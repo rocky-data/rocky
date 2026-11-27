@@ -35,6 +35,45 @@ pub struct DoctorOutput {
     pub suggestions: Vec<String>,
 }
 
+/// Which health checks `rocky doctor` runs.
+///
+/// `--check <name>` picks one check by name. `--check-set` picks a group. The
+/// two flags conflict, so a named check can never be silently skipped by a set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum DoctorCheckSet {
+    /// Every check, including the ones that reach a remote state backend or a
+    /// warehouse.
+    #[default]
+    All,
+    /// Only checks that read local files: no network call, no warehouse call
+    /// and no write to a remote state backend. It skips `state_rw`,
+    /// `state_concurrency` and `auth`.
+    Local,
+}
+
+/// The checks in the [`DoctorCheckSet::Local`] set. A check not listed here is
+/// not local, so a check added later stays out of the set until someone adds it.
+const LOCAL_CHECKS: &[&str] = &[
+    "config",
+    "state",
+    "state_schema",
+    "adapters",
+    "pipelines",
+    "state_sync",
+    "scheduler",
+    "spool",
+];
+
+impl DoctorCheckSet {
+    /// Whether the check called `name` belongs to this set.
+    fn includes(self, name: &str) -> bool {
+        match self {
+            DoctorCheckSet::All => true,
+            DoctorCheckSet::Local => LOCAL_CHECKS.contains(&name),
+        }
+    }
+}
+
 /// Exit code returned when `rocky doctor` finds at least one Critical
 /// health check.
 ///
@@ -45,19 +84,19 @@ pub struct DoctorOutput {
 /// code. See the exit-code convention in `rocky/src/main.rs`.
 const DOCTOR_CRITICAL_EXIT_CODE: i32 = 3;
 
-/// Execute `rocky doctor` — aggregate health checks, render, and exit.
+/// Run the health checks of `check_set` and build the report.
 ///
-/// Health-check collection is delegated to [`collect_health_checks`] so it
-/// can be unit-tested without the `process::exit` in this wrapper.
-pub async fn doctor(
+/// Never exits the process: the caller decides what a `critical` overall means.
+/// `rocky doctor` exits `3`; `GET /api/v1/doctor` answers `200` with the report.
+pub(crate) async fn doctor_output(
     config_path: &Path,
     state_path: &Path,
-    output_json: bool,
     check_filter: Option<&str>,
+    check_set: DoctorCheckSet,
     verbose: bool,
-) -> Result<()> {
+) -> DoctorOutput {
     let (checks, suggestions) =
-        collect_health_checks(config_path, state_path, check_filter, verbose).await;
+        collect_health_checks_in(config_path, state_path, check_filter, check_set, verbose).await;
 
     // Determine overall status
     let has_critical = checks
@@ -91,12 +130,29 @@ pub async fn doctor(
         })
         .collect();
     let suggestions = suggestions.iter().map(|s| render(s)).collect();
-    let doctor_output = DoctorOutput {
+    DoctorOutput {
         command: "doctor".into(),
         overall: overall.into(),
         checks,
         suggestions,
-    };
+    }
+}
+
+/// Execute `rocky doctor` — aggregate health checks, render, and exit.
+///
+/// The report is built by [`doctor_output`], which is what the HTTP route
+/// serves too; only this wrapper exits the process.
+pub async fn doctor(
+    config_path: &Path,
+    state_path: &Path,
+    output_json: bool,
+    check_filter: Option<&str>,
+    check_set: DoctorCheckSet,
+    verbose: bool,
+) -> Result<()> {
+    let doctor_output =
+        doctor_output(config_path, state_path, check_filter, check_set, verbose).await;
+    let has_critical = doctor_output.overall == "critical";
 
     if output_json {
         println!("{}", serde_json::to_string_pretty(&doctor_output)?);
@@ -142,17 +198,38 @@ pub async fn doctor(
 /// Split out of [`doctor`] so tests can assert check outcomes (e.g. a
 /// broken `rocky.toml` under `--check adapters` produces a Critical)
 /// without the `process::exit` the wrapper performs.
+#[cfg(test)]
 async fn collect_health_checks(
     config_path: &Path,
     state_path: &Path,
     check_filter: Option<&str>,
     verbose: bool,
 ) -> (Vec<HealthCheck>, Vec<String>) {
+    collect_health_checks_in(
+        config_path,
+        state_path,
+        check_filter,
+        DoctorCheckSet::All,
+        verbose,
+    )
+    .await
+}
+
+/// [`collect_health_checks`] for one [`DoctorCheckSet`]. A check runs when it
+/// is in the set and passes the `--check` filter.
+async fn collect_health_checks_in(
+    config_path: &Path,
+    state_path: &Path,
+    check_filter: Option<&str>,
+    check_set: DoctorCheckSet,
+    verbose: bool,
+) -> (Vec<HealthCheck>, Vec<String>) {
+    let run = |name: &str| check_set.includes(name) && should_run(name, check_filter);
     let mut checks: Vec<HealthCheck> = Vec::new();
     let mut suggestions: Vec<String> = Vec::new();
 
     // 1. Config validation
-    if should_run("config", check_filter) {
+    if run("config") {
         let start = Instant::now();
         let details = if verbose {
             vec![("path".into(), config_path.display().to_string())]
@@ -183,7 +260,7 @@ async fn collect_health_checks(
     }
 
     // 2. State store
-    if should_run("state", check_filter) {
+    if run("state") {
         let start = Instant::now();
         let details = if verbose {
             let mut details = vec![("path".into(), state_path.display().to_string())];
@@ -247,7 +324,7 @@ async fn collect_health_checks(
     //     so it reports the on-disk version precisely when it is newer (the
     //     normal open path hard-fails there). A missing/unversioned store, or
     //     one older than this binary (which auto-migrates forward), is healthy.
-    if should_run("state_schema", check_filter) {
+    if run("state_schema") {
         let start = Instant::now();
         let supported = rocky_core::state::current_schema_version();
         match rocky_core::state::StateStore::peek_schema_version(state_path) {
@@ -294,7 +371,7 @@ async fn collect_health_checks(
     }
 
     // 3. Adapter configuration checks (without actual connectivity)
-    if should_run("adapters", check_filter) {
+    if run("adapters") {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
             Err(e) => checks.push(config_load_failed("adapters", &e, start, &mut suggestions)),
@@ -350,7 +427,7 @@ async fn collect_health_checks(
     }
 
     // 4. Pipeline validation
-    if should_run("pipelines", check_filter) {
+    if run("pipelines") {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
             Err(e) => checks.push(config_load_failed("pipelines", &e, start, &mut suggestions)),
@@ -393,7 +470,7 @@ async fn collect_health_checks(
     }
 
     // 5. State sync configuration
-    if should_run("state_sync", check_filter) {
+    if run("state_sync") {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
             Err(e) => checks.push(config_load_failed(
@@ -430,7 +507,7 @@ async fn collect_health_checks(
     //    (which only inspects the backend type) by surfacing permission
     //    and reachability problems that would otherwise only manifest at
     //    end-of-run upload time.
-    if should_run("state_rw", check_filter) {
+    if run("state_rw") {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
             Err(e) => checks.push(config_load_failed("state_rw", &e, start, &mut suggestions)),
@@ -484,7 +561,7 @@ async fn collect_health_checks(
     //    resolved concurrency mode, the conditional-write probe, and the
     //    `cas-required` marker. Silent on `local` — the check simply isn't
     //    emitted.
-    if should_run("state_concurrency", check_filter)
+    if run("state_concurrency")
         && let Some(check) =
             state_concurrency_check(config_path, state_path, verbose, &mut suggestions).await
     {
@@ -492,7 +569,7 @@ async fn collect_health_checks(
     }
 
     // 8. Auth — construct adapters and ping each warehouse
-    if should_run("auth", check_filter) {
+    if run("auth") {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
             Ok(cfg) => {
@@ -630,7 +707,7 @@ async fn collect_health_checks(
     //    declares a `[schedule]` — the check simply isn't emitted.
     // The check records its own remediation hints as it decides status, so a
     // config-load failure no longer draws a misleading "a reconciler is wedged".
-    if should_run("scheduler", check_filter)
+    if run("scheduler")
         && let Some(check) = scheduler_check(config_path, state_path, verbose, &mut suggestions)
     {
         checks.push(check);
@@ -643,8 +720,8 @@ async fn collect_health_checks(
     //      project with zero `[schedule]` blocks can still quarantine demands,
     //      and folding this in would have warned exactly where it was not
     //      needed and stayed silent where it was (#1712).
-    if should_run("spool", check_filter)
-        && let Some(check) = spool_check(config_path, &mut suggestions)
+    if run("spool")
+        && let Some(check) = spool_check(config_path, &mut suggestions, check_set)
     {
         checks.push(check);
     }
@@ -1011,7 +1088,11 @@ async fn state_concurrency_check(
 /// "no webhooks here" — the shape of #1668/#1707/#1739. A path that is present
 /// but cannot be inspected is a WARNING, not silence: absence is unproven, and
 /// a spool nobody can read is exactly the state this check exists to surface.
-fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<HealthCheck> {
+fn spool_check(
+    config_path: &Path,
+    suggestions: &mut Vec<String>,
+    check_set: DoctorCheckSet,
+) -> Option<HealthCheck> {
     use rocky_core::path_presence::PathPresence;
     use rocky_core::schedule::spool;
 
@@ -1047,7 +1128,13 @@ fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<Heal
         }
     }
 
-    let (status, message) = match spool::count_corrupt(&rocky_dir) {
+    // The local set is a read-only probe: `count_corrupt` can create the
+    // spool's sentinel file, so it counts without creating anything.
+    let counted = match check_set {
+        DoctorCheckSet::All => spool::count_corrupt(&rocky_dir),
+        DoctorCheckSet::Local => spool::count_corrupt_read_only(&rocky_dir),
+    };
+    let (status, message) = match counted {
         Ok(0) => (
             HealthStatus::Healthy,
             "no quarantined webhook demands".to_string(),
@@ -1330,6 +1417,134 @@ mod tests {
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
+    // Check sets: `--check-set local` skips the remote and warehouse checks.
+    // -----------------------------------------------------------------------
+
+    fn local_project(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n",
+        )
+        .unwrap();
+        (config_path, dir.join("state.redb"))
+    }
+
+    fn check_names(output: &DoctorOutput) -> Vec<&str> {
+        output.checks.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    /// The local set leaves out `state_rw`, `state_concurrency` and every
+    /// `auth` check, and the full set has them: the first assertion alone would
+    /// pass if those checks never ran for this config.
+    #[tokio::test]
+    async fn the_local_set_excludes_state_rw_and_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path) = local_project(dir.path());
+
+        let all = doctor_output(&config_path, &state_path, None, DoctorCheckSet::All, false).await;
+        let all_names = check_names(&all);
+        assert!(all_names.contains(&"state_rw"), "{all_names:?}");
+        assert!(
+            all_names.iter().any(|n| n.starts_with("auth")),
+            "{all_names:?}"
+        );
+
+        let local = doctor_output(
+            &config_path,
+            &state_path,
+            None,
+            DoctorCheckSet::Local,
+            false,
+        )
+        .await;
+        let names = check_names(&local);
+        for expected in ["config", "state", "state_schema", "adapters", "pipelines"] {
+            assert!(names.contains(&expected), "{expected} missing: {names:?}");
+        }
+        for skipped in ["state_rw", "state_concurrency"] {
+            assert!(!names.contains(&skipped), "{skipped} ran: {names:?}");
+        }
+        assert!(
+            names.iter().all(|n| !n.starts_with("auth")),
+            "an auth check ran: {names:?}"
+        );
+    }
+
+    /// Membership is an allow list: a name that is not listed is not local.
+    #[test]
+    fn a_check_missing_from_the_local_list_is_not_local() {
+        for name in LOCAL_CHECKS {
+            assert!(DoctorCheckSet::Local.includes(name), "{name}");
+        }
+        for name in [
+            "state_rw",
+            "state_concurrency",
+            "auth",
+            "auth/default",
+            "new_check",
+        ] {
+            assert!(!DoctorCheckSet::Local.includes(name), "{name}");
+            assert!(DoctorCheckSet::All.includes(name), "{name}");
+        }
+    }
+
+    /// A store another handle holds is a warning, not a critical check, so
+    /// `overall` is `warning`. The report comes back as a value: building it
+    /// never exits the process.
+    #[tokio::test]
+    async fn a_busy_state_store_is_a_warning_in_the_local_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path) = local_project(dir.path());
+        let holder = rocky_core::state::StateStore::open(&state_path).unwrap();
+
+        let output = doctor_output(
+            &config_path,
+            &state_path,
+            None,
+            DoctorCheckSet::Local,
+            false,
+        )
+        .await;
+        let state = output.checks.iter().find(|c| c.name == "state").unwrap();
+        assert!(matches!(state.status, HealthStatus::Warning), "{state:?}");
+        assert!(
+            state.message.contains("Cannot open state store"),
+            "{state:?}"
+        );
+        assert!(
+            output
+                .checks
+                .iter()
+                .all(|c| !matches!(c.status, HealthStatus::Critical)),
+            "{:?}",
+            output.checks
+        );
+        assert_eq!(output.overall, "warning");
+        drop(holder);
+    }
+
+    /// A critical check comes back as `overall: critical`; only the CLI
+    /// wrapper turns that into an exit code. Reaching the assertion proves the
+    /// builder did not exit.
+    #[tokio::test]
+    async fn a_critical_report_is_returned_not_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, "this is = not [valid toml").unwrap();
+        let state_path = dir.path().join("state.redb");
+        let output = doctor_output(
+            &config_path,
+            &state_path,
+            None,
+            DoctorCheckSet::Local,
+            false,
+        )
+        .await;
+        assert_eq!(output.overall, "critical");
+    }
+
+    // -----------------------------------------------------------------------
     // #1712: quarantined webhook demands were invisible. `count_corrupt` had
     // no production caller, so a `.corrupt-*` file — payload the engine could
     // not parse and deliberately did not delete — showed up nowhere.
@@ -1345,7 +1560,7 @@ mod tests {
         std::fs::write(&config_path, "").unwrap();
 
         let mut suggestions = Vec::new();
-        assert!(super::spool_check(&config_path, &mut suggestions).is_none());
+        assert!(super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All).is_none());
         assert!(suggestions.is_empty());
     }
 
@@ -1360,7 +1575,8 @@ mod tests {
         std::fs::write(spool.join("abc123"), "{}").unwrap();
 
         let mut suggestions = Vec::new();
-        let check = super::spool_check(&config_path, &mut suggestions).expect("spool exists");
+        let check = super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All)
+            .expect("spool exists");
         assert!(matches!(check.status, HealthStatus::Healthy), "{check:?}");
         assert!(suggestions.is_empty());
     }
@@ -1377,7 +1593,8 @@ mod tests {
         std::fs::write(spool.join("ghi789.corrupt-1757000001"), "also not json").unwrap();
 
         let mut suggestions = Vec::new();
-        let check = super::spool_check(&config_path, &mut suggestions).expect("spool exists");
+        let check = super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All)
+            .expect("spool exists");
         assert!(matches!(check.status, HealthStatus::Warning), "{check:?}");
         assert!(check.message.contains('2'), "names the count: {check:?}");
         assert_eq!(suggestions.len(), 1, "{suggestions:?}");
@@ -1414,7 +1631,7 @@ mod tests {
         );
 
         let mut suggestions = Vec::new();
-        let check = super::spool_check(&config_path, &mut suggestions)
+        let check = super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All)
             .expect("a dangling spool is NOT absent");
         assert!(matches!(check.status, HealthStatus::Warning), "{check:?}");
         assert!(

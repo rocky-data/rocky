@@ -1731,12 +1731,36 @@ fn fill_from_default_seed_with_names(
     Vec<(String, Option<String>)>,
     std::collections::HashSet<String>,
 ) {
-    let mut added = Vec::new();
     // A build without DuckDB cannot run a seed; the default tier is silent.
     if cfg!(not(feature = "duckdb")) || !seed_file(project_root).is_file() {
-        return (added, std::collections::HashSet::new());
+        return (Vec::new(), std::collections::HashSet::new());
     }
-    match load_seed_at(project_root, config) {
+    merge_seed_result(load_seed_at(project_root, config), schemas)
+}
+
+/// [`fill_from_default_seed`] for seed SQL the caller already read, such as the
+/// seed committed at `HEAD`. Nothing is read from disk. A seed that does not
+/// run is logged and skipped.
+pub(crate) fn fill_from_seed_text(
+    seed_sql: &str,
+    config: Option<&rocky_config::RockyConfig>,
+    schemas: &mut HashMap<String, Vec<TypedColumn>>,
+) -> Vec<(String, Option<String>)> {
+    if cfg!(not(feature = "duckdb")) {
+        return Vec::new();
+    }
+    merge_seed_result(run_seed_sql(seed_sql, "the seed at HEAD", config), schemas).0
+}
+
+fn merge_seed_result(
+    result: Result<SeedTypes>,
+    schemas: &mut HashMap<String, Vec<TypedColumn>>,
+) -> (
+    Vec<(String, Option<String>)>,
+    std::collections::HashSet<String>,
+) {
+    let mut added = Vec::new();
+    match result {
         Ok((seed, names)) => {
             for (key, columns) in seed {
                 if schemas.contains_key(&key) {
@@ -1798,7 +1822,6 @@ fn load_seed_at(
     config: Option<&rocky_config::RockyConfig>,
 ) -> Result<SeedTypes> {
     use anyhow::Context;
-    use rocky_duckdb::DuckDbConnector;
 
     let seed_path = seed_file(project_root);
     if !seed_path.is_file() {
@@ -1810,20 +1833,41 @@ fn load_seed_at(
 
     let seed_sql = std::fs::read_to_string(&seed_path)
         .with_context(|| format!("failed to read seed file: {}", seed_path.display()))?;
+    run_seed_sql(&seed_sql, &seed_path.display().to_string(), config)
+}
+
+/// Run `seed_sql` in an in-memory DuckDB and read the source schemas and the
+/// function names it created. `label` names the seed in an error.
+#[cfg(feature = "duckdb")]
+fn run_seed_sql(
+    seed_sql: &str,
+    label: &str,
+    config: Option<&rocky_config::RockyConfig>,
+) -> Result<SeedTypes> {
+    use rocky_duckdb::DuckDbConnector;
 
     // In-memory DuckDB; dropped at end of fn so no temp files leak. It takes
     // the project's extension settings, so `offline = true` holds here too.
     let extensions = crate::registry::duckdb_extensions_from(config);
     let conn = DuckDbConnector::in_memory_with(&extensions)
         .map_err(|e| anyhow::anyhow!("failed to open in-memory DuckDB for --with-seed: {e}"))?;
-    conn.execute_statement(&seed_sql)
-        .map_err(|e| anyhow::anyhow!("seed execution failed for {}: {e}", seed_path.display()))?;
+    conn.execute_statement(seed_sql)
+        .map_err(|e| anyhow::anyhow!("seed execution failed for {label}: {e}"))?;
 
     // The same derivation `rocky test` and `rocky ci` type their compile
     // from, on the database they then execute in.
     let schemas = rocky_engine::test_runner::source_schemas_from_db(&conn)?;
     let names = rocky_engine::test_runner::seed_function_names_from_db(&conn)?;
     Ok((schemas, names))
+}
+
+#[cfg(not(feature = "duckdb"))]
+fn run_seed_sql(
+    _seed_sql: &str,
+    _label: &str,
+    _config: Option<&rocky_config::RockyConfig>,
+) -> Result<SeedTypes> {
+    anyhow::bail!("--with-seed requires the `duckdb` feature; rebuild with `--features duckdb`");
 }
 
 /// Stub used when the binary is built without the `duckdb` feature. The

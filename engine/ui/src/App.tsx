@@ -15,6 +15,7 @@ import type { BriefOutput } from "@rocky-types/brief";
 import { ApiError, SESSION_EXPIRED_EVENT, apiGet } from "./api";
 import {
   AREAS,
+  AREA_GROUPS,
   NOT_YET_HEADING,
   areaFromPath,
   areaHasTabs,
@@ -468,26 +469,45 @@ function badgeFor(id: AreaId, waiting: Waiting | null): number | undefined {
   return undefined;
 }
 
+/** One sidebar section: a small uppercase heading that names its list. */
+function AreaGroup({ label, children }: { label: string; children: ReactNode }) {
+  const headingId = useId();
+  return (
+    <li>
+      <h2 id={headingId} className="mb-1 text-xs/6 font-semibold tracking-wider text-muted uppercase">
+        {label}
+      </h2>
+      <ul aria-labelledby={headingId} className="-mx-2 space-y-1">
+        {children}
+      </ul>
+    </li>
+  );
+}
+
 function AreaNav({ current, waiting }: { current: AreaId; waiting: Waiting | null }) {
   const open = AREAS.filter((area) => area.kind === "link");
   const notYet = AREAS.filter((area) => area.kind === "disabled");
   return (
     <nav aria-label="Areas" className="flex flex-1 flex-col">
       <ul className="flex flex-1 flex-col gap-y-6">
-        <li>
-          <ul className="-mx-2 space-y-1">
-            {open.map((area) => (
-              <li key={area.id} className="relative">
-                <AreaLink
-                  area={area as Area & { kind: "link" }}
-                  current={current}
-                  waiting={badgeFor(area.id, waiting)}
-                  noun={area.id === "needs-you" ? "item" : "decision"}
-                />
-              </li>
-            ))}
-          </ul>
-        </li>
+        {AREA_GROUPS.map((group) => (
+          <AreaGroup key={group.id} label={group.label}>
+            {group.areas.map((id) => {
+              const area = open.find((entry) => entry.id === id);
+              if (area === undefined) return null;
+              return (
+                <li key={area.id} className="relative">
+                  <AreaLink
+                    area={area as Area & { kind: "link" }}
+                    current={current}
+                    waiting={badgeFor(area.id, waiting)}
+                    noun={area.id === "needs-you" ? "item" : "decision"}
+                  />
+                </li>
+              );
+            })}
+          </AreaGroup>
+        ))}
         <li className="border-t border-zinc-200 pt-4 dark:border-white/10">
           <details className="group/later -mx-2">
             <summary className="flex cursor-pointer list-none items-center gap-x-2 rounded-md p-2 text-xs/6 font-semibold text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-white [&::-webkit-details-marker]:hidden">
