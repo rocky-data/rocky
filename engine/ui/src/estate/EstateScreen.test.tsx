@@ -85,6 +85,12 @@ function loaders(overrides: Partial<EstateLoaders> = {}): EstateLoaders {
     schedule: async () => emptySchedule,
     spool: async () => emptySpool,
     detail: async (name) => detail(name),
+    replayCheck: async () => {
+      throw new ApiError(404, { code: "run_not_found", message: "no run" });
+    },
+    recipeHistory: async () => {
+      throw new Error("no recipe hash, so no history read");
+    },
     ...overrides,
   };
 }
@@ -591,7 +597,7 @@ describe("EstateScreen", () => {
 import { ModelDetail } from "./ModelDetail";
 
 function DetailHarness({ name, load }: { name: string; load: EstateLoaders["detail"] }) {
-  return <ModelDetail name={name} load={load} onClose={() => {}} />;
+  return <ModelDetail name={name} load={load} onClose={() => {}} runs={{ kind: "loading" }} />;
 }
 
 describe("The Promote panel on the estate", () => {

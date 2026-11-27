@@ -16,7 +16,7 @@ The UI ships inside the release binaries and the container image. A sidebar list
   Project            models, their lineage, runs and schedules
   Changes            changes that need approval, one change in full
   Data products      each data product, and its history
-  Oversight          agent activity, trace, audit log
+  Oversight          agent activity, compliance, trace, audit log
 ```
 
 The other six are not links. See [Areas without a screen](#areas-without-a-screen). On a screen narrower than 1024 pixels the sidebar folds behind an **Areas** button.
@@ -78,6 +78,8 @@ The printed address opens Project, even though Inbox is first in the sidebar. It
 
 Below the strip, the Lineage panel draws every model and the edges between them. Click a model to open its columns (with types, where the compiler inferred them) and its compiled SQL. The server caps the SQL at 256 KiB and says so when it cuts it. Further down are the recent runs and the pipelines that declare a `[schedule]`. The Schedule panel also shows the queued triggers: webhook calls waiting in the spool that the scheduler has not picked up yet. If the server cannot read the spool, the panel shows that error instead of a count.
 
+An open model also has a **Rebuild check**. It picks the newest run in the runs list that executed the model, reads `GET /api/v1/runs/<run>/replay-check?model=<name>` once, and says whether the recording of that run alone can rebuild the table: a verdict sentence, a Why table (program recorded, program readable by this engine, inputs recorded, same result every time) and an Inputs table. Nothing runs. Rocky writes provenance only when `[reuse] enabled = true`; without it the verdict is "Not recorded" and the other rows are grey dashes, not findings. **Runs of this exact program** reads `GET /api/v1/recipes/<hash>/history` for the recipe hash the runs list holds for that model and run, or shows a grey dash with the reason. The panel shows `rocky replay <run> --check` and `rocky history --recipe <hash>` as copyable code.
+
 ## Changes
 
 The Changes screen lists the changes that policy marked **Needs approval**, by a rule or by the default for agents. The CLI calls a change a plan: this is the list `rocky review --queue` prints. The engine ranks the queue by impact (downstream models affected) × change class × staleness. A breaking schema change weighs 3, a bare `apply`, `promote` or `backfill` weighs 2, and anything else weighs 1.
@@ -134,12 +136,13 @@ Each cost figure says how sure it is: **measured**, **estimated** (split by esti
 
 ## Oversight
 
-Oversight answers "what did the agents do, and was it allowed?" It has four tabs, each matching a CLI view:
+Oversight answers "what did the agents do, and was it allowed?" It has five tabs, each matching a CLI view:
 
 | Tab | Shows | Matches |
 |---|---|---|
 | Agent activity | Allowed, needed-approval and blocked rates for a window. Group by actor, rule or model decided on. Lists the metrics the audit log cannot support, with the reason. | `rocky audit --scorecard` |
 | Agents | Requests that Rocky's policy gated as an agent, from the audit log: how each name was given, its requests (one per change) and their outcomes. A person can appear here too. | `rocky audit` |
+| Compliance | Whether each classified column is masked in each environment, and the columns that are not. | `rocky compliance` |
 | Trace | Every recorded decision about a subject: a model, a run id, a change id, or another recorded id such as `freeze:global`. Shows its decisions, change, applying runs, post-apply checks and impact. | `rocky audit --for <subject>` |
 | Audit log | The whole policy decision log, oldest first. Filter to one data product. | `rocky audit`, `rocky audit --product <name>` |
 
@@ -156,6 +159,14 @@ An outcome is the policy decision when the request was made. A later approval is
 The audit log does not record an agent's channel yet, so the Channel column shows a dash, with that reason as its tooltip. Rules and change freezes act on all agents as a class, never on one name.
 
 The audit log also records the drift decisions `rocky run` made on its own, applied or refused, as agent decisions, under a plan id that starts with `autoapply:`. The tab leaves those decisions out and says how many.
+
+### Compliance
+
+The Compliance tab answers "are the classified columns masked where policy says they should be?" It reads `GET /api/v1/compliance` once, when the tab opens. The read is static: it checks `rocky.toml` and the model sidecars and calls no warehouse. A refused read shows the engine's error, never a count of zero.
+
+The page opens with one sentence, then the **Exceptions** table (model, column, environment, reason). An exception is a classified column with no masking strategy in an environment, whose tag is not on the `[classifications] allow_unmasked` list. `rocky compliance --fail-on exception` exits 1 on these. The opening sentence counts distinct columns that have an exception in at least one environment. The first two cards count columns (classified, and masked in every environment). The last two count column × environment pairs, and say so: pairs left unmasked on purpose, and exceptions, with the number of columns they fall in. The Exceptions card is red above zero and green at zero. A `[mask.default]` block makes the engine report two `default` rows for a column; the page shows one, the less masked of the two.
+
+Each classified column shows one chip per environment. Green means a strategy (`hash`, `redact` or `partial`) is applied. Amber means unmasked on purpose: the strategy is `none`, or no strategy applies and the tag is on the allow list. Red means an exception. The Environment picker narrows the page to one environment without a new read. The footer shows the CI command as copyable code.
 
 ![The Trace tab for the model revenue_daily: a table of twelve policy decisions, agent proposals and breaking-change evaluations and the human approvals that applied them](/ui-governor-custody.png)
 

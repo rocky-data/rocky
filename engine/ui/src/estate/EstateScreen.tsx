@@ -13,6 +13,12 @@ import type { JobClient } from "../operator";
 import { CompactControls } from "./CompactControls";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
+import {
+  type RecipeHistoryLoader,
+  type ReplayCheckLoader,
+  defaultRecipeHistoryLoader,
+  defaultReplayCheckLoader,
+} from "./RebuildCheck";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
 import { PreviewControls } from "./PreviewControls";
 import { PromoteControls } from "./PromoteControls";
@@ -33,6 +39,9 @@ export interface EstateLoaders {
   /** The webhook demands waiting in the spool, which `schedule` cannot see. */
   spool: () => Promise<ScheduleSpoolOutput>;
   detail: (name: string) => Promise<ModelDetailOutput>;
+  /** One model's rebuild check, read once with its detail. */
+  replayCheck: ReplayCheckLoader;
+  recipeHistory: RecipeHistoryLoader;
 }
 
 export const defaultLoaders: EstateLoaders = {
@@ -43,6 +52,8 @@ export const defaultLoaders: EstateLoaders = {
   schedule: () => apiGet<ScheduleStatusOutput>("schedule"),
   spool: () => apiGet<ScheduleSpoolOutput>("schedule/spool"),
   detail: (name) => apiGet<ModelDetailOutput>(`models/${encodeURIComponent(name)}`),
+  replayCheck: defaultReplayCheckLoader,
+  recipeHistory: defaultRecipeHistoryLoader,
 };
 
 /** Runs and the schedule are ledger reads and refresh on their own; the DAG composes per request and refreshes on demand. */
@@ -160,6 +171,9 @@ export function EstateScreen({
                   key={generation}
                   name={shown}
                   load={loaders.detail}
+                  runs={runs}
+                  replayCheck={loaders.replayCheck}
+                  recipeHistory={loaders.recipeHistory}
                   onClose={() => setSelected(null)}
                   actions={
                     <ProjectActions

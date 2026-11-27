@@ -6,6 +6,7 @@ function slots() {
   return {
     brief: <span>brief slot</span>,
     scorecard: <span>scorecard slot</span>,
+    compliance: <span>compliance slot</span>,
     custody: (subject: string | null) => <span>custody slot: {subject ?? "none"}</span>,
     audit: (product: string | null) => <span>audit slot: {product ?? "none"}</span>,
     products: (name: string | null) => <span>products slot: {name ?? "none"}</span>,
@@ -28,13 +29,14 @@ describe("GovernorScreen", () => {
     expect(screen.queryByRole("navigation", { name: "Oversight screens" })).toBeNull();
   });
 
-  it("switches between Oversight's three tabs without a reload", async () => {
+  it("switches between Oversight's tabs without a reload", async () => {
     window.history.pushState(null, "", "/ui/governor/scorecard");
     render(<GovernorScreen {...slots()} />);
     const tabs = within(screen.getByRole("navigation", { name: "Oversight screens" }));
     expect(tabs.getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Agent activity",
       "Agents",
+      "Compliance",
       "Trace",
       "Audit log",
     ]);
@@ -46,6 +48,13 @@ describe("GovernorScreen", () => {
     screen.getByRole("link", { name: "Trace" }).click();
     await waitFor(() => expect(screen.getByText("custody slot: none")).toBeInTheDocument());
     expect(window.location.pathname).toBe("/ui/governor/custody");
+  });
+
+  it("opens the Compliance tab after Agents", () => {
+    window.history.pushState(null, "", "/ui/governor/compliance");
+    render(<GovernorScreen {...slots()} />);
+    expect(screen.getByText("compliance slot")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Compliance" })).toHaveAttribute("aria-current", "page");
   });
 
   it("deep-links one product's timeline", () => {
