@@ -414,11 +414,13 @@ impl BigQueryAdapter {
         // error is always a failed submit (a 429, a 5xx, a lost connection),
         // which BigQuery may still have accepted. With the same key it
         // returns the job it already made instead of running a second copy
-        // (#2774). BigQuery keeps the key for 15 minutes only. With the
-        // default `[retry]` (3 retries, at most 30 s apart) and the 120 s
-        // request timeout, the last resend goes out within about 10 minutes.
-        // A `max_retries` of 6 or more can pass 15 minutes; a resend after
-        // that may run a second copy.
+        // (#2774). BigQuery keeps the key for 15 minutes only. The time to
+        // the last resend depends on `max_retries`, `initial_backoff_ms` and
+        // `max_backoff_ms`, plus the 120 s request timeout per attempt. With
+        // the defaults (3 retries, at most 30 s apart) the last resend goes
+        // out within about 10 minutes. Nothing caps these settings: a larger
+        // `max_retries`, or a large backoff even with 3 retries, can pass
+        // 15 minutes, and a resend after that may run a second copy.
         let request_id = new_submit_request_id();
         for attempt in 0..=self.retry.max_retries {
             match self.run_query_once(sql, &request_id).await {
