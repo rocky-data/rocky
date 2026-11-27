@@ -166,12 +166,12 @@ The routes `/jobs/promote`, `/jobs/compact` and `/jobs/diff` are not in the diag
 | `/jobs/preview` | `rocky preview create` | optional `{"name": "<branch>", "base": "<ref>"}` | mutation |
 | `/jobs/promote` | `rocky plan promote <name>` | `{"name": "<branch>", "base": "<ref>", "pipeline": "<name>"}`, `name` required | none |
 | `/jobs/compact` | `rocky compact <table>` or `rocky compact --catalog <name>` | exactly one of `{"table": "<catalog.schema.table>"}` or `{"catalog": "<name>"}` | none |
-| `/jobs/diff` | `rocky ci-diff [<base>]` | optional `{"base": "<ref>", "working_tree": true, "semantic": true}` | one diff at a time |
+| `/jobs/diff` | `rocky ci-diff [<base>]` | optional `{"base": "<ref>", "semantic": true}` | one diff at a time |
 | `/jobs/product_approve` | `rocky product approve <name>` | `{"name": "<product>", "expect_spec_digest": "<digest>"}`, both required | mutation |
 | `/jobs/approve` | `rocky review <plan_id> --approve` | `{"plan_id": "<64 lowercase hex>"}` | mutation |
 | `/jobs/apply` | `rocky apply <plan_id>` | `plan_id`, optional `expect_spec_digest` | mutation |
 
-A `diff` job writes no state, file or cache, and every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, so it never takes git's index lock. It does not take the mutation lock, so it never blocks a run. A second `diff` submitted while one runs answers `409 mutation_in_progress` with the running job's `running_job_id`. The result is the `rocky ci-diff` output, including its lineage fields.
+A `diff` job writes no state, file or cache, and every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, so it never takes git's index lock. It does not take the mutation lock, so it never blocks a run. A second `diff` submitted while one runs answers `409 mutation_in_progress` with the running job's `running_job_id`. It diffs the `HEAD` commit, so uncommitted edits are not compared. The result is the `rocky ci-diff` output, including its lineage fields.
 
 Jobs that take the mutation lock answer `409 mutation_in_progress` while another one holds it. A run holds the local state store for its whole run, even on a remote `[state]` backend, so retry a refused freeze when that run ends. To stop a running job, cancel it.
 

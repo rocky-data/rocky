@@ -11777,7 +11777,7 @@
             "type": "string"
           },
           {
-            "description": "`rocky ci-diff` — the structural model diff between a git ref and `HEAD` (or the working tree), with the column lineage it moves. Read-only: it writes no state, file or cache, and every git command it runs sets `GIT_OPTIONAL_LOCKS=0`. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
+            "description": "`rocky ci-diff` — the structural model diff between a git ref and the `HEAD` commit, with the column lineage it moves. Uncommitted edits are not compared. Read-only: it writes no state, file or cache, and every git command it runs sets `GIT_OPTIONAL_LOCKS=0`. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
             "enum": [
               "diff"
             ],
@@ -11790,7 +11790,7 @@
         "properties": {
           "base": {
             "default": null,
-            "description": "`--base <git ref>` for `preview` and `promote`: the ref the change set is computed against. Absent means `main`. Ignored by every other kind.",
+            "description": "`--base <git ref>` for `preview` and `promote`, and the positional ref for `diff`: the ref the change set is computed against. Absent means `main`. Ignored by every other kind.",
             "type": [
               "string",
               "null"
@@ -11889,14 +11889,6 @@
             "description": "`<table>` for `compact`: the table to compact, `catalog.schema.table`. Exactly one of `table` and `catalog`. Ignored by every other kind.",
             "type": [
               "string",
-              "null"
-            ]
-          },
-          "working_tree": {
-            "default": null,
-            "description": "`--working-tree` for `diff`: compare the working tree, uncommitted edits included, instead of `HEAD`. Ignored by every other kind.",
-            "type": [
-              "boolean",
               "null"
             ]
           }
@@ -30432,7 +30424,7 @@
     },
     "/api/v1/jobs/diff": {
       "post": {
-        "description": "Submit a `diff` job: `rocky ci-diff`, the structural model diff between a git ref and `HEAD`, with the column lineage it moves. The result is the `ci-diff` output. It is read-only: it writes no state, file or cache, every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, and it takes no mutation permit, so it never blocks a run. At most one diff runs at a time: a second submission answers `409 mutation_in_progress` with the running job's id. Body fields, all optional: `base` (a git ref, default `main`, validated before the job starts), `working_tree` (compare the working tree instead of `HEAD`) and `semantic` (also run the breaking-change classifier).",
+        "description": "Submit a `diff` job: `rocky ci-diff`, the structural model diff between a git ref and `HEAD`, with the column lineage it moves. The result is the `ci-diff` output. It is read-only: it writes no state, file or cache, every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, and it takes no mutation permit, so it never blocks a run. At most one diff runs at a time: a second submission answers `409 mutation_in_progress` with the running job's id. Body fields, both optional: `base` (a git ref, default `main`, validated before the job starts) and `semantic` (also run the breaking-change classifier). It diffs the `HEAD` commit: uncommitted edits are not compared.",
         "operationId": "submitDiffJob",
         "parameters": [
           {

@@ -1018,9 +1018,10 @@ fn route_table() -> Vec<Route> {
                  every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, and it takes no \
                  mutation permit, so it never blocks a run. At most one diff runs at a time: \
                  a second submission answers `409 mutation_in_progress` with the running \
-                 job's id. Body fields, all optional: `base` (a git ref, default `main`, \
-                 validated before the job starts), `working_tree` (compare the working tree \
-                 instead of `HEAD`) and `semantic` (also run the breaking-change classifier).",
+                 job's id. Body fields, both optional: `base` (a git ref, default `main`, \
+                 validated before the job starts) and `semantic` (also run the \
+                 breaking-change classifier). It diffs the `HEAD` commit: uncommitted \
+                 edits are not compared.",
             path_params: &[],
             query_params: &[],
             header_params: &["X-Rocky-Principal"],

@@ -3426,12 +3426,10 @@ pub(crate) struct JobRequest {
     /// the catalog. Exactly one of `table` and `catalog`. Ignored by every
     /// other kind.
     catalog: Option<String>,
-    /// `--base <git ref>` for `preview` and `promote`: the ref the change set
-    /// is computed against. Absent means `main`. Ignored by every other kind.
+    /// `--base <git ref>` for `preview` and `promote`, and the positional ref
+    /// for `diff`: the ref the change set is computed against. Absent means
+    /// `main`. Ignored by every other kind.
     base: Option<String>,
-    /// `--working-tree` for `diff`: compare the working tree, uncommitted edits
-    /// included, instead of `HEAD`. Ignored by every other kind.
-    working_tree: Option<bool>,
     /// `--semantic` for `diff`: also run the breaking-change classifier.
     /// Ignored by every other kind.
     semantic: Option<bool>,
@@ -3980,9 +3978,9 @@ async fn submit_compact(
 
 /// `POST /api/v1/jobs/diff` — the structural model diff: `rocky ci-diff`
 /// (read-only; no mutation permit). Body `{"base": "<git ref>",
-/// "working_tree": <bool>, "semantic": <bool>}`, every field optional: `base`
-/// defaults to `main`, `working_tree` to `false` (diff `HEAD`) and `semantic`
-/// to `false`. The result is the command's `CiDiffOutput`. At most one diff
+/// "semantic": <bool>}`, both optional: `base` defaults to `main` and
+/// `semantic` to `false`. It diffs the `HEAD` commit; uncommitted edits are
+/// not compared. The result is the command's `CiDiffOutput`. At most one diff
 /// runs at a time: a second submission is refused `409 mutation_in_progress`
 /// with the running job's id. The job writes no state, file or cache, and its
 /// git commands never take git's index lock.
@@ -4877,9 +4875,6 @@ fn job_subprocess_args(
             }
             if request.semantic == Some(true) {
                 args.push("--semantic".into());
-            }
-            if request.working_tree == Some(true) {
-                args.push("--working-tree".into());
             }
         }
         JobKind::Test | JobKind::Ci => {
@@ -16735,8 +16730,8 @@ adapter = "db"
     }
 
     /// The argv a diff job runs: the verb, then the ref as its own entry, then
-    /// the server's `--models` and the two opt-in flags. Without a body it is
-    /// `ci-diff` alone, and the CLI's own defaults apply.
+    /// the server's `--models` and the opt-in `--semantic`. Without a body it is
+    /// `ci-diff` and `--models`, and the CLI's own defaults apply.
     #[test]
     fn diff_job_argv_carries_the_ref_models_and_flags() {
         let dirs = JobProjectDirs {
@@ -16765,20 +16760,14 @@ adapter = "db"
             "ci-diff",
         ];
         let full: JobRequest = serde_json::from_value(serde_json::json!({
-            "base": "origin/main", "semantic": true, "working_tree": true
+            "base": "origin/main", "semantic": true
         }))
         .unwrap();
         assert_eq!(
             argv(&full),
             [
                 &head[..],
-                &[
-                    "origin/main",
-                    "--models",
-                    "/p/models",
-                    "--semantic",
-                    "--working-tree"
-                ]
+                &["origin/main", "--models", "/p/models", "--semantic"]
             ]
             .concat()
         );
@@ -16787,10 +16776,8 @@ adapter = "db"
             argv(&plain),
             [&head[..], &["--models", "/p/models"]].concat()
         );
-        let off: JobRequest = serde_json::from_value(serde_json::json!({
-            "semantic": false, "working_tree": false
-        }))
-        .unwrap();
+        let off: JobRequest =
+            serde_json::from_value(serde_json::json!({ "semantic": false })).unwrap();
         assert_eq!(argv(&off), argv(&plain));
     }
 

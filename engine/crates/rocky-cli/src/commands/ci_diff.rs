@@ -3950,10 +3950,11 @@ mod tests {
     /// A committed diff over a repository whose files have a stale stat writes
     /// nothing: no index refresh, no lock file, no cache, no state file.
     ///
-    /// Scope: this covers the default (`HEAD`) mode. With `--working-tree`,
-    /// `git diff <base>` still refreshes the index under git 2.56, whatever
-    /// `GIT_OPTIONAL_LOCKS` says: the env stops `git status` from doing it, and
-    /// `git diff` does not read it.
+    /// Scope: the default (`HEAD`) mode, which is what the `diff` job runs.
+    /// With `--working-tree`, `git diff <base>` refreshes the index under git
+    /// 2.56 whatever `GIT_OPTIONAL_LOCKS` says: the env stops `git status` from
+    /// doing it, and `git diff` does not read it. The job never passes that
+    /// flag.
     #[test]
     fn a_committed_diff_leaves_the_repository_untouched() {
         let tmp = TempDir::new().unwrap();
