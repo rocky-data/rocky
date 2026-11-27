@@ -111,7 +111,7 @@ fn esc(s: &str) -> String {
 /// The effect as shown to a person. `require_review` is not an approval.
 fn effect_label(effect: &str) -> String {
     if effect == "require_review" {
-        "require_review (review was not enforced on this run)".to_string()
+        "require_review (review required, not an approval)".to_string()
     } else {
         esc(effect)
     }

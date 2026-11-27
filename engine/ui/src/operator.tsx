@@ -123,7 +123,9 @@ export const defaultJobClient: JobClient = {
 /**
  * Where the latest cancel request of the running job stands. The engine
  * sends the job SIGTERM on the first request (which `rocky run` handles like
- * Ctrl-C) and SIGKILL on the next.
+ * Ctrl-C) and SIGTERM again on the second: the run's forced exit, which
+ * cancels its warehouse statements and exits. If the job is still running
+ * 15 s after that, the engine kills it. A third request kills it at once.
  */
 export type CancelView =
   | { kind: "idle" }
@@ -136,6 +138,11 @@ export interface JobCancel {
   view: CancelView;
   /** A stop was delivered to this job, so the button now offers a forced stop. */
   stopping: boolean;
+  /**
+   * A forced stop (the second terminate) was delivered too. The engine kills
+   * the job if it has not exited 15 s later; one more press kills it at once.
+   */
+  forced: boolean;
   request: () => void;
 }
 
@@ -155,7 +162,9 @@ export function useJob(
 ): { view: JobView; start: (body?: Record<string, unknown>) => void; cancel: JobCancel } {
   const [view, setView] = useState<JobView>({ kind: "idle" });
   const [cancelView, setCancelView] = useState<CancelView>({ kind: "idle" });
-  const [stopping, setStopping] = useState(false);
+  // How many terminates the engine delivered to the shown job: 1 is the
+  // stop, 2 the forced stop.
+  const [terminates, setTerminates] = useState(0);
   // A second cancel click before the first answers is ignored, like `start`.
   const cancelInFlight = useRef(false);
   const done = useRef(onDone);
@@ -207,7 +216,7 @@ export function useJob(
       if (inFlight.current) return;
       inFlight.current = true;
       setCancelView({ kind: "idle" });
-      setStopping(false);
+      setTerminates(0);
       setView({ kind: "submitting" });
       client
         .submit(kind, body)
@@ -245,7 +254,7 @@ export function useJob(
       .then(({ signal }) => {
         cancelInFlight.current = false;
         if (!current()) return;
-        if (signal === "terminate") setStopping(true);
+        if (signal === "terminate") setTerminates((n) => n + 1);
         setCancelView({ kind: "sent", signal });
       })
       .catch((error: unknown) => {
@@ -258,7 +267,7 @@ export function useJob(
   return {
     view,
     start,
-    cancel: { view: cancelView, stopping, request: requestCancel },
+    cancel: { view: cancelView, stopping: terminates >= 1, forced: terminates >= 2, request: requestCancel },
   };
 }
 
@@ -468,20 +477,34 @@ export const FORCE_STOP_LABEL = "Force stop";
  * start the job and cannot stop it, so it shows nothing). The first press
  * asks the job to stop, as Ctrl-C does: a replication run finishes the
  * copies in flight and saves its state before it stops. If it does not stop,
- * the button then offers a forced stop, which kills it at once.
+ * the button then offers a forced stop: a second terminate, on which the run
+ * cancels its warehouse statements and exits. The engine kills it if it is
+ * still running 15 s later, and a third press kills it at once.
  */
 function CancelControl({ cancel }: { cancel: JobCancel }) {
   const access = useWriteAccess();
   if (access.kind !== "operator") return null;
   const view = cancel.view;
   const label = cancel.stopping ? FORCE_STOP_LABEL : "Cancel";
-  const busy = view.kind === "sending" || (view.kind === "sent" && view.signal === "kill");
+  const killed = view.kind === "sent" && view.signal === "kill";
+  const busy = view.kind === "sending" || killed;
   return (
     <div className="space-y-0.5">
       <WriteButton label={label} busy={busy} busyLabel="stopping…" onClick={cancel.request} />
-      {cancel.stopping && !busy && (
+      {cancel.stopping && !cancel.forced && !busy && (
         <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
           Asked the job to stop, as Ctrl-C does. A run finishes the copies in flight first.
+        </p>
+      )}
+      {killed && (
+        <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+          Kill sent. The job should end now. The warehouse may still be running its statements.
+        </p>
+      )}
+      {cancel.forced && !busy && (
+        <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+          Forced stop sent. The run cancels its warehouse statements, then exits. If it is still running 15 s later,
+          the engine kills it. Press again to kill it now.
         </p>
       )}
       {view.kind === "refused" && (

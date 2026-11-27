@@ -33,7 +33,7 @@ pub use crate::commands::product::{
 pub use crate::commands::review::{compute_review_status, run_review_status};
 pub use crate::commands::run::RunTermination;
 #[cfg(feature = "duckdb")]
-pub use crate::commands::test::test_output;
+pub use crate::commands::test::{dialect_warning, test_output};
 // How many declarative tests the runner WOULD execute for a model. The
 // loop reports these as deferred at `verifying`, where the target is not
 // materialised yet and none of them can run. Shares the declarative

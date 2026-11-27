@@ -127,7 +127,7 @@ A backfill re-runs **existing** recipes over a scoped window — it never rewrit
 
 ## `rocky policy`
 
-The agent-authority policy plane. A `[policy]` rule in `rocky.toml` resolves a `(principal, capability, scope)` triple to one of three effects: `allow`, `require_review`, or `deny`. Rocky enforces the resolved effect at the mutating [seams](/reference/glossary/#seam). The seams are `rocky apply`, branch promote, the MCP write tools, an agent's `rocky run` (the `run` capability), and drift auto-apply. Drift auto-apply runs in `rocky run` when `auto_apply_additive_drift` is on. For `rocky run`, a `require_review` effect is recorded and warned about, and the run proceeds. Only `deny` refuses it. With no `[policy]` block, behaviour is unchanged.
+The agent-authority policy plane. A `[policy]` rule in `rocky.toml` resolves a `(principal, capability, scope)` triple to one of three effects: `allow`, `require_review`, or `deny`. Rocky enforces the resolved effect at the mutating [seams](/reference/glossary/#seam). The seams are `rocky apply`, branch promote, the MCP write tools, an agent's `rocky run` (the `run` capability), and drift auto-apply. Drift auto-apply runs in `rocky run` when `auto_apply_additive_drift` is on. For an agent's `rocky run`, `require_review` and `deny` both refuse the run, because a one-step run has no plan to review. With no `[policy]` block, behaviour is unchanged.
 
 ```bash
 rocky policy check --principal agent --capability apply --model fct_orders

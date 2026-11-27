@@ -192,8 +192,9 @@ pub(crate) async fn count_sources(
 
 /// Count `table` once per run: a table already counted reuses its result.
 ///
-/// `None` when the run is cancelled while the count runs: the query is
-/// dropped, and nothing is memoized.
+/// `None` when the run is cancelled while the count runs: a cancel is sent
+/// for the count's statement (bounded, best effort), the query is dropped,
+/// and nothing is memoized.
 async fn count_once(
     warehouse: &dyn WarehouseAdapter,
     table: &str,
@@ -212,10 +213,27 @@ async fn count_once(
     }
     let started = Instant::now();
     let result = match table_ref {
-        Ok(table_ref) => tokio::select! {
-            result = count_rows(warehouse, &table_ref) => result,
-            () = cancel.cancelled() => return None,
-        },
+        Ok(table_ref) => {
+            let before = warehouse.in_flight_statements();
+            let count = count_rows(warehouse, &table_ref);
+            tokio::pin!(count);
+            tokio::select! {
+                result = &mut count => result,
+                () = cancel.cancelled() => {
+                    // The count is dropped on return. While it is still
+                    // alive its statement is listed, so cancel it first: a
+                    // warehouse keeps running a query its client left.
+                    crate::statement_cancel::cancel_started_since(
+                        "warehouse",
+                        warehouse,
+                        &before,
+                        "source volume count",
+                    )
+                    .await;
+                    return None;
+                }
+            }
+        }
         Err(reason) => Err(reason),
     };
     let found = Counted {
@@ -386,6 +404,54 @@ mod tests {
         assert!(refusals.get("out").is_none());
         assert!(output.volume_warnings.is_empty());
         assert_eq!(output.source_volumes.len(), 1);
+        assert_eq!(
+            output.source_volumes[0].verdict,
+            VolumeVerdict::NotEvaluated
+        );
+    }
+
+    /// A cancel while the count runs sends a cancel for the count's
+    /// statement before the query is dropped. A statement that was already
+    /// running before the count started is not touched.
+    #[tokio::test]
+    async fn a_cancel_during_the_count_cancels_the_count_statement() {
+        use crate::testing::{CancelAnswer, CancellableWarehouseAdapter};
+        use rocky_core::statement_cancel::StatementHandle;
+
+        let warehouse = CancellableWarehouseAdapter::with_hanging_queries(CancelAnswer::Accept);
+        let _earlier = warehouse
+            .in_flight
+            .register(StatementHandle::new("earlier"));
+        let volumes = SourceVolumes::from_ranges(vec![range(
+            "p",
+            "out",
+            "c.s.t",
+            (Some(1), None, Some(VolumeSeverity::Error)),
+        )]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+
+        let cancel_once_counting = async {
+            while warehouse.in_flight.snapshot().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+            cancel.cancel();
+        };
+        let (refusals, ()) = tokio::join!(
+            count_sources(&volumes, |_| true, &warehouse, &mut output, &cancel),
+            cancel_once_counting
+        );
+
+        assert_eq!(
+            *warehouse.cancelled.lock().unwrap(),
+            vec![StatementHandle::new("query")]
+        );
+        assert_eq!(
+            warehouse.in_flight.snapshot(),
+            vec![StatementHandle::new("earlier")],
+            "the count is dropped after its cancel"
+        );
+        assert!(refusals.get("out").is_none());
         assert_eq!(
             output.source_volumes[0].verdict,
             VolumeVerdict::NotEvaluated
