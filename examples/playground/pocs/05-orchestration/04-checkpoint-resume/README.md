@@ -7,16 +7,13 @@
 
 ## What it shows
 
-`rocky run` records per-table progress in the state store as it processes a
-replication pipeline. When a run fails partway, `rocky run --resume-latest`
-reads that run's checkpoint, skips the tables that already succeeded, and
-retries only the ones that did not.
+`rocky run` records per-table progress. After a partial failure,
+`rocky run --resume-latest` skips the tables that succeeded and retries the rest.
 
-A checkpoint belongs to the scope that wrote it: the pipeline, its `--filter`,
-and where it writes. A `--resume-latest` from another scope is refused, and
-`--resume-latest` refuses when the latest run in scope succeeded. Both
-refusals are demonstrated here. (An explicit `--resume <run-id>` checks the
-scope but not whether that run succeeded.)
+A checkpoint belongs to its scope: the pipeline, its `--filter`, and where it
+writes. `--resume-latest` from another scope is refused, and so is one when the
+latest run in scope succeeded. (An explicit `--resume <run-id>` checks the scope
+but not whether that run succeeded.)
 
 ## How it works
 
@@ -32,23 +29,10 @@ run 2  --resume-latest     skips orders + customers, copies products   exit 0
    +-- resume again        refused: the latest run succeeded
 ```
 
-The failure is induced by occupying the `products` target with a view that
-Rocky did not create, with a column that matches the source so drift detection
-has nothing to alter. `full_refresh` then replaces the target table, and DuckDB
-refuses to replace a view with a table (`Existing object products is of type
-View, trying to replace with type Table`), so that one table fails while the
-other two copy. The script asserts that error, then drops the view before
-resuming.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml
-├── run.sh           Demonstrates the --resume-latest contract
-└── data/seed.sql
-```
+The failure is induced by a view Rocky did not create occupying the `products`
+target (matching column, so drift detection has nothing to alter). DuckDB refuses
+to replace it (`Existing object products is of type View, trying to replace with
+type Table`). The script drops the view before resuming.
 
 ## Run
 
@@ -58,12 +42,10 @@ resuming.
 
 ## Expected output
 
-- `Run 1` exits 2 with `status = PartialFailure`, `tables_copied = 2`,
-  `tables_failed = 1`, and the recorded error names the view.
-- A resume with `--filter source=orders` is refused with `no progress found`:
-  the filter makes it a different scope, and the checkpoint is not visible
-  from there.
-- `Run 2 (--resume-latest)` exits 0 with `tables_skipped = 2`,
-  `tables_copied = 1`, and a `resumed_from` naming run 1.
-- A third `--resume-latest` is refused: `nothing to resume: run <run 2 id>
-  already succeeded`.
+- Run 1 exits 2: `status = PartialFailure`, `tables_copied = 2`,
+  `tables_failed = 1`; the error names the view.
+- The `--filter source=orders` resume is refused with `no progress found`.
+- Run 2 exits 0: `tables_skipped = 2`, `tables_copied = 1`, `resumed_from`
+  naming run 1.
+- A third `--resume-latest` is refused:
+  `nothing to resume: run <run 2 id> already succeeded`.

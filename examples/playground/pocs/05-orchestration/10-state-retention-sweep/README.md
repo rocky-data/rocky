@@ -8,44 +8,19 @@
 
 ## What it shows
 
-Rocky tracks every run in `state.redb`: `run_history`, `dag_snapshots`,
-and `quality_history` grow monotonically until something prunes them.
-The `[state.retention]` config block governs that prune, with two
-delivery paths exercised by this POC:
+`run_history`, `dag_snapshots` and `quality_history` in `state.redb` grow until
+pruned. `[state.retention]` controls the prune, run either by
+`rocky state retention sweep` (`--dry-run` to plan only) or by an auto-sweep at
+the end of `rocky run`, throttled by `sweep_interval_seconds`.
 
-1. **Manual** — `rocky state retention sweep` (with `--dry-run` to plan
-   without deleting) explicitly prunes the three history domains.
-2. **Automatic** — `rocky run` end-of-run auto-sweep, throttled by
-   `sweep_interval_seconds` so a project that runs every minute doesn't
-   pay the sweep cost on every invocation.
+Operational tables (schema cache, watermarks, partition records, loaded files,
+branches, idempotency keys, grace periods, check history) are **never** swept,
+whatever the configuration says. A swept run record takes its resume checkpoint
+with it, unless that checkpoint still needs watermark recovery or still owes
+post-copy checks.
 
-Operational tables (schema cache, watermarks, partition records, loaded
-files, branches, idempotency keys, grace periods, check history) are
-**never** swept, whatever the configuration says. A swept run record takes
-its resume checkpoint with it, unless that checkpoint still needs watermark
-recovery or still owes post-copy checks.
-
-## Why it's distinctive
-
-- **No external cron.** A long-running project is a single config block
-  away from a self-bounded state store; auto-sweep amortizes the cost
-  end-of-run.
-- **Dry-run plan equals apply count.** Both paths share the same planner,
-  so the dry-run JSON's `runs_deleted` is exactly what the apply path
-  will remove (modulo concurrent writers).
-- **Operational tables are explicitly off-limits.** Retention only ever
-  touches history domains; the schema cache and watermark map stay
-  intact, so the next run isn't paying a cold-cache penalty.
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        [state.retention] knobs + DuckDB pipeline
-├── run.sh            manual + auto-sweep walkthrough
-└── data/seed.sql     raw__orders.orders bootstrap
-```
+Both paths share one planner, so the dry run's `runs_deleted` is what apply
+removes (modulo concurrent writers).
 
 ## Prerequisites
 
@@ -58,6 +33,10 @@ recovery or still owes post-copy checks.
 ```bash
 ./run.sh
 ```
+
+It does three runs with auto-sweep parked (`sweep_interval_seconds = 3600`, in a
+copied `rocky.no-auto.toml`), a dry run, a manual sweep, then three runs with the
+live `rocky.toml` (`sweep_interval_seconds = 0`).
 
 ## Expected output
 
@@ -75,24 +54,8 @@ recovery or still owes post-copy checks.
 
 ==> Three more runs WITH auto-sweep (sweep_interval_seconds = 0)
     after run 4: history rows = 1
-    after run 5: history rows = 1
-    after run 6: history rows = 1
+...
 ```
-
-## What happened
-
-1. **Three runs with auto-sweep parked** — `run.sh` copies `rocky.toml`
-   into `rocky.no-auto.toml` with `sweep_interval_seconds = 3600` so the
-   run loop's auto-sweep skips silently. After three replication runs,
-   `run_history` carries three rows.
-2. **Dry-run** — `rocky state retention sweep --dry-run` reports the
-   plan (`runs_deleted = 2`, `runs_kept = 1`) without touching the
-   state store. The probe confirms the table is still at 3.
-3. **Apply** — `rocky state retention sweep` runs the same plan for
-   real and drops the table to `min_runs_kept = 1`.
-4. **Auto-sweep on `rocky run`** — Switching back to the live
-   `rocky.toml` (`sweep_interval_seconds = 0`), three further runs each
-   trigger an end-of-run sweep. `run_history` stays flat at 1.
 
 ## Config knobs
 
@@ -110,11 +73,3 @@ sweep_budget_ms = 5000        # soft budget; exceeding flips the per-run
 
 Set `applies_to = []` to turn the sweep off (manual and automatic) without
 removing the block.
-
-## Related
-
-- Engine source: `engine/crates/rocky-cli/src/commands/state.rs`,
-  `engine/crates/rocky-core/src/retention.rs`
-- Sibling POC: [`04-checkpoint-resume`](../04-checkpoint-resume/) —
-  state-store usage for resumable runs; this POC is the operational
-  housekeeping counterpart.

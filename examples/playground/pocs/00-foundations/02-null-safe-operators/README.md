@@ -7,39 +7,7 @@
 
 ## What it shows
 
-Demonstrates that Rocky's `!=` operator compiles to `IS DISTINCT FROM`, which
-treats NULL as a regular value. SQL's standard `!=` does not: it returns
-`UNKNOWN` for NULL comparisons, so rows with NULL on either side are dropped
-by `WHERE col != value`.
-
-This POC ships two models that filter the same source two different ways and
-verifies the row counts diverge when NULL values are present.
-
-## Why it's distinctive
-
-- **A bug class dbt cannot fix at the model level.** Anyone writing
-  `WHERE status != 'cancelled'` in plain SQL silently loses the NULL-status
-  rows. The Rocky DSL compiles your filter to NULL-safe SQL automatically.
-- The two models are side-by-side so the difference is reviewable in one place.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml
-├── run.sh
-├── models/
-│   ├── _defaults.toml          Shared target (poc.demo)
-│   ├── raw_orders.sql
-│   ├── raw_orders.toml
-│   ├── filter_dsl.rocky        Rocky DSL: != lowers to IS DISTINCT FROM
-│   ├── filter_dsl.toml
-│   ├── filter_sql.sql          Plain SQL: != skips NULL rows
-│   └── filter_sql.toml
-└── data/
-    └── seed.sql                Includes deliberate NULL-status rows
-```
+Rocky's `!=` compiles to `IS DISTINCT FROM`, which treats NULL as a value. SQL's `!=` returns `UNKNOWN` for NULL comparisons, so `WHERE col != value` silently drops NULL rows. Two models (`filter_dsl.rocky`, `filter_sql.sql`) filter the same seed both ways.
 
 ## Run
 
@@ -49,14 +17,7 @@ verifies the row counts diverge when NULL values are present.
 
 ## Expected output
 
-Both filters target the same `raw_orders` table. The DSL filter (`filter_dsl`)
-keeps NULL-status rows; the SQL filter (`filter_sql`) drops them.
-
-`run.sh` first prints the SQL Rocky actually lowered `filter_dsl` to (captured
-from `rocky compile --expand-macros`, so it reads `IS DISTINCT FROM`, not a
-hand-written copy) and fails loudly if that lowering ever regresses. It then
-builds both DuckDB tables from Rocky's own compiled SQL and reports the row
-count delta:
+`run.sh` prints the SQL Rocky actually lowered `filter_dsl` to (from `rocky compile --expand-macros`) and fails if the lowering regresses. It then builds both DuckDB tables from Rocky's compiled SQL and reports the row counts:
 
 ```
 Rocky lowered the DSL filter (filter_dsl) to:
@@ -72,4 +33,4 @@ Rocky lowered the DSL filter (filter_dsl) to:
 ## Related
 
 - DSL lowering: `engine/crates/rocky-lang/src/lower.rs` (search for `IS DISTINCT FROM`)
-- Documented in `docs/src/content/docs/concepts/rocky-dsl.md` (the "NULL-safe operators" section)
+- `docs/src/content/docs/concepts/rocky-dsl.md` ("NULL-safe operators")

@@ -20,7 +20,7 @@ The official starter examples live in `../../engine/examples/` (quickstart, mult
 Every POC under `pocs/<category>/<id>-<name>/` must contain:
 
 ```
-README.md      # Structured: feature, why distinctive, layout, run, expected output
+README.md      # Short: what it shows, prerequisites, run, expected output, limitations
 rocky.toml     # Minimal POC-specific config (DuckDB by default)
 run.sh         # Executable end-to-end demo (chmod +x)
 models/        # .sql / .rocky files + .toml sidecars

@@ -7,36 +7,9 @@
 
 ## What it shows
 
-`rocky trace <run_id>` reads a `RunRecord` from the state store and
-renders it as a timeline: per-model offsets, duration bars,
-concurrency lanes. Same backing store as `rocky replay`, different
-view: replay is *"what exactly ran?"*, trace is *"show me the shape
-of the run"*.
+`rocky trace <run_id>` renders a `RunRecord` from the state store as a timeline: per-model offsets, duration bars, concurrency lanes. `rocky replay` reads the same store and answers what ran; trace shows the shape of the run.
 
-The default `rocky` build includes the `otel` Cargo feature. Set
-`OTEL_EXPORTER_OTLP_ENDPOINT` and Rocky also exports its tracing spans
-over OTLP: a `run` span for the run, with child spans for its steps.
-Your OpenTelemetry collector receives them as ordinary spans.
-
-## Why it's distinctive
-
-- **The Gantt is trace data, not render metadata.** Other orchestrators
-  reconstruct a timeline from logs post-hoc; Rocky produces it from the
-  primary RunRecord, so it always matches reality.
-- **OTLP is the on-ramp**: `rocky trace` is the local-inspection view.
-  No special build is needed. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and the
-  run's spans go to Grafana Tempo / Honeycomb / Datadog as ordinary
-  OTel spans.
-
-## Layout
-
-```
-.
-├── README.md      this file
-├── rocky.toml     DuckDB pipeline with two sources to give the Gantt concurrency
-├── run.sh         end-to-end demo (seed → run orders + customers → trace)
-└── data/seed.sql  raw__orders.orders + raw__customers.customers
-```
+The default build includes the `otel` Cargo feature. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and Rocky also exports its tracing spans over OTLP (a `run` span with child spans for its steps) to your OpenTelemetry collector.
 
 ## Prerequisites
 
@@ -49,15 +22,7 @@ Your OpenTelemetry collector receives them as ordinary spans.
 ./run.sh
 ```
 
-## What happened
-
-1. Seed two source tables.
-2. Run the pipeline once — both sources copy concurrently, so the
-   single run record holds two models on two concurrency lanes.
-3. `rocky trace latest` — renders the recorded run as a timeline
-   (per-model offsets, duration bars, concurrency lanes), read from the
-   run record `rocky run` persists to the state store.
-4. `rocky replay latest` — the sibling inspection command.
+The script seeds two sources and runs the pipeline once. Both copy concurrently, so one run record holds two models on two lanes. It then runs `rocky trace latest` and `rocky replay latest`.
 
 ## Related
 

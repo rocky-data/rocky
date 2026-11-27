@@ -9,57 +9,14 @@
 
 ## What it shows
 
-The four primitives that make up Rocky's branch / replay / lineage
-surface, all on a single 3-model DuckDB pipeline:
+Branches, replay and column lineage on one 3-model DuckDB project:
 
-1. **Named branches** — `rocky branch create fix_revenue` registers a
-   virtual branch in the state store; runs written against the branch
-   land in a prefixed schema, leaving `main` untouched.
-2. **Branch-scoped runs** — `rocky run --branch fix_revenue` is the
-   persistent analogue of `--shadow`. Warehouse-native zero-copy clones
-   slot into the same API: Databricks emits `SHALLOW CLONE` and BigQuery
-   emits `CREATE TABLE … COPY` (both metadata-only) via the
-   `WarehouseAdapter::clone_table_for_branch` trait method. DuckDB and
-   Snowflake fall through to the portable CTAS default.
-3. **Replay** — `rocky replay latest` reads `RunRecord`s back from the
-   state store: every model, SQL hash, row count, timings, per-model
-   status. The reproducibility artefact for *"what exactly ran?"*.
-   `rocky history` lists recent runs; `rocky cost latest` rolls up
-   per-run cost from the same record. `rocky replay <run_id> --execute
-   --verify` re-runs the recorded recipe and compares output hashes. This
-   POC does not run it.
-4. **Column-level blast radius** — `rocky lineage raw_orders --column
-   amount --downstream` traces every consumer of `amount`, so you can
-   see before you ship a schema change exactly which downstream columns
-   will need to move.
+1. **Named branches**: `rocky branch create fix_revenue` registers a virtual branch in the state store (no warehouse side effects). Runs against it write to a prefixed schema, leaving `main` untouched.
+2. **Branch-scoped runs**: `rocky run --branch fix_revenue` is the persistent analogue of `--shadow`. Through `WarehouseAdapter::clone_table_for_branch`, Databricks emits `SHALLOW CLONE` and BigQuery `CREATE TABLE … COPY` (both metadata-only); DuckDB and Snowflake use the portable CTAS default.
+3. **Replay**: `rocky replay latest` reads the `RunRecord` back: every model, SQL hash, row count, timings, per-model status. `rocky history` lists recent runs; `rocky cost latest` rolls up per-run cost. `rocky replay <run_id> --execute --verify` re-runs the recorded recipe and compares output hashes. This POC does not run it.
+4. **Column-level blast radius**: `rocky lineage raw_orders --column amount --downstream` traces every consumer of `amount`. Lineage is compiler-driven, so `group customer_id { total: sum(amount) }` traces `amount → total`.
 
-## Why it's distinctive
-
-- **The DAG is the primitive.** Warehouses don't own it; Rocky does.
-  That's why branches, replay, and column lineage are all one command
-  away here and wouldn't be in any warehouse.
-- **Replay captures SQL hashes and row counts** at the time of the run,
-  so the same `run_id` answers both *"what ran at 03:15 UTC?"* and
-  *"are you sure it was deterministic?"* (`rocky replay --execute
-  --verify` answers the second; this POC shows only inspection).
-- **Column lineage is semantic-graph aware** (compiler-driven, not
-  regex). An expression like `group customer_id { total: sum(amount) }`
-  is correctly traced as `amount → total` through the group-by.
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        DuckDB pipeline, full-refresh strategy
-├── run.sh            end-to-end demo (compile → run → branch → replay → lineage)
-├── data/seed.sql     200-row synthetic orders table
-└── models/
-    ├── _defaults.toml       catalog=poc, schema=demo
-    ├── raw_orders.sql       leaf: reads from seeds.orders
-    ├── stg_orders.rocky     filter cancelled orders
-    └── fct_revenue.rocky    group by customer_id → total
-```
+Note: the runs here replicate `raw__orders.orders` into `poc.staging__orders.orders`. The 3 models are only compiled, not materialized.
 
 ## Prerequisites
 
@@ -72,24 +29,8 @@ surface, all on a single 3-model DuckDB pipeline:
 ./run.sh
 ```
 
-## What happened
-
-1. **Compile** — semantic graph for 3 models; column schemas propagated
-   from `raw_orders` through to `fct_revenue`.
-2. **Run on main** — the replication copies `raw__orders.orders` into
-   `poc.staging__orders.orders` and records a `RunRecord`. (The 3 models
-   are only compiled in step 1, not materialized.)
-3. **Create branch `fix_revenue`** — state-store entry, no warehouse
-   side effects.
-4. **Run on the branch** — writes to a prefixed schema, separate
-   `RunRecord`.
-5. **Replay latest** — dumps the recorded artefact for the branch run.
-6. **Lineage downstream from `raw_orders.amount`** — shows every
-   downstream column that would break if `amount` changes type.
-
 ## Related
 
-- Engine source: `engine/crates/rocky-engine/src/branch.rs`,
-  `engine/crates/rocky-cli/src/commands/{branch.rs,replay.rs,lineage.rs}`
-- Companion example: [`engine/examples/multi-layer/`](../../../../../engine/examples/multi-layer/)
-- Sibling POC: [`06-developer-experience/01-lineage-column-level/`](../../06-developer-experience/01-lineage-column-level/)
+- Engine source: `engine/crates/rocky-engine/src/branch.rs`, `engine/crates/rocky-cli/src/commands/{branch.rs,replay.rs,lineage.rs}`
+- [`engine/examples/multi-layer/`](../../../../../engine/examples/multi-layer/)
+- [`06-developer-experience/01-lineage-column-level/`](../../06-developer-experience/01-lineage-column-level/)

@@ -7,28 +7,11 @@
 
 ## What it shows
 
-A transformation pipeline materialises two models into a target schema (`poc.mart`) that does not exist when the run starts. With `auto_create_schemas = true` set on the pipeline target's governance block, Rocky creates the schema between compile and execute, then materialises the models into it.
-
-## Why it's distinctive
-
-- **Regression guard.** Before engine 1.29.0, transformation pipelines ignored this setting, and the run failed with `Catalog Error: Schema with name mart does not exist`. The precondition asserts the schema is absent; the run must still succeed.
-- **One config knob, zero `CREATE SCHEMA` boilerplate.** Without `auto_create_schemas`, users hand-author the schema before every fresh deploy.
-
-## Layout
-
-```
-.
-├── README.md                                    this file
-├── rocky.toml                                   transformation pipeline w/ auto_create_schemas = true
-├── run.sh                                       end-to-end demo
-├── models/
-│   ├── stg_orders.sql                           filter source on status; target poc.mart
-│   ├── stg_orders.toml                          full_refresh -> poc.mart.stg_orders
-│   ├── order_revenue_by_customer.sql            depends on stg_orders; aggregate
-│   └── order_revenue_by_customer.toml           full_refresh -> poc.mart.order_revenue_by_customer
-└── seeds/
-    └── seed.sql                                 8 orders in raw__orders.orders (2 cancelled)
-```
+A transformation pipeline materialises two models into `poc.mart`, a schema that
+does not exist when the run starts. With `auto_create_schemas = true` on
+`[pipeline.transform.target.governance]`, Rocky creates it between compile and
+execute. Before engine 1.29.0, transformation pipelines ignored this setting and
+the run failed with `Catalog Error: Schema with name mart does not exist`.
 
 ## Prerequisites
 
@@ -43,63 +26,20 @@ A transformation pipeline materialises two models into a target schema (`poc.mar
 
 ## Expected output
 
-```text
-=== precondition — 'mart' schema does NOT exist in DuckDB ===
-+-------------+
-| schema_name |
-+-------------+
-| main        |
-| raw__orders |
-+-------------+
-  (expected: only 'main' + 'raw__orders' — no 'mart' schema yet)
+`run.sh` shows `mart` absent, runs, then shows the schema, both tables and the
+revenue rows.
 
+```text
 === run — pipeline creates 'poc.mart' before materializing the two models ===
   2 model(s) materialized:
     - poc.mart.stg_orders (full_refresh): ok
     - poc.mart.order_revenue_by_customer (full_refresh): ok
-
-=== postcondition — 'mart' schema now exists, and both models live in it ===
-  -- schemas in catalog 'poc' (now includes 'mart'):
-+-------------+
-| schema_name |
-+-------------+
-| main        |
-| mart        |
-| raw__orders |
-+-------------+
-  -- tables in poc.mart:
-+---------------------------+------------+
-| table_name                | table_type |
-+---------------------------+------------+
-| order_revenue_by_customer | BASE TABLE |
-| stg_orders                | BASE TABLE |
-+---------------------------+------------+
-  -- poc.mart.order_revenue_by_customer:
-+-------------+-------------+--------------------+
-| customer_id | order_count | total_revenue      |
-+-------------+-------------+--------------------+
-| 101         | 2           | 44.239999999999995 |
-| 102         | 1           | 49.5               |
-| 103         | 2           | 238.5              |
-| 104         | 1           | 9.99               |
-+-------------+-------------+--------------------+
 ```
 
-> The `run` step reports `ok` rather than a row count: transformation-pipeline
-> materializations don't populate `rows_copied` (that field is for the
-> replication path). `stg_orders` still keeps 6 of 8 rows and
-> `order_revenue_by_customer` aggregates to 4 customers, as the revenue table
-> above confirms.
-
-## What happened
-
-1. `seeds/seed.sql` populates `raw__orders.orders` with 8 rows; the `poc.mart` target schema is intentionally not pre-created.
-2. The precondition query against `information_schema.schemata` confirms `poc.mart` is absent.
-3. `rocky run` compiles the two models, then (because `auto_create_schemas = true` is set on `[pipeline.transform.target.governance]`) pre-creates the unique `(catalog, schema)` pairs declared by the model set (here, just `poc.mart`) before executing per-model SQL.
-4. Both models materialise: `stg_orders` filters the cancelled orders out (6 of 8 rows), `order_revenue_by_customer` aggregates by `customer_id` (4 distinct customers).
-5. The postcondition queries show the schema now exists and contains both tables.
+The `run` step reports `ok`, not a row count: transformation materializations
+don't populate `rows_copied` (a replication field). `stg_orders` keeps 6 of 8
+seeded rows (2 cancelled) and `order_revenue_by_customer` has 4 customers.
 
 ## Related
 
-- Rocky configuration reference: [`[…target.governance]`](https://rocky-data.dev/reference/configuration/#pipelinenametargetgovernance)
-- Source: `engine/crates/rocky-cli/src/commands/run_local.rs` (transformation path) + `engine/crates/rocky-cli/src/commands/run.rs` (replication path, pre-existing parity).
+- [`[…target.governance]` reference](https://rocky-data.dev/reference/configuration/#pipelinenametargetgovernance)

@@ -1,8 +1,6 @@
 # Live BigQuery smoke tests
 
-Credential-gated counterparts to the parent POC's `../run.sh` (which is
-compile-only). Each driver runs a different materialization strategy
-end-to-end against a real GCP project and asserts the resulting state.
+Credential-gated counterparts to the compile smoke in `../run.sh`. Each driver runs end-to-end against a real GCP project and asserts the result.
 
 ## Drivers
 
@@ -11,29 +9,11 @@ end-to-end against a real GCP project and asserts the resulting state.
 | `./run.sh` | `full_refresh` | `BigQueryDialect::create_table_as` |
 | `time-interval/run.sh` | `time_interval` | `BigQueryDialect::insert_overwrite_partition` (BEGIN TRANSACTION / DELETE / INSERT / COMMIT TRANSACTION script) |
 | `merge/run.sh` | `merge` | `BigQueryDialect::merge_into` (`WHEN NOT MATCHED THEN INSERT ROW`) + first-run target bootstrap |
-| `discover/run.sh` | n/a | `BigQueryDiscoveryAdapter` enumerating datasets via region-qualified `INFORMATION_SCHEMA.SCHEMATA` |
-| `drift/run.sh` | `incremental` (replication) | Replication-from-BQ + per-table drift detection: `add_columns` (ALTER TABLE ADD COLUMN), `drop_and_recreate` (unsafe type change), and `alter_column_types` (safe widening, e.g. INT64 → NUMERIC) |
-| `cost-cross-check/run.sh` | `full_refresh` (scans a real source) | Rocky's `bytes_scanned` equals the `totalBytesBilled` that `bq show -j` reports for the same job ID |
+| `discover/run.sh` | n/a | `BigQueryDiscoveryAdapter` via region-qualified `INFORMATION_SCHEMA.SCHEMATA` |
+| `drift/run.sh` | `incremental` (replication) | Per-table drift: `add_columns`, `drop_and_recreate` (unsafe type change), `alter_column_types` (safe widening) |
+| `cost-cross-check/run.sh` | `full_refresh` (scans a real source) | Rocky's `bytes_scanned` equals `totalBytesBilled` from `bq show -j` for the same job ID |
 
-Each driver:
-
-- Pre-creates a target dataset, runs `rocky run`, asserts the resulting
-  rows via `bq query`, drops the dataset on exit (success or failure).
-- Captures the `rocky run --output json` payload to `expected/run.json`
-  (gitignored).
-- Has its own `live.rocky.toml` and `models/` so they can run in any
-  order without coupling.
-
-## What's not covered yet
-
-- Incremental strategy as a transformation pipeline (the
-  transformation incremental path has no callers in the repo and
-  `sql_gen` ignores `timestamp_column`, a separate design call).
-- Time-interval failure-path (forced mid-transaction error → BQ
-  auto-rollback). The script-as-transaction shape proves the happy
-  path; rollback semantics are a separate property worth its own test.
-- MERGE without explicit `update_columns` (see finding 5): no live driver
-  runs it yet.
+Drivers are independent, run in any order, and drop their datasets on exit (success or failure). JSON output goes to `expected/` (gitignored).
 
 ## Run
 
@@ -49,93 +29,26 @@ export BQ_LOCATION="EU"   # optional; default EU
 ./cost-cross-check/run.sh  # cost (rocky bytes_scanned vs bq show -j totalBytesBilled)
 ```
 
-Each script exits 0 on success after dropping its target dataset.
+Each script exits 0 on success.
 
 ## Project-ID templating
 
-The time-interval / merge / cost-cross-check model SQL references
-source tables by 3-part `project.dataset.table` name and so needs a
-project-qualified reference. Model **SQL bodies** don't honor `${VAR}`
-env substitution today — only `rocky.toml` and model `.toml` sidecars
-do (see finding 2 below) — so each driver writes a `__GCP_PROJECT__`
-placeholder into its committed files (SQL, plus the sidecars for
-staging uniformity) and substitutes it at runtime by staging the config + models
-into a temp dir, running `sed -i "s|__GCP_PROJECT__|${GCP_PROJECT_ID}|g"`
-across the staged copy, and pointing `rocky -c` at the temp
-`live.rocky.toml`. The repo therefore contains no project IDs; each
-driver works against whatever project `GCP_PROJECT_ID` resolves to.
+Model SQL bodies don't honor `${VAR}` substitution (finding 2), yet some reference sources by `project.dataset.table`. So committed files carry a `__GCP_PROJECT__` placeholder; drivers stage config and models into a temp dir, substitute `GCP_PROJECT_ID` with `sed`, and point `rocky -c` at the copy. No project ID is in the repo.
 
-## Why a separate `live/` subdir
+## What's not covered yet
 
-The parent POC's `../run.sh` is compile-only and runs as part of
-credential-free POC sweeps. Keeping the live driver in its own subdir
-means that path is unchanged.
+- Incremental as a transformation pipeline (that path has no callers in the repo and `sql_gen` ignores `timestamp_column`; a separate design call).
+- Time-interval failure path (mid-transaction error and BigQuery auto-rollback).
+- MERGE without explicit `update_columns` (finding 5).
 
 ## Notes surfaced while authoring
 
-Adapter-side gaps to revisit separately:
-
-1. ~~No `BigQueryDiscoveryAdapter`~~: **shipped**. BQ now
-   supports both `WarehouseAdapter` and `DiscoveryAdapter` traits;
-   `adapter_capability.rs` reports `BOTH`. Replication-from-BQ
-   pipelines work end-to-end (see `discover/run.sh`).
-2. **Model SQL bodies skip env substitution — sidecar TOMLs don't.**
-   Both `rocky.toml` and model `.toml` sidecars are piped through
-   `substitute_env_vars` at parse time (`engine/crates/rocky-core/src/models.rs`),
-   so `${VAR}` resolves in the sidecar. But the model **SQL file** is read
-   raw with no substitution, so the 3-part source
-   references in the merge / time-interval / cost SQL bodies still need
-   the `__GCP_PROJECT__` placeholder + runtime `sed`.
-3. **Transformation runs need the target dataset unless
-   `auto_create_schemas = true`.** The transformation run path reads
-   `pipeline.target.governance.auto_create_schemas` (`run_local.rs` →
-   `execute_models`, which emits `CREATE SCHEMA`; covered by the
-   `transformation_auto_create_schemas_materializes_fresh_schema` test).
-   It defaults to `false` and these drivers don't opt in, so `rocky run`
-   errors with 404 unless the dataset exists — the drivers pre-create it
-   via `bq mk`. Setting `auto_create_schemas = true` in `live.rocky.toml`
-   would let the run create it instead.
-4. **Time-interval `time_column` must be TIMESTAMP on BigQuery.** The
-   runtime emits the partition filter as `'YYYY-MM-DD HH:MM:SS'`
-   string literals (`rocky-core/src/sql_gen.rs`). BigQuery refuses to coerce a
-   timestamp-shape literal to a DATE column, so the model output's
-   partition column has to be TIMESTAMP. Other dialects are more
-   permissive. The time-interval model uses `TIMESTAMP_TRUNC(...)` to
-   produce a TIMESTAMP partition column.
-5. ~~MERGE emits the invalid whole-row `UPDATE SET target = source`~~:
-   **fixed**. BigQuery has no whole-row update form. When the model omits
-   `update_columns`, the runner resolves the list from the model's
-   columns. If it cannot, the BigQuery dialect refuses with a clear error
-   instead of emitting invalid SQL (`rocky-bigquery/src/dialect.rs`). The
-   merge model still declares `update_columns = ["name", "amount"]`.
-6. ~~`bytes_scanned` is `totalBytesProcessed`, not `totalBytesBilled`~~:
-   **fixed**. `execute_statement_with_stats` now follows up
-   `jobs.query` with a `jobs.get` call to enrich the response with
-   the full `statistics` block (where `totalBytesBilled` lives, with
-   the 10 MB minimum-bill floor applied). The merge and time-interval
-   smoke tests assert `bytes_scanned >= 10 MiB` to verify the
-   enrichment is firing.
-7. **Full-refresh `bytes_scanned` is zero when the model has no
-   source.** The `live/run.sh` model is `SELECT 1 AS id, ...` with no
-   FROM clause, so BigQuery reports `totalBytesProcessed: 0`. The
-   cost wire-up runs but the figure is `0` rather than missing. Real
-   models that scan source tables produce non-zero values (verified
-   via `live/merge/run.sh` and `live/time-interval/run.sh`).
-8. ~~`detect_drift` ignores added columns~~: **fixed**.
-   `detect_drift` now populates `added_columns: Vec<ColumnInfo>` for
-   source columns missing from the target, and the runtime issues
-   `ALTER TABLE ADD COLUMN` for each before the next INSERT. The
-   drift smoke test exercises this in stage 2 (`add_columns` action).
-9. ~~`alter_column_types` drift action is detected but not wired~~:
-   **fixed**. `is_safe_type_widening` and `alter_column_type_sql` now
-   live on the `SqlDialect` trait so each adapter declares its own
-   widening semantics + SQL emit. The BigQuery dialect override
-   accepts only the strict lossless promotions BQ supports via
-   `ALTER COLUMN SET DATA TYPE`: `INT64 → NUMERIC`, `INT64 →
-   BIGNUMERIC`, `NUMERIC → BIGNUMERIC`. Lossy conversions (`… →
-   FLOAT64`) and unsupported targets (`… → STRING`, despite being
-   lossless at the value level, since BQ's ALTER rejects this with
-   `existing column type X is not assignable to STRING`) are
-   excluded; drift involving them falls through to
-   `drop_and_recreate`. Stage 4 of `drift/run.sh` exercises the path
-   live (INT64 → NUMERIC).
+1. ~~No `BigQueryDiscoveryAdapter`~~: **shipped**. BigQuery implements `WarehouseAdapter` and `DiscoveryAdapter` (`adapter_capability.rs` reports `BOTH`), and replication-from-BQ works (`discover/run.sh`).
+2. **Model SQL bodies skip env substitution; sidecar TOMLs don't.** `rocky.toml` and model `.toml` sidecars pass through `substitute_env_vars` at parse time (`engine/crates/rocky-core/src/models.rs`). SQL files are read raw, hence the placeholder + `sed`.
+3. **Transformation runs need the target dataset unless `auto_create_schemas = true`.** The path reads `pipeline.target.governance.auto_create_schemas` (`run_local.rs` → `execute_models`, which emits `CREATE SCHEMA`; test `transformation_auto_create_schemas_materializes_fresh_schema`). It defaults to `false` and these drivers don't opt in, so without the dataset `rocky run` errors with 404. They pre-create it with `bq mk`.
+4. **Time-interval `time_column` must be TIMESTAMP on BigQuery.** The partition filter is emitted as `'YYYY-MM-DD HH:MM:SS'` literals (`rocky-core/src/sql_gen.rs`), which BigQuery won't coerce to DATE. The model uses `TIMESTAMP_TRUNC(...)`.
+5. ~~MERGE emits the invalid whole-row `UPDATE SET target = source`~~: **fixed**. BigQuery has no whole-row update. Without `update_columns`, the runner resolves the list from the model's columns; if it cannot, the dialect refuses with a clear error (`rocky-bigquery/src/dialect.rs`). The merge model still declares `update_columns = ["name", "amount"]`.
+6. ~~`bytes_scanned` is `totalBytesProcessed`, not `totalBytesBilled`~~: **fixed**. `execute_statement_with_stats` follows `jobs.query` with `jobs.get` to read `totalBytesBilled` (10 MB floor applied). Merge and time-interval assert `bytes_scanned >= 10 MiB`.
+7. **Full-refresh `bytes_scanned` is zero when the model has no source.** `live/run.sh`'s model is `SELECT 1 AS id, ...`, so BigQuery reports `totalBytesProcessed: 0`. Models that scan tables report non-zero.
+8. ~~`detect_drift` ignores added columns~~: **fixed**. It fills `added_columns` and the runtime issues `ALTER TABLE ADD COLUMN` before the next INSERT (drift stage 2).
+9. ~~`alter_column_types` drift action is detected but not wired~~: **fixed**. `is_safe_type_widening` and `alter_column_type_sql` are on `SqlDialect`. BigQuery accepts only `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, `NUMERIC → BIGNUMERIC`. `… → FLOAT64` (lossy) and `… → STRING` (BigQuery's ALTER rejects it with `existing column type X is not assignable to STRING`) fall through to `drop_and_recreate`. Drift stage 4 runs INT64 → NUMERIC live.
