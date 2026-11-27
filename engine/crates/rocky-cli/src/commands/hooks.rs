@@ -179,8 +179,13 @@ fn command_program(command: &str) -> String {
     };
     let mut words = command.split_whitespace().peekable();
     let mut dropped = false;
-    while words.peek().is_some_and(|word| is_assignment(word)) {
-        words.next();
+    while let Some(word) = words.next_if(|word| is_assignment(word)) {
+        // Splitting on whitespace cannot see a quoted or escaped value, so
+        // `AUTH='Bearer S1' curl` would serve `S1' curl`. A value that could
+        // hide whitespace shows nothing.
+        if word.contains(['"', '\'', '\\', '$', '`', '(', ')']) {
+            return "…".to_string();
+        }
         dropped = true;
     }
     let Some(first) = words.next() else {
@@ -394,10 +399,17 @@ mod tests {
             ("héllo\u{201c}https://h/SECRET5", "…"),
             ("", "…"),
             ("TOKEN=SECRET6", "…"),
+            ("AUTH='Bearer S1' curl x", "…"),
+            ("FOO=bar\\ S2 cmd", "…"),
+            ("A=$(echo S3 x) cmd", "…"),
+            ("A=`S4` cmd", "…"),
         ] {
             let got = command_program(command);
             assert_eq!(got, want, "{command}");
             assert!(!got.contains("SECRET"), "{got}");
+            for secret in ["S1", "S2", "S3", "S4"] {
+                assert!(!got.contains(secret), "{got}");
+            }
         }
     }
 

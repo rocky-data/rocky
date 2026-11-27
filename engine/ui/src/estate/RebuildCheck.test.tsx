@@ -148,7 +148,10 @@ describe("RebuildCheck", () => {
     renderCheck(noProvenance());
     const verdict = await screen.findByRole("status");
     expect(verdict).toHaveTextContent("Not recorded");
-    expect(verdict).toHaveTextContent("This project does not record provenance.");
+    expect(verdict).toHaveTextContent(
+      "This run recorded no provenance for this model. Rocky records it only for content-addressed models with [reuse] enabled = true.",
+    );
+    expect(verdict).toHaveTextContent("The engine said: no provenance recorded for this model");
     expect(verdict).toHaveTextContent("[reuse] enabled = true");
     expect(verdict.className).toContain("bg-surface-2");
     expect(verdict.className).not.toMatch(/fail|ok-soft|warn/);
@@ -174,7 +177,12 @@ describe("RebuildCheck", () => {
     renderCheck(failed);
     const verdict = await screen.findByRole("status");
     expect(verdict).toHaveTextContent("Not read: the state store did not answer");
-    expect(verdict).not.toHaveTextContent("does not record provenance");
+    expect(verdict).not.toHaveTextContent("recorded no provenance");
+    const rows = within(screen.getByRole("table", { name: "Why" })).getAllByRole("row").slice(1);
+    const [, result] = within(rows[0]).getAllByRole("cell");
+    expect(within(result).getByRole("img")).toHaveTextContent("-");
+    expect(within(result).getByRole("img")).toHaveAttribute("title", "Not read");
+    expect(within(result).queryByText("No")).toBeNull();
   });
 
   it("marks a recorded program that does not parse red, and leaves its determinism unread", async () => {
@@ -215,6 +223,7 @@ describe("RebuildCheck", () => {
     renderCheck(recorded({ nondeterministic: true }));
     const verdict = await screen.findByRole("status");
     expect(verdict.className).toContain("bg-warn-soft");
+    expect(verdict).toHaveTextContent("could not be shown deterministic (a volatile or unknown function)");
     expect(verdict).toHaveTextContent("a rebuild may differ");
     const row = within(screen.getByRole("table", { name: "Why" })).getByText("Same result every time").closest("tr")!;
     expect(within(row).getByText("No").className).toContain("bg-warn-soft");
@@ -269,7 +278,8 @@ describe("RebuildCheck", () => {
         loadHistory={never}
       />,
     );
-    expect(screen.getByText("No run of this model recorded yet.")).toBeInTheDocument();
+    expect(screen.getByText("No run of this model among the 50 newest runs.")).toBeInTheDocument();
+    expect(screen.getByText("rocky history --model fct_revenue").tagName).toBe("CODE");
     expect(load).not.toHaveBeenCalled();
   });
 

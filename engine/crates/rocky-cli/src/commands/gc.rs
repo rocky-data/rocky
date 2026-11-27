@@ -2767,8 +2767,13 @@ auto_create_schemas = true
     }
 
     fn record_run(store: &StateStore, run_id: &str, model: &str) {
+        record_run_models(store, run_id, &[model]);
+    }
+
+    /// A run that executed every model in `models`, in order.
+    fn record_run_models(store: &StateStore, run_id: &str, models: &[&str]) {
         let now = Utc::now();
-        let exec = ModelExecution {
+        let exec = |model: &str| ModelExecution {
             row_count: None,
             model_name: model.to_string(),
             started_at: now,
@@ -2803,7 +2808,7 @@ auto_create_schemas = true
                 started_at: now,
                 finished_at: now,
                 status: RunStatus::Success,
-                models_executed: vec![exec],
+                models_executed: models.iter().map(|m| exec(m)).collect(),
                 trigger: RunTrigger::Manual,
                 config_hash: "cfg".to_string(),
                 triggering_identity: None,
@@ -2829,6 +2834,59 @@ auto_create_schemas = true
                 hold: None,
             })
             .unwrap();
+    }
+
+    /// A consumer whose upstream is built in the same run by a model that
+    /// recorded no provenance is not derivable: the DAG replay cannot rebuild
+    /// that upstream. The producer's artifact row is in the ledger, so only
+    /// the in-run producer check refuses it.
+    #[test]
+    fn consumer_of_an_unrecorded_in_run_producer_is_not_derivable() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        let h_up = "7".repeat(64);
+        let h_down = "8".repeat(64);
+        seed(
+            &store,
+            "rp",
+            "down",
+            "SELECT 1 AS id",
+            &[UpstreamIdentity::Content {
+                upstream_key: "tgt.raw.up".to_string(),
+                blake3_hash: h_up.clone(),
+            }],
+            &h_down,
+            100,
+            old,
+        );
+        // The producer has an artifact row and no provenance.
+        store
+            .record_artifact(&ArtifactRecord {
+                blake3_hash: h_up.clone(),
+                run_id: "rp".to_string(),
+                model_name: "up".to_string(),
+                file_path: format!("s3://b/{h_up}.parquet"),
+                commit_version: 0,
+                size_bytes: 50,
+                written_at: old,
+            })
+            .unwrap();
+        record_run_models(&store, "rp", &["up", "down"]);
+
+        let report = gather_report(&store, None, Utc::now(), 7).unwrap();
+        let down = report
+            .candidates
+            .iter()
+            .find(|c| c.model_name == "down")
+            .unwrap();
+        assert!(!down.derivable, "{down:?}");
+        let replay = down
+            .checks
+            .iter()
+            .find(|k| k.check == "replayable")
+            .unwrap();
+        assert!(!replay.passed);
     }
 
     /// One old, unreferenced artifact with a recorded recipe, so the

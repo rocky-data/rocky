@@ -107,7 +107,13 @@ function RunChoice({
     case "ready": {
       const runId = newestRunOf(runs.value, name);
       if (runId === null) {
-        return <p className="text-sm text-ink-2">No run of this model recorded yet.</p>;
+        return (
+          <div className="space-y-1">
+            <p className="text-sm text-ink-2">No run of this model among the 50 newest runs.</p>
+            <p className="text-xs text-muted">An older run may hold it. Read it on the command line:</p>
+            <CommandBlock command={`rocky history --model ${name}`} />
+          </div>
+        );
       }
       return (
         <RunCheck
@@ -218,13 +224,15 @@ function Verdict({
       model.reasons.join("; ")
     ) : (
       <>
-        This project does not record provenance. Set <code>[reuse] enabled = true</code> in rocky.toml.
+        This run recorded no provenance for this model. Rocky records it only for content-addressed models with{" "}
+        <code>[reuse] enabled = true</code>.
+        {model.reasons.length > 0 && <> The engine said: {model.reasons.join("; ")}</>}
       </>
     );
   } else if (replayable) {
     headline = "This table can be rebuilt from its recording";
     why = model.nondeterministic
-      ? "The program and its inputs are recorded, but its SQL uses a volatile construct, so a rebuild may differ."
+      ? "The program and its inputs are recorded, but the SQL could not be shown deterministic (a volatile or unknown function), so a rebuild may differ."
       : "The program and its inputs are recorded, and nothing in the SQL is volatile.";
   } else {
     headline = "This table cannot be rebuilt exactly";
@@ -232,7 +240,7 @@ function Verdict({
   }
   const inputsOk = model.inputs.filter((i) => i.resolvable).length;
   const historyCommand = `rocky history --recipe ${recipeHash ?? "<hash>"}`;
-  const unrecorded = <Missing reason={NO_PROVENANCE} />;
+  const unrecorded = <Missing reason={readFailed ? "Not read: the state store did not answer" : NO_PROVENANCE} />;
   // The determinism scan reads the recorded program, so no parse, no answer.
   const noScan = !recorded || !model.ir_parseable;
   return (
@@ -261,7 +269,8 @@ function Verdict({
             <tbody>
               <CheckRow
                 label="Program recorded"
-                ok={model.has_provenance}
+                ok={readFailed ? undefined : model.has_provenance}
+                unevaluated={readFailed ? "Not read" : undefined}
                 neutralNo
                 detail={
                   model.proof_class ? (
@@ -294,7 +303,7 @@ function Verdict({
                   ) : !model.ir_parseable ? (
                     <Missing reason="the recorded program did not parse, so its SQL was not scanned" />
                   ) : model.nondeterministic ? (
-                    "the SQL has a volatile construct such as now() or random()"
+                    "the SQL could not be shown deterministic (a volatile or unknown function)"
                   ) : (
                     "no volatile construct found"
                   )
@@ -360,6 +369,7 @@ function CheckRow({
   detail,
   warnWhenNo = false,
   neutralNo = false,
+  unevaluated = "the engine did not evaluate this check",
 }: {
   label: string;
   /** `undefined` is a check the engine did not evaluate; `null` is a check with nothing to check. */
@@ -368,6 +378,8 @@ function CheckRow({
   warnWhenNo?: boolean;
   /** A "No" that is a plain fact, not a defect: shown grey. */
   neutralNo?: boolean;
+  /** Why an `undefined` result is shown as a grey dash. */
+  unevaluated?: string;
 }) {
   const style =
     ok === undefined || ok === null || (neutralNo && !ok)
@@ -382,7 +394,7 @@ function CheckRow({
       <td className={TABLE.td}>{label}</td>
       <td className={TABLE.td}>
         {ok === undefined ? (
-          <Missing reason="the engine did not evaluate this check" />
+          <Missing reason={unevaluated} />
         ) : (
           <span className={`rounded-chip px-2 py-0.5 text-xs font-medium ${style}`}>
             {ok === null ? "Nothing to check" : ok ? "Yes" : "No"}

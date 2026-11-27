@@ -107,6 +107,20 @@ describe("ComplianceScreen", () => {
     expect(load).toHaveBeenCalledTimes(1);
   });
 
+  it("drops the other environments' chips and pairs when one environment is picked", async () => {
+    render(<ComplianceScreen load={async () => OUTPUT} />);
+    await screen.findByRole("table", { name: "Classified columns" });
+    const email = () => screen.getByRole("list", { name: "Masking of customers.email" });
+    expect(within(email()).getAllByRole("listitem")).toHaveLength(2);
+    fireEvent.change(screen.getByLabelText("Environment"), { target: { value: "prod" } });
+    expect(within(email()).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      expect.stringMatching(/^prod · hash/),
+    ]);
+    expect(within(email()).queryByText(/dev · none/)).toBeNull();
+    // Only the prod pair of payments.notes counts as unmasked on purpose.
+    expect(within(card("Unmasked on purpose")).getByText("1")).toBeInTheDocument();
+  });
+
   it("draws red, green and amber chips from semantic tokens", async () => {
     render(<ComplianceScreen load={async () => OUTPUT} />);
     await screen.findByRole("table", { name: "Classified columns" });

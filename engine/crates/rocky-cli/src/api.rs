@@ -497,11 +497,15 @@ impl ApiError {
     /// (e.g. a concurrent CLI `rocky run`) has no job id, so it stays `None`.
     /// `500` — a `rocky.toml` the engine could not read or parse. Deliberately
     /// not the retryable `503`: retrying will not make an invalid config parse.
+    ///
+    /// The message loses the TOML source snippet: the quoted line can hold a
+    /// literal token. The line, column and reason stay. The CLI's report is
+    /// unchanged.
     fn config_invalid(message: &str) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_invalid",
-            message,
+            without_toml_source_snippet(message),
             Some("fix the config and retry; `rocky validate` reports the specific error"),
         )
     }
@@ -2458,6 +2462,26 @@ struct ComplianceQuery {
     exceptions_only: bool,
 }
 
+/// Drop the source lines a TOML parse error quotes.
+///
+/// `toml` renders `TOML parse error at line L, column C`, then a gutter line
+/// (`  |`), the source line (`L | text`), a caret line (`  |   ^`) and the
+/// reason. Only the source line can carry a literal secret, but the whole
+/// snippet goes: the header already gives the line and column.
+fn without_toml_source_snippet(message: &str) -> String {
+    let is_snippet = |line: &str| {
+        let rest = line
+            .trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit());
+        rest.trim_start().starts_with('|')
+    };
+    message
+        .lines()
+        .filter(|line| !is_snippet(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `GET /api/v1/compliance` — canonical [`ComplianceOutput`].
 ///
 /// The same bytes as `rocky compliance --output json` for the project the
@@ -2703,12 +2727,13 @@ async fn packages(
 /// `GET /api/v1/hooks` — canonical [`HooksListOutput`].
 ///
 /// What `rocky hooks list --output json` prints, plus the `[hook.webhooks]`
-/// endpoints. Runs no hook and calls no endpoint. A command prints a resolved
-/// `${VAR}` as `${NAME}`, a literal URL in it as scheme and host, and the
-/// value after `Bearer` or `--token` as `<redacted>`. A webhook URL is cut to
-/// its scheme and host. The config loads the way the rest of `rocky serve`
-/// loads it: an unset adapter credential stays literal text. With no config
-/// the list is empty.
+/// endpoints. Runs no hook and calls no endpoint. Each command is cut to its
+/// program name, followed by ` …` when arguments were dropped (`curl …`), or
+/// `…` alone when no plain program name can be told. An argument is never
+/// served. A webhook URL is cut to its scheme and host. The config loads the
+/// way the rest of `rocky serve` loads it: an unset adapter credential stays
+/// literal text. With no config the list is empty. A config that does not
+/// parse is `500 config_invalid`, without the quoted source line.
 async fn hooks_list(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<HooksListOutput>, ApiError> {
@@ -7191,6 +7216,10 @@ mod tests {
             "TOKENSECRET5",
             "APIKEYSECRET6",
             "HEADERSECRET7",
+            "QUOTEDASSIGNS8",
+            "ESCAPEDASSIGNS9",
+            "SUBSHELLS10",
+            "BACKTICKS11",
         ];
         let mut text = std::fs::read_to_string(&config).unwrap();
         for command in [
@@ -7201,6 +7230,10 @@ mod tests {
             "notify.sh token=TOKENSECRET5 https://h.example/y",
             "notify.sh apikey=APIKEYSECRET6",
             "curl -H 'X-Api-Key: HEADERSECRET7' https://h.example/z",
+            "AUTH='Bearer QUOTEDASSIGNS8' curl x",
+            "FOO=bar\\ ESCAPEDASSIGNS9 cmd",
+            "A=$(echo SUBSHELLS10 x) cmd",
+            "A=`BACKTICKS11` cmd",
         ] {
             text.push_str(&format!(
                 "\n[[hook.on_pipeline_error]]\ncommand = {command:?}\n"
@@ -7225,6 +7258,29 @@ mod tests {
             assert!(!body.contains(fragment), "{fragment} leaked: {body}");
         }
         assert!(body.contains("\"command\": \"curl …\""), "{body}");
+    }
+
+    /// A syntax error on a line that holds a literal token reports the line
+    /// and column, never the line's text, on every config-reading route.
+    #[tokio::test]
+    async fn config_invalid_bodies_carry_no_toml_source_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, config, _state_path) = pure_routes_fixture(dir.path());
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\n\n[[hook.on_pipeline_start]]\n\
+             command = \"curl -H 'Bearer ERRSECRET1'\n",
+        )
+        .unwrap();
+        let base = spawn_router(state).await;
+        for path in ["/api/v1/hooks", "/api/v1/compliance"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 500, "{path}");
+            let body = resp.text().await.unwrap();
+            assert!(body.contains("config_invalid"), "{path}: {body}");
+            assert!(body.contains("line 5"), "{path}: {body}");
+            assert!(!body.contains("ERRSECRET1"), "{path}: {body}");
+        }
     }
 
     /// Each route answers 200 with the command's payload, names no absolute
