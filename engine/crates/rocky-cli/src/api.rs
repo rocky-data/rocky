@@ -127,6 +127,7 @@ use crate::output::{
 };
 
 use crate::output::ConfigStatus;
+use crate::output::{ComplianceOutput, RecipeHistoryOutput, ReplayCheckOutput};
 use rocky_core::process::GroupSignal;
 use rocky_server::auth::TokenScope;
 use rocky_server::jobs::{CancelMessage, CancelRequest};
@@ -227,6 +228,9 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/audit", get(audit_ledger))
         .route("/api/v1/audit/scorecard", get(audit_scorecard))
         .route("/api/v1/custody/{subject}", get(custody_chain))
+        .route("/api/v1/compliance", get(compliance))
+        .route("/api/v1/runs/{id}/replay-check", get(replay_check))
+        .route("/api/v1/recipes/{hash}/history", get(recipe_history))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -556,6 +560,16 @@ impl ApiError {
             "product_not_found",
             format!("product '{name}' not found"),
             Some("list the products this project knows at GET /api/v1/products"),
+        )
+    }
+
+    /// `404` — no run with this id (or, for `latest`, no run at all).
+    fn run_not_found(message: String) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "run_not_found",
+            message,
+            Some("list the recorded runs at GET /api/v1/runs"),
         )
     }
 
@@ -1004,6 +1018,9 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/audit",
         "GET /api/v1/audit/scorecard",
         "GET /api/v1/custody/{subject}",
+        "GET /api/v1/compliance",
+        "GET /api/v1/runs/{id}/replay-check",
+        "GET /api/v1/recipes/{hash}/history",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -2413,6 +2430,130 @@ async fn audit_ledger(
 /// without touching the filesystem or the store.
 fn is_bare_product_name(name: &str) -> bool {
     crate::commands::audit::is_bare_product_name(name)
+}
+
+/// Query string of `GET /api/v1/compliance`.
+#[derive(Debug, Deserialize)]
+struct ComplianceQuery {
+    /// Evaluate one environment only (`rocky compliance --env`).
+    env: Option<String>,
+    /// List only the exceptions (`rocky compliance --exceptions-only`).
+    #[serde(default)]
+    exceptions_only: bool,
+}
+
+/// `GET /api/v1/compliance` — canonical [`ComplianceOutput`].
+///
+/// The same bytes as `rocky compliance --output json` for the project the
+/// bound config names. Reads the config (credential-tolerant, like the rest
+/// of `rocky serve`) and the models directory; opens no state store and no
+/// warehouse. A config the engine cannot read is `500 config_invalid`; a
+/// models directory it cannot read is `500 internal_error`.
+async fn compliance(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<ComplianceQuery>,
+) -> Result<PrettyJson<ComplianceOutput>, ApiError> {
+    let Some(config_path) = state.config_path.clone() else {
+        return Err(ApiError::engine_not_ready());
+    };
+    let models_dir = state.models_dir.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        crate::commands::compute_compliance_credential_tolerant(
+            &config_path,
+            &models_dir,
+            query.env.as_deref(),
+            query.exceptions_only,
+        )
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| match e {
+        crate::commands::ComplianceRouteError::Config { .. } => {
+            ApiError::config_invalid(&e.to_string())
+        }
+        crate::commands::ComplianceRouteError::Models(_) => ApiError::internal(e.to_string()),
+    })?;
+    Ok(PrettyJson(output))
+}
+
+/// Query string of `GET /api/v1/runs/{id}/replay-check`.
+#[derive(Debug, Deserialize)]
+struct ReplayCheckQuery {
+    /// Check one model of the run only.
+    model: Option<String>,
+}
+
+/// `GET /api/v1/runs/{id}/replay-check` — canonical [`ReplayCheckOutput`].
+///
+/// The same bytes as `rocky replay <id> --check --output json`; `id` may be
+/// `latest`. Nothing is executed or written. An unknown run (or a `model`
+/// the run did not execute) is `404`.
+async fn replay_check(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<ReplayCheckQuery>,
+) -> Result<PrettyJson<ReplayCheckOutput>, ApiError> {
+    let state_path = state_path_for(&state);
+    // Two steps, so the process-wide store permit covers only the reads: the
+    // funnel reads run under it, and IR parsing, SQL parsing and
+    // classification run after it is released.
+    let facts = store_read(&state, move || {
+        crate::commands::read_replay_facts_request_scoped(&state_path, &id, query.model.as_deref())
+    })
+    .await?
+    .map_err(|e| {
+        use crate::commands::ReplayLookupError;
+        match e.downcast_ref::<ReplayLookupError>() {
+            Some(lookup @ (ReplayLookupError::NoRuns | ReplayLookupError::RunNotFound { .. })) => {
+                ApiError::run_not_found(lookup.to_string())
+            }
+            Some(lookup @ ReplayLookupError::ModelNotInRun { .. }) => ApiError::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                lookup.to_string(),
+                Some("list the run's models at GET /api/v1/runs"),
+            ),
+            None => map_state_err(e, state.mutation_permit.running_job()),
+        }
+    })?;
+    let output = tokio::task::spawn_blocking(move || crate::commands::classify_replay_facts(facts))
+        .await
+        .map_err(|e| map_join_err(&e))?;
+    Ok(PrettyJson(output))
+}
+
+/// Query string of `GET /api/v1/recipes/{hash}/history`.
+#[derive(Debug, Deserialize)]
+struct RecipeHistoryQuery {
+    /// Lower bound on run start: RFC 3339 or `YYYY-MM-DD`.
+    since: Option<String>,
+}
+
+/// `GET /api/v1/recipes/{hash}/history` — canonical [`RecipeHistoryOutput`].
+///
+/// The same bytes as `rocky history --recipe <hash> --output json`: every
+/// recorded execution of one exact program, newest run first. An unknown hash
+/// is `200` with no executions, not a `404`. A malformed `since` is
+/// `400 bad_request` before the store is opened.
+async fn recipe_history(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(hash): ApiPath<String>,
+    ApiQuery(query): ApiQuery<RecipeHistoryQuery>,
+) -> Result<PrettyJson<RecipeHistoryOutput>, ApiError> {
+    if let Err(e) = crate::commands::parse_since(query.since.as_deref()) {
+        return Err(ApiError::bad_request(format!("{e:#}")));
+    }
+    let state_path = state_path_for(&state);
+    let output = store_read(&state, move || {
+        crate::commands::recipe_history_output_request_scoped(
+            &state_path,
+            &hash,
+            query.since.as_deref(),
+        )
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -6395,6 +6536,252 @@ mod tests {
         assert_eq!(resp.status(), 503);
         let err: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(err.code, "engine_not_ready");
+    }
+
+    // --- /compliance, /runs/{id}/replay-check, /recipes/{hash}/history ---
+
+    /// A project with one recorded run (`run-1`: `raw`, `revenue_daily`), the
+    /// second model stamped with a recipe hash. Returns the server state.
+    fn read_routes_fixture(dir: &std::path::Path) -> (Arc<ServerState>, PathBuf) {
+        let (config, state_path) = crate::commands::cost::tests::budget_project(dir, "");
+        crate::commands::cost::tests::one_charged_run(&state_path);
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let mut run = store.get_run("run-1").unwrap().expect("run-1 recorded");
+        for exec in &mut run.models_executed {
+            if exec.model_name == "revenue_daily" {
+                exec.recipe_hash = Some("recipe-abc".to_string());
+            }
+        }
+        store.record_run(&run).unwrap();
+        drop(store);
+        let root = config.parent().unwrap().to_path_buf();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        (state, state_path)
+    }
+
+    /// The read routes answer 200 with the CLI command's bytes, and the
+    /// models-only server (no bound config) refuses the config-backed one.
+    #[tokio::test]
+    async fn ui_read_routes_match_the_command_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, state_path) = read_routes_fixture(dir.path());
+        let config = state.config_path.clone().unwrap();
+        let models_dir = state.models_dir.clone();
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected =
+            crate::commands::compute_compliance(&config, &models_dir, None, false).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+        let resp = reqwest::get(format!(
+            "{base}/api/v1/compliance?env=prod&exceptions_only=true"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = reqwest::get(format!("{base}/api/v1/compliance?exceptions_only=maybe"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        for target in ["run-1", "latest"] {
+            let resp = reqwest::get(format!("{base}/api/v1/runs/{target}/replay-check"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{target}");
+            let text = resp.text().await.unwrap();
+            let expected = {
+                let _gate = store_gate(&state).await;
+                crate::commands::compute_replay_check(&state_path, target, None).unwrap()
+            };
+            assert_eq!(text, reference_bytes(&expected), "{target}");
+            assert_eq!(expected.run_id, "run-1");
+            assert_eq!(expected.model_count, 2);
+        }
+        let resp = reqwest::get(format!(
+            "{base}/api/v1/runs/run-1/replay-check?model=revenue_daily"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let one: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(one["model_count"], 1);
+
+        let resp = reqwest::get(format!("{base}/api/v1/recipes/recipe-abc/history"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::recipe_history_output(&state_path, "recipe-abc", None).unwrap()
+        };
+        assert_eq!(text, reference_bytes(&expected));
+        assert_eq!(expected.count, 1);
+        let resp = reqwest::get(format!(
+            "{base}/api/v1/recipes/unknown/history?since=2026-01-01"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let none: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(none["count"], 0);
+        let resp = reqwest::get(format!(
+            "{base}/api/v1/recipes/recipe-abc/history?since=soon"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "bad_request");
+
+        let bare = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{bare}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+    }
+
+    /// An unknown run id, an unknown model of a known run, and `latest` on an
+    /// empty store are `404`, not a `500` from the command's `bail!`.
+    #[tokio::test]
+    async fn replay_check_unknown_run_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _state_path) = read_routes_fixture(dir.path());
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/runs/no-such-run/replay-check"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "run_not_found");
+
+        let resp = reqwest::get(format!(
+            "{base}/api/v1/runs/run-1/replay-check?model=no_such_model"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "model_not_found");
+
+        let empty = dir.path().join("empty-state.redb");
+        drop(rocky_core::state::StateStore::open(&empty).unwrap());
+        let other = pinned_server(state.models_dir.clone(), state.config_path.clone(), &empty);
+        let base = spawn_router(other).await;
+        let resp = reqwest::get(format!("{base}/api/v1/runs/latest/replay-check"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "run_not_found");
+    }
+
+    /// A store another handle holds is `503 engine_busy` on every store-backed
+    /// read route, never an empty result.
+    #[tokio::test]
+    async fn ui_store_read_routes_answer_503_on_a_busy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, state_path) = read_routes_fixture(dir.path());
+        let held = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let base = spawn_router(state).await;
+        for path in [
+            "/api/v1/runs/run-1/replay-check",
+            "/api/v1/recipes/recipe-abc/history",
+        ] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_busy", "{path}");
+        }
+        drop(held);
+    }
+
+    /// A state path that does not exist is `200` on every store-backed read
+    /// route, and the request creates no file.
+    #[tokio::test]
+    async fn ui_store_read_routes_do_not_create_an_absent_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _state_path) = read_routes_fixture(dir.path());
+        let absent = dir.path().join("absent-state.redb");
+        let other = pinned_server(state.models_dir.clone(), state.config_path.clone(), &absent);
+        let base = spawn_router(other).await;
+        for path in [
+            "/api/v1/runs/latest/replay-check",
+            "/api/v1/recipes/recipe-abc/history",
+        ] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            // `latest` on an empty store is a 404; the others are 200.
+            let want = if path.contains("replay-check") {
+                404
+            } else {
+                200
+            };
+            assert_eq!(resp.status(), want, "{path}");
+            assert!(!absent.exists(), "{path} created the state file");
+        }
+        let resp = reqwest::get(format!("{base}/api/v1/recipes/recipe-abc/history"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(!absent.exists());
+    }
+
+    /// `/compliance` loads the config the way the rest of `rocky serve` does:
+    /// an unset adapter `${VAR}` credential is `200`. A config that does not
+    /// parse is `config_invalid`. A models directory that cannot be read is
+    /// `internal_error`, never `config_invalid`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compliance_route_error_wiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, state_path) = read_routes_fixture(dir.path());
+        let config = state.config_path.clone().unwrap();
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\
+             token = \"${ROCKY_TEST_UNSET_CREDENTIAL_7C1}\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let models = dir.path().join("models-dir");
+        std::fs::create_dir_all(&models).unwrap();
+
+        let ok = pinned_server(models.clone(), Some(config.clone()), &state_path);
+        let base = spawn_router(ok).await;
+        let resp = reqwest::get(format!("{base}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "an unset credential must not 500");
+
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+        let broken_models = pinned_server(dangling, Some(config.clone()), &state_path);
+        let base = spawn_router(broken_models).await;
+        let resp = reqwest::get(format!("{base}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "internal_error");
+
+        std::fs::write(&config, "this is [not valid toml").unwrap();
+        let broken_config = pinned_server(models, Some(config), &state_path);
+        let base = spawn_router(broken_config).await;
+        let resp = reqwest::get(format!("{base}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "config_invalid");
     }
 
     // --- /review ---

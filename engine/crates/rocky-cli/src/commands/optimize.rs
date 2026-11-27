@@ -10,9 +10,10 @@ use rocky_core::models::StrategyConfig;
 use rocky_core::optimize::{
     CostConfig, MaterializationCost, ModelStats, UNKNOWN_STRATEGY, recommend_strategy,
 };
-use rocky_core::state::{StateStore, UnrecordedScope};
+use rocky_core::state::UnrecordedScope;
 use rocky_ir::dag::DagNode;
 
+use super::history::StoreBudget;
 use crate::output::{OptimizeOutput, OptimizeRecommendation, ProductionRunScope, print_json};
 
 /// Build the optimize output from run history + the on-disk DAG. Pure
@@ -24,45 +25,129 @@ pub fn optimize_output(
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
 ) -> Result<OptimizeOutput> {
-    let store = StateStore::open_read_only_or_empty(state_path)?;
+    // Config loads BEFORE the store opens: redb's exclusive file lock must
+    // not wait on disk work, or a writer retries out to `Busy`.
+    let config = load_cost_config(config_path)?;
+    let reads = read_optimize_history(state_path, model_filter)?;
+    Ok(finish_optimize(reads, &config, models_dir))
+}
 
-    // `[cost]` pricing: read it from the loaded project config when one
-    // exists, and fall back to `CostConfig::default()` only when the
-    // project has no `rocky.toml` to read (#2056). `CostConfig::default()`
-    // is defined AS `CostSection::default().into()` specifically so this
-    // plain match is safe: a `rocky.toml` with no `[cost]` block (or one
-    // that explicitly restates the default values) parses to
-    // `CostSection::default()`, which produces this exact same `CostConfig`
-    // either way — no separate "did the project really declare one" check
-    // needed (a prior version tried a value-equality guard for that and
-    // Codex review of #2056 found it still diverged on a differently-cased
-    // `warehouse_size` that mapped to the same DBU/hour rate). Credential-
-    // tolerant and offline, the same loader `rocky cost`'s `adapter_pricing`
-    // uses — this command opens no warehouse connection either. A
-    // `rocky.toml` that is there but does not load is a hard error: a wrong
-    // price is worse than no price.
-    let config = match rocky_core::config::load_optional_project_config(Some(config_path))
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?
-    {
-        Some(cfg) => CostConfig::from(cfg.cost),
-        None => CostConfig::default(),
-    };
+/// What `optimize` keeps of one execution: its duration and bytes written.
+type ExecutionStats = (u64, Option<u64>);
 
-    // Get all runs to extract model names and compute stats.
-    //
-    // Production runs only (#2201): a shadow or branch run built a copy
-    // somewhere else, and its timings must not steer the production table's
-    // materialization. Runs recorded before runs carried a scope ARE counted:
-    // they are most of the history right after an upgrade, and dropping them
-    // would leave nothing to recommend from. `run_scope` in the output says
-    // how many of each were read.
-    let (runs, run_scope) =
-        ProductionRunScope::read(&store, 100, UnrecordedScope::Count, |_| true)?;
+/// Everything `optimize` reads from the state store. Read in one short
+/// window so the store's file lock is not held while models load or while
+/// the recommendations compute.
+struct StoreReads {
+    run_scope: crate::output::ProductionRunScope,
+    total_runs: usize,
+    /// `started_at` of the oldest and the newest run read.
+    span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    model_names: Vec<String>,
+    histories: HashMap<String, Vec<ExecutionStats>>,
+}
 
-    if runs.is_empty() {
+/// Step 1: the `[cost]` pricing.
+///
+/// Read it from the loaded project config when one exists, and fall back to
+/// `CostConfig::default()` only when the project has no `rocky.toml` to read
+/// (#2056). `CostConfig::default()` is defined AS `CostSection::default()
+/// .into()` specifically so this plain match is safe: a `rocky.toml` with no
+/// `[cost]` block (or one that explicitly restates the default values) parses
+/// to `CostSection::default()`, which produces this exact same `CostConfig`
+/// either way. No separate "did the project really declare one" check is
+/// needed (a prior version tried a value-equality guard for that and Codex
+/// review of #2056 found it still diverged on a differently-cased
+/// `warehouse_size` that mapped to the same DBU/hour rate). Credential-
+/// tolerant and offline, the same loader `rocky cost`'s `adapter_pricing`
+/// uses; this command opens no warehouse connection either. A `rocky.toml`
+/// that is there but does not load is a hard error: a wrong price is worse
+/// than no price. The error keeps its `ConfigError` for the CLI's span report.
+fn load_cost_config(config_path: &Path) -> Result<CostConfig> {
+    Ok(
+        match rocky_core::config::load_optional_project_config(Some(config_path))
+            .with_context(|| format!("failed to load config from {}", config_path.display()))?
+        {
+            Some(cfg) => CostConfig::from(cfg.cost),
+            None => CostConfig::default(),
+        },
+    )
+}
+
+/// Step 2: every state-store read `optimize` needs, and nothing else.
+fn read_optimize_history(state_path: &Path, model_filter: Option<&str>) -> Result<StoreReads> {
+    super::history::with_store(state_path, StoreBudget::Default, |store| {
+        // Get all runs to extract model names and compute stats.
+        //
+        // Production runs only (#2201): a shadow or branch run built a copy
+        // somewhere else, and its timings must not steer the production
+        // table's materialization. Runs recorded before runs carried a scope
+        // ARE counted: they are most of the history right after an upgrade,
+        // and dropping them would leave nothing to recommend from.
+        // `run_scope` in the output says how many of each were read.
+        let (runs, run_scope) =
+            ProductionRunScope::read(store, 100, UnrecordedScope::Count, |_| true)?;
+        let span = runs
+            .last()
+            .zip(runs.first())
+            .map(|(oldest, newest)| (oldest.started_at, newest.started_at));
+
+        // Collect unique model names across all runs
+        let mut model_names: Vec<String> = runs
+            .iter()
+            .flat_map(|r| r.models_executed.iter().map(|m| m.model_name.clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        model_names.sort();
+
+        // Apply filter
+        if let Some(filter) = model_filter {
+            model_names.retain(|name| name.contains(filter));
+        }
+
+        // One walk of the run table for every model, not one per model.
+        let name_refs: Vec<&str> = model_names.iter().map(String::as_str).collect();
+        let histories = if runs.is_empty() {
+            HashMap::new()
+        } else {
+            store.get_models_history_matching(
+                &name_refs,
+                100,
+                |run| run.counts_as_production(UnrecordedScope::Count),
+                |exec| (exec.duration_ms, exec.bytes_written),
+            )?
+        };
+        Ok(StoreReads {
+            run_scope,
+            total_runs: runs.len(),
+            span,
+            model_names,
+            histories,
+        })
+    })
+}
+
+/// Step 3: load the models and compute the recommendations. The store is
+/// already closed. With no run history there is nothing to recommend, so the
+/// models are not loaded.
+fn finish_optimize(
+    reads: StoreReads,
+    config: &CostConfig,
+    models_dir: Option<&Path>,
+) -> OptimizeOutput {
+    let StoreReads {
+        run_scope,
+        total_runs,
+        span,
+        model_names,
+        mut histories,
+    } = reads;
+
+    if total_runs == 0 {
         let mut out = OptimizeOutput::empty("no production run history available");
         out.run_scope = run_scope;
-        return Ok(out);
+        return out;
     }
 
     // Build the DAG + each model's configured strategy from the models on
@@ -73,48 +158,28 @@ pub fn optimize_output(
     let (dag_nodes, strategies) = load_models_from_disk(models_dir);
     let downstream = downstream_counts(&dag_nodes);
 
-    // Collect unique model names across all runs
-    let mut model_names: Vec<String> = runs
-        .iter()
-        .flat_map(|r| r.models_executed.iter().map(|m| m.model_name.clone()))
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    model_names.sort();
-
-    // Apply filter
-    if let Some(filter) = model_filter {
-        model_names.retain(|name| name.contains(filter));
-    }
-
     // Build stats and recommendations for each model
     let mut recommendations: Vec<MaterializationCost> = Vec::new();
-    let total_runs = runs.len();
 
     for model_name in &model_names {
-        let history = store.get_model_history_matching(model_name, 100, |run| {
-            run.counts_as_production(UnrecordedScope::Count)
-        })?;
+        let history = histories.remove(model_name).unwrap_or_default();
         if history.is_empty() {
             continue;
         }
 
-        let avg_duration_seconds = history.iter().map(|m| m.duration_ms as f64).sum::<f64>()
-            / history.len() as f64
-            / 1000.0;
+        let avg_duration_seconds =
+            history.iter().map(|(ms, _)| *ms as f64).sum::<f64>() / history.len() as f64 / 1000.0;
 
         // Estimate size from bytes_written if available
         let estimated_size_gb = history
             .iter()
-            .filter_map(|m| m.bytes_written)
+            .filter_map(|(_, bytes)| *bytes)
             .next_back()
             .map(|b| b as f64 / 1_073_741_824.0)
             .unwrap_or(0.1); // default 100MB estimate
 
         // Rough estimate of runs per month
-        let runs_per_month = if total_runs > 1 {
-            let first = runs.last().unwrap().started_at;
-            let last = runs.first().unwrap().started_at;
+        let runs_per_month = if let (true, Some((first, last))) = (total_runs > 1, span) {
             let span_days = (last - first).num_days().max(1) as f64;
             (history.len() as f64 / span_days) * 30.0
         } else {
@@ -134,7 +199,7 @@ pub fn optimize_output(
             runs_per_month,
         };
 
-        recommendations.push(recommend_strategy(&stats, &config));
+        recommendations.push(recommend_strategy(&stats, config));
     }
 
     let typed_recs: Vec<OptimizeRecommendation> = recommendations
@@ -152,7 +217,7 @@ pub fn optimize_output(
         .collect();
     let mut out = OptimizeOutput::new(typed_recs);
     out.run_scope = run_scope;
-    Ok(out)
+    out
 }
 
 /// Execute `rocky optimize`.
@@ -314,7 +379,46 @@ fn truncate(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource};
+    use rocky_core::state::{
+        ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource, StateStore,
+    };
+
+    /// Config loads before the store opens: with another handle holding the
+    /// store, a broken config answers a config error at once, not `Busy`
+    /// after the open's retries.
+    #[test]
+    fn optimize_loads_config_before_it_opens_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = record_history(tmp.path(), "m", 2, 100, None);
+        let config = tmp.path().join("rocky.toml");
+        write(&config, "this is [not valid toml");
+        let _held = StateStore::open(&state_path).unwrap();
+
+        let err = optimize_output(&state_path, &config, None, None)
+            .expect_err("a broken config must fail");
+        assert!(
+            err.downcast_ref::<rocky_core::config::ConfigError>()
+                .is_some(),
+            "expected a config error, got {err:#}"
+        );
+    }
+
+    /// A rocky.toml that does not load stays a typed `ConfigError` in the
+    /// error chain, so the CLI's miette span report
+    /// (`try_upgrade_config_error`) can still find it.
+    #[test]
+    fn a_broken_config_error_downcasts_to_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        write(&config, "this is [not valid toml");
+        let err = optimize_output(&dir.path().join("absent.redb"), &config, None, None)
+            .expect_err("a broken config must fail");
+        assert!(
+            err.downcast_ref::<rocky_core::config::ConfigError>()
+                .is_some(),
+            "lost the ConfigError: {err:#}"
+        );
+    }
 
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {

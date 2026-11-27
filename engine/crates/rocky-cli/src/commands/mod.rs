@@ -159,7 +159,10 @@ pub use compile::{
     run_compile_with_options,
 };
 pub use completions::run_completions;
-pub use compliance::{compute_compliance, run_compliance};
+pub use compliance::{
+    ComplianceRouteError, compute_compliance, compute_compliance_credential_tolerant,
+    run_compliance,
+};
 pub use connector_init::{
     ConnectorLang, HELPER_FILE_NAME, HELPER_PY, run_connector_init, scaffold_connector,
 };
@@ -184,9 +187,10 @@ pub use fmt::run_fmt;
 pub use freshness::run_freshness;
 pub use fulfill_api::propose_governed_run_plan;
 pub use gc::{run_gc_derivable, run_gc_plan};
+pub(crate) use history::parse_since;
 pub use history::{
     history_run_output, history_runs_output, history_runs_output_filtered, model_history_output,
-    recipe_history_output, run_history,
+    recipe_history_output, recipe_history_output_request_scoped, run_history,
 };
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
@@ -233,7 +237,8 @@ pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
 pub use replay::{
-    compute_replay_check, run_replay, run_replay_check, run_replay_execute,
+    ReplayFacts, ReplayLookupError, classify_replay_facts, compute_replay_check,
+    read_replay_facts_request_scoped, run_replay, run_replay_check, run_replay_execute,
     run_replay_execute_warehouse,
 };
 pub use restore::run_restore_plan;

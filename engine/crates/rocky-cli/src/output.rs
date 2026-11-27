@@ -14672,7 +14672,8 @@ impl PreviewCostOutput {
 /// `state_needs_migration` (`409`: the state store lacks tables this server
 /// reads and a read never creates them; one read-write command — a
 /// `rocky run` — migrates it; not retryable), `model_not_found`,
-/// `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
+/// `run_not_found` (a run id, or `latest` on an empty store, names no
+/// recorded run), `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
 /// the mutation permit — carries [`running_job_id`](Self::running_job_id)),
 /// `job_not_running` (`409`: a cancel named a job that has finished),
 /// `job_not_cancellable` (`409`: a cancel named a job this server process
