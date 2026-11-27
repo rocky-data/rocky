@@ -132,6 +132,12 @@ pub(crate) fn validate_base_ref(base_ref: &str) -> Result<()> {
     Ok(())
 }
 
+/// The env var that stops git taking its optional locks, such as the index
+/// refresh `git diff` and `git status` attempt after a stat change.
+pub(crate) const GIT_OPTIONAL_LOCKS_ENV: &str = "GIT_OPTIONAL_LOCKS";
+/// `0`: skip every optional lock.
+pub(crate) const GIT_OPTIONAL_LOCKS_VALUE: &str = "0";
+
 /// Build a `git` invocation, optionally rooted at an explicit repository
 /// directory instead of the process's current one.
 ///
@@ -144,6 +150,7 @@ pub(crate) fn validate_base_ref(base_ref: &str) -> Result<()> {
 fn git_in(repo_dir: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
     rocky_core::process::strip_dagster_pipes_env(&mut cmd);
+    cmd.env(GIT_OPTIONAL_LOCKS_ENV, GIT_OPTIONAL_LOCKS_VALUE);
     if let Some(dir) = repo_dir {
         cmd.current_dir(dir);
     }
@@ -3914,6 +3921,106 @@ mod tests {
         assert_eq!(
             column_names(&wt, "orders"),
             vec![("dirty".to_string(), ColumnChangeType::Added)]
+        );
+    }
+
+    /// Every git command `ci-diff` starts carries `GIT_OPTIONAL_LOCKS=0`, set
+    /// on the `Command`, so a read-only caller never takes git's index lock.
+    #[test]
+    fn git_commands_carry_git_optional_locks_zero() {
+        let cmd = git_in(None);
+        let value = cmd
+            .get_envs()
+            .find(|(key, _)| *key == GIT_OPTIONAL_LOCKS_ENV)
+            .and_then(|(_, value)| value);
+        assert_eq!(value, Some(std::ffi::OsStr::new(GIT_OPTIONAL_LOCKS_VALUE)));
+    }
+
+    /// The env is passed per command, never set on this process, so no other
+    /// git call in the process inherits it.
+    #[test]
+    fn git_optional_locks_is_not_set_process_wide() {
+        let _ = git_in(None);
+        assert!(
+            std::env::var_os(GIT_OPTIONAL_LOCKS_ENV).is_none(),
+            "building a git command must not set the env for the whole process"
+        );
+    }
+
+    /// A committed diff over a repository whose files have a stale stat writes
+    /// nothing: no index refresh, no lock file, no cache, no state file.
+    ///
+    /// Scope: this covers the default (`HEAD`) mode. With `--working-tree`,
+    /// `git diff <base>` still refreshes the index under git 2.56, whatever
+    /// `GIT_OPTIONAL_LOCKS` says: the env stops `git status` from doing it, and
+    /// `git diff` does not read it.
+    #[test]
+    fn a_committed_diff_leaves_the_repository_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("orders.sql", "SELECT 1 AS id\n"),
+                ("orders.toml", &inferred_sidecar("marts")),
+                ("control.sql", "SELECT 1 AS id\n"),
+                ("control.toml", &inferred_sidecar("marts")),
+            ],
+        );
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT 1 AS id, 2 AS added\n",
+        )
+        .unwrap();
+        run_git(dir, &["commit", "-q", "-am", "add a column"]);
+        // Same bytes, new mtime: the index entry no longer matches the file's
+        // stat, which is what makes git want to refresh it.
+        let control = models_dir.join("control.sql");
+        let file = fs::File::options().write(true).open(&control).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        drop(file);
+
+        fn snapshot(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+            let mut files = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(current) = stack.pop() {
+                for entry in fs::read_dir(&current).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        files.push((path.clone(), fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            files.sort();
+            files
+        }
+        let before = snapshot(dir);
+
+        let head = compute_mode(dir, &models_dir, "HEAD~1", CiDiffMode::Head);
+        assert_eq!(
+            column_names(&head, "orders"),
+            vec![("added".to_string(), ColumnChangeType::Added)],
+            "the diff must have run: {:?}",
+            head.results
+        );
+
+        assert!(
+            !dir.join(".git/index.lock").exists(),
+            "the diff left a git index lock behind"
+        );
+        let after = snapshot(dir);
+        let changed: Vec<_> = before
+            .iter()
+            .filter(|entry| !after.contains(entry))
+            .chain(after.iter().filter(|entry| !before.contains(entry)))
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "the diff wrote a file (the index, a cache or a state file): {changed:?}"
         );
     }
 

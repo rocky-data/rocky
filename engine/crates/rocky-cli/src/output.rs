@@ -15140,6 +15140,13 @@ pub enum JobKind {
     /// Applying the plan (`apply`, with the returned `plan_id`) is what runs the
     /// statements.
     Compact,
+    /// `rocky ci-diff` — the structural model diff between a git ref and `HEAD`
+    /// (or the working tree), with the column lineage it moves. Read-only: it
+    /// writes no state, file or cache, and every git command it runs sets
+    /// `GIT_OPTIONAL_LOCKS=0`. It takes no mutation permit, so it never blocks a
+    /// run. At most one runs at a time; a second submission is refused
+    /// `409 mutation_in_progress`.
+    Diff,
 }
 
 impl JobKind {
@@ -15160,6 +15167,7 @@ impl JobKind {
             JobKind::Promote => "promote",
             JobKind::ProductApprove => "product_approve",
             JobKind::Compact => "compact",
+            JobKind::Diff => "diff",
         }
     }
 
@@ -15183,6 +15191,7 @@ impl JobKind {
             JobKind::Promote => "plan",
             JobKind::ProductApprove => "product",
             JobKind::Compact => "compact",
+            JobKind::Diff => "ci-diff",
         }
     }
 
@@ -15201,9 +15210,12 @@ impl JobKind {
             | JobKind::Unfreeze
             | JobKind::Preview
             | JobKind::ProductApprove => true,
-            JobKind::Plan | JobKind::Test | JobKind::Ci | JobKind::Promote | JobKind::Compact => {
-                false
-            }
+            JobKind::Plan
+            | JobKind::Test
+            | JobKind::Ci
+            | JobKind::Promote
+            | JobKind::Compact
+            | JobKind::Diff => false,
         }
     }
 
@@ -15222,6 +15234,7 @@ impl JobKind {
             "promote" => Some(JobKind::Promote),
             "product_approve" => Some(JobKind::ProductApprove),
             "compact" => Some(JobKind::Compact),
+            "diff" => Some(JobKind::Diff),
             _ => None,
         }
     }

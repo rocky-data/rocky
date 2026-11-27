@@ -153,6 +153,7 @@ pub use ci::run_ci;
 pub use ci_diff::{
     CiDiffMode, ci_diff_mode, extract_base_compile, project_ir_from_compile, run_ci_diff,
 };
+pub(crate) use ci_diff::{GIT_OPTIONAL_LOCKS_ENV, GIT_OPTIONAL_LOCKS_VALUE};
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
 pub use compile::{
@@ -179,7 +180,8 @@ pub use cost::{CostGroupBy, compute_cost, compute_month_cost, run_cost};
 pub use dag::{dag_output, run_dag};
 pub use discover::discover;
 pub use docs::{DocsFormat, run_docs};
-pub use doctor::doctor;
+pub use doctor::{DoctorCheckSet, doctor};
+pub(crate) use doctor::{DoctorOutput, doctor_output};
 pub use emit_sql::{run_emit_sql, run_emit_sql_with_selection};
 pub use estimate::{EstimateReport, compute_estimate, run_estimate};
 pub use export_openapi::export_openapi;

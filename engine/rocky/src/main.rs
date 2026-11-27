@@ -2640,6 +2640,11 @@ enum Command {
         /// Run only a specific check (config, state, adapters, pipelines, state_sync)
         #[arg(long)]
         check: Option<String>,
+        /// Run a named set of checks. `local` reads local files only: it skips
+        /// the remote state probes (`state_rw`, `state_concurrency`) and the
+        /// warehouse and discovery logins (`auth`). Cannot be combined with `--check`.
+        #[arg(long, value_enum, default_value_t, conflicts_with = "check")]
+        check_set: rocky_cli::commands::DoctorCheckSet,
         /// Print extra context for each check (config path, state file size, adapter type, credential type).
         #[arg(long)]
         verbose: bool,
@@ -6379,9 +6384,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 }
             }
         }
-        Command::Doctor { check, verbose } => {
-            rocky_cli::commands::doctor(&cli.config, &state_path, json, check.as_deref(), verbose)
-                .await
+        Command::Doctor {
+            check,
+            check_set,
+            verbose,
+        } => {
+            rocky_cli::commands::doctor(
+                &cli.config,
+                &state_path,
+                json,
+                check.as_deref(),
+                check_set,
+                verbose,
+            )
+            .await
         }
         Command::Compliance {
             env,

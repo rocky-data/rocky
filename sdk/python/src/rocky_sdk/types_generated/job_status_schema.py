@@ -105,6 +105,14 @@ class JobKind12(StrEnum):
     compact = "compact"
 
 
+class JobKind13(StrEnum):
+    """
+    `rocky ci-diff` — the structural model diff between a git ref and `HEAD` (or the working tree), with the column lineage it moves. Read-only: it writes no state, file or cache, and every git command it runs sets `GIT_OPTIONAL_LOCKS=0`. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.
+    """
+
+    diff = "diff"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -177,6 +185,7 @@ class JobStatus(BaseModel):
         | JobKind10
         | JobKind11
         | JobKind12
+        | JobKind13
     )
     """
     Which operation the job wraps.

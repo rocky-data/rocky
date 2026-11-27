@@ -11775,6 +11775,13 @@
               "compact"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky ci-diff` — the structural model diff between a git ref and `HEAD` (or the working tree), with the column lineage it moves. Read-only: it writes no state, file or cache, and every git command it runs sets `GIT_OPTIONAL_LOCKS=0`. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
+            "enum": [
+              "diff"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -11869,11 +11876,27 @@
               "null"
             ]
           },
+          "semantic": {
+            "default": null,
+            "description": "`--semantic` for `diff`: also run the breaking-change classifier. Ignored by every other kind.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "table": {
             "default": null,
             "description": "`<table>` for `compact`: the table to compact, `catalog.schema.table`. Exactly one of `table` and `catalog`. Ignored by every other kind.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "working_tree": {
+            "default": null,
+            "description": "`--working-tree` for `diff`: compare the working tree, uncommitted edits included, instead of `HEAD`. Ignored by every other kind.",
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -29895,6 +29918,28 @@
         ]
       }
     },
+    "/api/v1/doctor": {
+      "get": {
+        "description": "The local health checks: the same report as `rocky doctor --check-set local --output json`. It covers `config`, `state`, `state_schema`, `adapters`, `pipelines`, `state_sync`, `scheduler` and `spool`. It skips `state_rw`, `state_concurrency` and `auth`, so it makes no network call, no warehouse call and no write to a remote state backend. A state store another process holds is a `warning` check, not an error response. A critical check, such as an invalid `rocky.toml`, still answers `200`: read `overall`. Read-only.",
+        "operationId": "getDoctor",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DoctorOutput"
+                }
+              }
+            },
+            "description": "The health report."
+          }
+        },
+        "summary": "Local health checks",
+        "tags": [
+          "project"
+        ]
+      }
+    },
     "/api/v1/gc/derivable": {
       "get": {
         "description": "The derivability inventory: which content-addressed artifacts a recorded recipe could rebuild. The same bytes as `rocky gc --derivable --dry-run --output json`. Reads the artifact ledger and writes nothing: no plan file, no review row, no eviction.",
@@ -30380,6 +30425,78 @@
           }
         },
         "summary": "Submit a compact plan job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/diff": {
+      "post": {
+        "description": "Submit a `diff` job: `rocky ci-diff`, the structural model diff between a git ref and `HEAD`, with the column lineage it moves. The result is the `ci-diff` output. It is read-only: it writes no state, file or cache, every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, and it takes no mutation permit, so it never blocks a run. At most one diff runs at a time: a second submission answers `409 mutation_in_progress` with the running job's id. Body fields, all optional: `base` (a git ref, default `main`, validated before the job starts), `working_tree` (compare the working tree instead of `HEAD`) and `semantic` (also run the breaking-change classifier).",
+        "operationId": "submitDiffJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another diff job is already running (`mutation_in_progress`). Its id is carried in `running_job_id`."
+          }
+        },
+        "summary": "Submit a model diff job",
         "tags": [
           "jobs"
         ]

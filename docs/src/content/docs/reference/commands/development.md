@@ -582,12 +582,13 @@ Most specs report `skipped` today. The suite declares 26 specs. Three of them (`
 Run health checks on the project and report each result. It exits `3` when any check is `critical`, and `0` otherwise.
 
 ```bash
-rocky doctor [--check <NAME>] [--verbose]
+rocky doctor [--check <NAME> | --check-set <SET>] [--verbose]
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--check <NAME>` | `string` | (all) | Run only the check with this name, from the table below. A name that matches no check runs nothing. |
+| `--check-set <SET>` | `all` or `local` | `all` | Run a named set of checks. `local` reads local files only: it skips `state_rw`, `state_concurrency` and `auth`, so it makes no network call and no warehouse call. Cannot be combined with `--check`. |
 | `--verbose` | `bool` | `false` | Add context under each check. In JSON, each check gains a `details` array of `[key, value]` pairs. Without the flag, `details` is left out. |
 
 | Check | What it checks |
