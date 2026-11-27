@@ -18,31 +18,32 @@ describe("GovernorScreen", () => {
     render(<GovernorScreen {...slots()} />);
     expect(screen.getByText("brief slot")).toBeInTheDocument();
     // The sidebar's "Needs you" is the one navigation that marks this page.
-    expect(screen.queryByRole("navigation", { name: "Governor screens" })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Oversight screens" })).toBeNull();
   });
 
   it("shows no tab bar on Products, an area of its own", () => {
     window.history.pushState(null, "", "/ui/governor/products");
     render(<GovernorScreen {...slots()} />);
     expect(screen.getByText("products slot: none")).toBeInTheDocument();
-    expect(screen.queryByRole("navigation", { name: "Governor screens" })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Oversight screens" })).toBeNull();
   });
 
-  it("switches between Governance's three tabs without a reload", async () => {
+  it("switches between Oversight's three tabs without a reload", async () => {
     window.history.pushState(null, "", "/ui/governor/scorecard");
     render(<GovernorScreen {...slots()} />);
-    const tabs = within(screen.getByRole("navigation", { name: "Governor screens" }));
+    const tabs = within(screen.getByRole("navigation", { name: "Oversight screens" }));
     expect(tabs.getAllByRole("link").map((link) => link.textContent)).toEqual([
-      "Scorecard",
-      "Custody",
-      "Audit",
+      "Agent activity",
+      "Agents",
+      "Trace",
+      "Audit log",
     ]);
-    expect(tabs.getByRole("link", { name: "Scorecard" })).toHaveAttribute("aria-current", "page");
+    expect(tabs.getByRole("link", { name: "Agent activity" })).toHaveAttribute("aria-current", "page");
 
-    tabs.getByRole("link", { name: "Audit" }).click();
+    tabs.getByRole("link", { name: "Audit log" }).click();
     await waitFor(() => expect(screen.getByText("audit slot: none")).toBeInTheDocument());
 
-    screen.getByRole("link", { name: "Custody" }).click();
+    screen.getByRole("link", { name: "Trace" }).click();
     await waitFor(() => expect(screen.getByText("custody slot: none")).toBeInTheDocument());
     expect(window.location.pathname).toBe("/ui/governor/custody");
   });

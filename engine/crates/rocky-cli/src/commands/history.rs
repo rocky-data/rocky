@@ -126,7 +126,7 @@ fn truncate_cell(s: &str, max: usize) -> String {
 
 /// Parse a `--since` filter string (RFC 3339 or `YYYY-MM-DD`) into a UTC
 /// timestamp. Shared by the run-level and model-level cores.
-fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+pub(crate) fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> {
     since
         .map(|s| {
             s.parse::<DateTime<Utc>>()
@@ -140,17 +140,58 @@ fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> {
         .transpose()
 }
 
-/// redb cache budget for this file's request-local opens: every consumer of
-/// [`history_runs_output`] (the `GET /api/v1/runs` handler, `rocky history`,
-/// the MCP `history` tool) opens the store, reads one page, and drops it, so
-/// the default ~1 GiB cache capacity only turns a full-table `list_runs`
-/// scan into retained RSS on glibc — +8.6 MB per request at 1,435 rows,
-/// ratcheting with history size while `/runs` is polled (#1399). 1 MiB is
-/// the measured budget at which the retained step collapses ~8× with request
-/// latency unchanged. Scoped to the run-history path because it is the one
-/// this was measured on; the sibling opens in this file share the shape and
+/// redb cache budget for request-local opens: open the store, read once, drop
+/// it. Every consumer of [`history_runs_output`] (the `GET /api/v1/runs`
+/// handler, `rocky history`, the MCP `history` tool) and the UI read routes
+/// (`/runs/{id}/replay-check`, `/recipes/{hash}/history`) opens
+/// this way. The default ~1 GiB cache capacity only turns a full-table
+/// `list_runs` scan into retained RSS on glibc: +8.6 MB per request at 1,435
+/// rows, ratcheting with history size while the route is polled (#1399). 1 MiB
+/// is the measured budget at which the retained step collapses ~8x with
+/// request latency unchanged. The other opens in this file share the shape and
 /// can adopt the policy once measured.
-const HISTORY_REQUEST_CACHE_BYTES: usize = 1 << 20;
+pub(crate) const HISTORY_REQUEST_CACHE_BYTES: usize = 1 << 20;
+
+/// How a request-local read opens the state store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreBudget {
+    /// redb's cache capped at [`HISTORY_REQUEST_CACHE_BYTES`]: the HTTP routes.
+    RequestScoped,
+    /// redb's default cache: the CLI.
+    Default,
+}
+
+/// Run `read` against the state store opened read-only with `budget` (an
+/// empty in-memory view when the file does not exist; nothing is created),
+/// and drop the store before returning.
+///
+/// The one open every request-local read uses: `GET /api/v1/runs`,
+/// `/runs/{id}/replay-check` and `/recipes/{hash}/history`.
+/// redb holds an exclusive file lock while a handle lives, so `read` must do
+/// store reads only. Load config and models before calling it, compute after.
+pub(crate) fn with_store<T>(
+    state_path: &Path,
+    budget: StoreBudget,
+    read: impl FnOnce(&StateStore) -> Result<T>,
+) -> Result<T> {
+    let store = match budget {
+        StoreBudget::RequestScoped => {
+            StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?
+        }
+        StoreBudget::Default => StateStore::open_read_only_or_empty(state_path)?,
+    };
+    let out = read(&store);
+    drop(store);
+    out
+}
+
+/// [`with_store`] with [`StoreBudget::RequestScoped`].
+pub(crate) fn with_request_scoped_store<T>(
+    state_path: &Path,
+    read: impl FnOnce(&StateStore) -> Result<T>,
+) -> Result<T> {
+    with_store(state_path, StoreBudget::RequestScoped, read)
+}
 
 /// Build the project-level run-history output from the state store (the
 /// model-unscoped `rocky history`). Pure compute — no printing — so other
@@ -175,39 +216,39 @@ pub fn history_runs_output_filtered(
     audit: bool,
     trigger: Option<&str>,
 ) -> Result<HistoryOutput> {
-    let store =
-        StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?;
-    let since_ts = parse_since(since)?;
+    with_request_scoped_store(state_path, |store| {
+        let since_ts = parse_since(since)?;
 
-    let runs = match trigger {
-        Some(trigger) => {
-            // Match on the same Debug form the output serializes (`"Schedule"`,
-            // `"Webhook"`, ...) so the filter vocabulary IS the wire vocabulary.
-            store.list_runs_matching(50, |run| format!("{:?}", run.trigger) == trigger)?
-        }
-        None => store.list_runs(50)?,
-    };
-    let filtered: Vec<_> = if let Some(ts) = since_ts {
-        runs.into_iter().filter(|r| r.started_at >= ts).collect()
-    } else {
-        runs
-    };
-    let runs: Vec<RunHistoryRecord> = filtered
-        .iter()
-        .map(|r| record_to_history(r, audit))
-        .collect();
-    // A trigger filter selects on a field only a record carries, so a
-    // record-less run can never match it.
-    let unrecorded_runs = match trigger {
-        Some(_) => Vec::new(),
-        None => unrecorded_runs(&store, since_ts)?,
-    };
-    Ok(HistoryOutput {
-        version: VERSION.to_string(),
-        command: "history".to_string(),
-        count: runs.len(),
-        runs,
-        unrecorded_runs,
+        let runs = match trigger {
+            Some(trigger) => {
+                // Match on the same Debug form the output serializes (`"Schedule"`,
+                // `"Webhook"`, ...) so the filter vocabulary IS the wire vocabulary.
+                store.list_runs_matching(50, |run| format!("{:?}", run.trigger) == trigger)?
+            }
+            None => store.list_runs(50)?,
+        };
+        let filtered: Vec<_> = if let Some(ts) = since_ts {
+            runs.into_iter().filter(|r| r.started_at >= ts).collect()
+        } else {
+            runs
+        };
+        let runs: Vec<RunHistoryRecord> = filtered
+            .iter()
+            .map(|r| record_to_history(r, audit))
+            .collect();
+        // A trigger filter selects on a field only a record carries, so a
+        // record-less run can never match it.
+        let unrecorded_runs = match trigger {
+            Some(_) => Vec::new(),
+            None => unrecorded_runs(store, since_ts)?,
+        };
+        Ok(HistoryOutput {
+            version: VERSION.to_string(),
+            command: "history".to_string(),
+            count: runs.len(),
+            runs,
+            unrecorded_runs,
+        })
     })
 }
 
@@ -355,6 +396,26 @@ pub fn recipe_history_output(
     since: Option<&str>,
 ) -> Result<RecipeHistoryOutput> {
     let store = StateStore::open_read_only_or_empty(state_path)?;
+    recipe_history_from_store(&store, recipe_hash, since)
+}
+
+/// [`recipe_history_output`] with the request-local cache budget
+/// ([`HISTORY_REQUEST_CACHE_BYTES`], #1399), for the HTTP route.
+pub fn recipe_history_output_request_scoped(
+    state_path: &Path,
+    recipe_hash: &str,
+    since: Option<&str>,
+) -> Result<RecipeHistoryOutput> {
+    with_request_scoped_store(state_path, |store| {
+        recipe_history_from_store(store, recipe_hash, since)
+    })
+}
+
+fn recipe_history_from_store(
+    store: &StateStore,
+    recipe_hash: &str,
+    since: Option<&str>,
+) -> Result<RecipeHistoryOutput> {
     let since_ts = parse_since(since)?;
 
     let runs = store.list_runs(RECIPE_SCAN_RUN_LIMIT)?;
@@ -793,6 +854,48 @@ mod tests {
             output_volumes: Vec::new(),
             hold: None,
         }
+    }
+
+    /// The request-local open the UI read routes share
+    /// (`/runs/{id}/replay-check`, `/recipes/{hash}/history`)
+    /// really caps redb's cache. A parity test cannot tell: a bigger cache
+    /// returns the same rows. Evictions only happen when the cache is full,
+    /// so a store bigger than the 1 MiB budget must evict on a full scan,
+    /// and the unbudgeted open (default ~1 GiB) must not.
+    #[test]
+    fn request_scoped_open_caps_the_redb_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            let base = Utc::now();
+            for i in 0..1_500i64 {
+                let mut run = sample_record();
+                run.run_id = format!("run-{i:05}");
+                run.started_at = base + chrono::Duration::seconds(i);
+                // ~2 KiB per row: the table is well past 1 MiB.
+                run.models_executed[0].sql_hash = "x".repeat(2_048);
+                run.models_executed[0].recipe_hash = Some("recipe-1".to_string());
+                store.record_run(&run).unwrap();
+            }
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 2 * u64::from(1u32 << 20));
+
+        let evictions = {
+            with_request_scoped_store(&path, |store| {
+                recipe_history_from_store(store, "recipe-1", None)?;
+                Ok(store.cache_evictions())
+            })
+            .unwrap()
+        };
+        assert!(evictions > 0, "the 1 MiB budget never bound");
+
+        let unbudgeted = {
+            let store = StateStore::open_read_only_or_empty(&path).unwrap();
+            recipe_history_from_store(&store, "recipe-1", None).unwrap();
+            store.cache_evictions()
+        };
+        assert_eq!(unbudgeted, 0, "the fixture no longer discriminates");
     }
 
     #[test]

@@ -87,6 +87,51 @@ pub fn compute_compliance(
     Ok(build_report(&cfg, &models, env, exceptions_only))
 }
 
+/// Why [`compute_compliance_credential_tolerant`] failed. The HTTP route
+/// answers the two differently: a config problem is `config_invalid`, a
+/// models problem is not.
+#[derive(Debug, thiserror::Error)]
+pub enum ComplianceRouteError {
+    /// `rocky.toml` did not load.
+    #[error("failed to load Rocky config from {path}: {source}")]
+    Config {
+        /// The config path.
+        path: String,
+        /// The loader's error.
+        source: rocky_core::config::ConfigError,
+    },
+    /// The models directory could not be read.
+    #[error("failed to read the models directory: {0:#}")]
+    Models(anyhow::Error),
+}
+
+/// [`compute_compliance`] with the credential-tolerant config loader, the
+/// one `rocky serve` uses for its own config: an unset `${VAR}` in an
+/// adapter's connection fields stays literal text. This report opens no
+/// connection, so it must not need warehouse credentials. A parse error or a
+/// missing file still refuses.
+///
+/// # Errors
+///
+/// [`ComplianceRouteError::Config`] when the config does not load,
+/// [`ComplianceRouteError::Models`] when the models directory cannot be read.
+pub fn compute_compliance_credential_tolerant(
+    config_path: &Path,
+    models_dir: &Path,
+    env: Option<&str>,
+    exceptions_only: bool,
+) -> Result<ComplianceOutput, ComplianceRouteError> {
+    let cfg = rocky_core::config::load_rocky_config_credential_tolerant(config_path).map_err(
+        |source| ComplianceRouteError::Config {
+            path: config_path.display().to_string(),
+            source,
+        },
+    )?;
+    let models =
+        load_all_models(models_dir, Some(&cfg.freshness)).map_err(ComplianceRouteError::Models)?;
+    Ok(build_report(&cfg, &models, env, exceptions_only))
+}
+
 /// Pure resolver — separated from I/O so it's unit-testable against
 /// synthetic inputs.
 fn build_report(
@@ -295,6 +340,32 @@ mod tests {
     const MINIMAL_CONFIG: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
          [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
          [pipeline.p.target.governance]\nauto_create_schemas = true\n";
+
+    /// The route's loader tolerates an unset `${VAR}` in a connection field
+    /// where the strict one refuses, and it names an unreadable models
+    /// directory as a models failure, not a config one.
+    #[cfg(unix)]
+    #[test]
+    fn route_compliance_is_credential_tolerant_and_labels_a_models_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        let config = MINIMAL_CONFIG.replace(
+            "path = \"x.duckdb\"",
+            "path = \"x.duckdb\"\ntoken = \"${ROCKY_TEST_UNSET_CREDENTIAL_9F3}\"",
+        );
+        std::fs::write(&config_path, config).unwrap();
+        let models = dir.path().join("models");
+
+        compute_compliance(&config_path, &models, None, false)
+            .expect_err("the strict loader refuses an unset credential");
+        compute_compliance_credential_tolerant(&config_path, &models, None, false)
+            .expect("the tolerant loader accepts it");
+
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models).unwrap();
+        let err =
+            compute_compliance_credential_tolerant(&config_path, &models, None, false).unwrap_err();
+        assert!(matches!(err, ComplianceRouteError::Models(_)), "{err}");
+    }
 
     /// No `models/` at all is the honest empty report — the case the old
     /// `exists()` guard was written for, kept.

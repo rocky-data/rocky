@@ -60,7 +60,7 @@ describe("Run and Plan on the estate", () => {
         <ProjectActions jobs={client} />
       </WriteAccessProvider>,
     );
-    for (const name of ["Run", "Plan", "Test", "CI"]) {
+    for (const name of ["Run", "Plan a change", "Test", "CI"]) {
       const button = screen.getByRole("button", { name });
       expect(button).toBeDisabled();
       // The reason is the tooltip; the banner says it once, so it is not
@@ -147,7 +147,7 @@ describe("Run and Plan on the estate", () => {
     expect(client.status).not.toHaveBeenCalled();
   });
 
-  it("draw Plan disabled, with the reason, where rocky plan cannot help", () => {
+  it("draw Plan a change disabled, with the reason, where rocky plan cannot help", () => {
     const project = (types: string[]) =>
       ({ pipelines: types.map((t, i) => ({ name: `p${i}`, pipeline_type: t })) }) as unknown as ProjectOutput;
     expect(planUnavailable(null)).toBeUndefined();
@@ -162,7 +162,7 @@ describe("Run and Plan on the estate", () => {
         <ProjectActions jobs={client} planDisabledReason={reason} />
       </WriteAccessProvider>,
     );
-    const plan = screen.getByRole("button", { name: "Plan" });
+    const plan = screen.getByRole("button", { name: "Plan a change" });
     expect(plan).toBeDisabled();
     fireEvent.click(plan);
     expect(screen.getByText(reason ?? "")).toBeInTheDocument();
@@ -177,7 +177,7 @@ describe("Run and Plan on the estate", () => {
         <ProjectActions jobs={client} />
       </WriteAccessProvider>,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Plan a change" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("config does not load");
   });
 });
@@ -221,7 +221,7 @@ function planLoaders(status: () => Promise<ReviewStatusOutput>): PlanLoaders {
   };
 }
 
-describe("Approve and Apply on the plan page", () => {
+describe("Approve change and Apply change on the change page", () => {
   it("approve over the HTTP API, then show who the marker names", async () => {
     let approved = false;
     const loaders = planLoaders(async () =>
@@ -248,7 +248,7 @@ describe("Approve and Apply on the plan page", () => {
     );
     const section = await screen.findByRole("region", { name: "Approval" });
     // Apply waits for the approval.
-    expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
+    expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
     // The command stays visible as a secondary hint.
     expect(within(section).getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
     // The steps say where the plan stands, in words: approval is next.
@@ -257,24 +257,24 @@ describe("Approve and Apply on the plan page", () => {
         .getAllByRole("listitem")
         .map((item) => item.textContent);
     // A done step shows a check, so only the others carry their number.
-    expect(steps()).toEqual(["Proposed: done", "2Approved: next", "3Applied: not yet"]);
+    expect(steps()).toEqual(["Proposed: done", "2Approve: next", "3Apply: not yet"]);
 
-    fireEvent.click(within(section).getByRole("button", { name: "Approve" }));
+    fireEvent.click(within(section).getByRole("button", { name: "Approve change" }));
     await screen.findByText(/approved over the HTTP API by ops@example.com/);
     expect(submitted).toEqual([{ kind: "approve", body: { plan_id: PLAN } }]);
     const text = document.body.textContent ?? "";
     expect(text).not.toMatch(/from the browser/i);
     expect(text).not.toMatch(/by a human/i);
-    // Approved is done. Applied is not known, never "next" or "done": the
+    // Approve is done. Apply change is not known, never "next" or "done": the
     // status route records approval, not apply, so an applied plan would
     // look the same.
     expect(steps()).toEqual([
       "Proposed: done",
-      "Approved: done",
-      "3Applied: not knownThe plan status does not record apply.",
+      "Approve: done",
+      "3Apply: not knownThe change status does not record apply.",
     ]);
     // Now Apply is live, and posts the plan id and nothing else.
-    const apply = screen.getByRole("button", { name: "Apply" });
+    const apply = screen.getByRole("button", { name: "Apply change" });
     expect(apply).toBeEnabled();
     fireEvent.click(apply);
     await waitFor(() =>
@@ -282,11 +282,11 @@ describe("Approve and Apply on the plan page", () => {
     );
     // Only an apply this page saw succeed marks the last step done.
     await waitFor(() =>
-      expect(steps()).toEqual(["Proposed: done", "Approved: done", "Applied: done"]),
+      expect(steps()).toEqual(["Proposed: done", "Approve: done", "Apply: done"]),
     );
   });
 
-  it("never marks Applied done after an apply that failed", async () => {
+  it("never marks Apply change done after an apply that failed", async () => {
     const loaders = planLoaders(async () => ({
       ...STATUS,
       reviewed: true,
@@ -299,15 +299,15 @@ describe("Approve and Apply on the plan page", () => {
       </WriteAccessProvider>,
     );
     const section = await screen.findByRole("region", { name: "Approval" });
-    fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+    fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
     await within(section).findByRole("alert");
     const steps = within(within(section).getByRole("list", { name: "Steps" }))
       .getAllByRole("listitem")
       .map((item) => item.textContent);
     expect(steps).toEqual([
       "Proposed: done",
-      "Approved: done",
-      "3Applied: not knownThe plan status does not record apply.",
+      "Approve: done",
+      "3Apply: not knownThe change status does not record apply.",
     ]);
   });
 
@@ -364,7 +364,7 @@ describe("Approve and Apply on the plan page", () => {
       const { section, input, submitted } = await open(bound());
       expect(input.value).toBe("");
       expect(input).toHaveAttribute("placeholder", "sha256:…");
-      expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
+      expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
       expect(within(section).getByText("Type the spec digest you approved.")).toBeTruthy();
       // The terminal hint names a placeholder, never a digest.
       expect(section).toHaveTextContent("--expect-spec-digest <the spec digest you approved>");
@@ -380,20 +380,20 @@ describe("Approve and Apply on the plan page", () => {
       expect(section).toHaveTextContent("approval.spec_digest");
       expect(section).toHaveTextContent("approval:");
       expect(section).toHaveTextContent("rocky product status <name>");
-      expect(section).toHaveTextContent(/Do not copy the plan.s own digest from the spec card/);
-      expect(section).toHaveTextContent("compare the plan with itself");
+      expect(section).toHaveTextContent(/Do not copy the change.s own digest from the spec card/);
+      expect(section).toHaveTextContent("compare the change with itself");
     });
 
     it("sends exactly the typed digest as expect_spec_digest, after a confirm step", async () => {
       const { section, input, submitted } = await open(bound(), OPERATOR, [job("apply", "succeeded")]);
       fireEvent.change(input, { target: { value: "sha256:typed-by-hand" } });
-      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
       // The first press only asks, and the question repeats the typed digest.
       expect(submitted).toEqual([]);
       const question = within(section).getByRole("group");
       expect(question).toHaveTextContent("sha256:typed-by-hand");
       fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
-      await within(section).findByText("Apply: done.");
+      await within(section).findByText("Apply change: done.");
       expect(submitted).toEqual([
         { kind: "apply", body: { plan_id: PLAN, expect_spec_digest: "sha256:typed-by-hand" } },
       ]);
@@ -402,35 +402,35 @@ describe("Approve and Apply on the plan page", () => {
     it("drops the spaces a paste adds and never sends a blank digest", async () => {
       const { section, input, submitted } = await open(bound());
       fireEvent.change(input, { target: { value: "   " } });
-      expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
+      expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
       fireEvent.change(input, { target: { value: "  sha256:pasted " } });
-      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
       fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
       await waitFor(() => expect(submitted).toHaveLength(1));
       expect(submitted[0].body).toEqual({ plan_id: PLAN, expect_spec_digest: "sha256:pasted" });
     });
 
-    it("treats a plan with only a spec digest as bound, and offers no bare Apply", async () => {
+    it("treats a plan with only a spec digest as bound, and offers no bare Apply change", async () => {
       const loaders = bound({ product_id: undefined });
       const { section, input } = await open(loaders, OPERATOR, undefined, false);
       expect(input.value).toBe("");
-      expect(within(section).getByRole("button", { name: "Apply" })).toBeDisabled();
+      expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
     });
 
-    it("keeps Apply off until the plan is approved, even with a digest typed", async () => {
+    it("keeps Apply change off until the change is approved, even with a digest typed", async () => {
       const { section, input, submitted } = await open(bound({ reviewed: false, approver: undefined }));
       fireEvent.change(input, { target: { value: "sha256:typed" } });
-      const apply = within(section).getByRole("button", { name: "Apply" });
+      const apply = within(section).getByRole("button", { name: "Apply change" });
       expect(apply).toBeDisabled();
       fireEvent.click(apply);
-      expect(within(section).getByText("Approve the plan first.")).toBeTruthy();
+      expect(within(section).getByText("Approve the change first.")).toBeTruthy();
       expect(submitted).toEqual([]);
     });
 
     it("draws Apply disabled on a read-only page", async () => {
       const { section, input, submitted } = await open(bound(), READ_ONLY);
       fireEvent.change(input, { target: { value: "sha256:typed" } });
-      const apply = within(section).getByRole("button", { name: "Apply" });
+      const apply = within(section).getByRole("button", { name: "Apply change" });
       expect(apply).toBeDisabled();
       expect(apply).toHaveAttribute("title", READ_ONLY_REASON);
       expect(submitted).toEqual([]);
@@ -445,10 +445,10 @@ describe("Approve and Apply on the plan page", () => {
       });
       const { section, input } = await open(bound(), OPERATOR, [refusal]);
       fireEvent.change(input, { target: { value: "sha256:bbbb" } });
-      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
       fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
       const alert = await within(section).findByRole("alert");
-      expect(alert).toHaveTextContent("Apply: failed. Error: spec digest mismatch for plan 'x'");
+      expect(alert).toHaveTextContent("Apply change: failed. Error: spec digest mismatch for plan 'x'");
       // The engine's refusal line stays whole, with both digests it carries.
       expect(alert).toHaveTextContent(
         "Error: spec digest mismatch for plan 'x': the plan was authored against 'sha256:aaaa' but the applier expected 'sha256:bbbb'.",
@@ -467,8 +467,8 @@ describe("Approve and Apply on the plan page", () => {
       );
       const section = await screen.findByRole("region", { name: "Approval" });
       expect(within(section).queryByLabelText("Spec digest you approved")).toBeNull();
-      fireEvent.click(within(section).getByRole("button", { name: "Apply" }));
-      await within(section).findByText("Apply: done.");
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
+      await within(section).findByText("Apply change: done.");
       expect(submitted).toEqual([{ kind: "apply", body: { plan_id: PLAN } }]);
     });
   });
@@ -482,7 +482,7 @@ describe("Approve and Apply on the plan page", () => {
       </WriteAccessProvider>,
     );
     const section = await screen.findByRole("region", { name: "Approval" });
-    const approve = within(section).getByRole("button", { name: "Approve" });
+    const approve = within(section).getByRole("button", { name: "Approve change" });
     expect(approve).toBeDisabled();
     fireEvent.click(approve);
     expect(approve).toHaveAttribute("title", READ_ONLY_REASON);

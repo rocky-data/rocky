@@ -8551,7 +8551,7 @@
         ]
       },
       "ErrorEnvelope": {
-        "description": "Structured error body returned by the `rocky serve` HTTP API.\n\nEvery non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.\n\nStable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `state_needs_migration` (`409`: the state store lacks tables this server reads and a read never creates them; one read-write command — a `rocky run` — migrates it; not retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `job_not_running` (`409`: a cancel named a job that has finished), `job_not_cancellable` (`409`: a cancel named a job this server process did not start, such as a scheduled run), `bad_request`, `unauthorized`, `internal_error`.",
+        "description": "Structured error body returned by the `rocky serve` HTTP API.\n\nEvery non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.\n\nStable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `state_needs_migration` (`409`: the state store lacks tables this server reads and a read never creates them; one read-write command — a `rocky run` — migrates it; not retryable), `model_not_found`, `run_not_found` (a run id, or `latest` on an empty store, names no recorded run), `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `job_not_running` (`409`: a cancel named a job that has finished), `job_not_cancellable` (`409`: a cancel named a job this server process did not start, such as a scheduled run), `bad_request`, `unauthorized`, `internal_error`.",
         "properties": {
           "code": {
             "description": "Stable machine token, e.g. `\"model_not_found\"`.",
@@ -29460,6 +29460,82 @@
         ]
       }
     },
+    "/api/v1/compliance": {
+      "get": {
+        "description": "The classification-versus-masking rollup for the project: every classified column, whether each environment masks it, and the exceptions. The same bytes as `rocky compliance --output json`. Reads `rocky.toml` and the models directory only: no state store, no warehouse.",
+        "operationId": "getCompliance",
+        "parameters": [
+          {
+            "description": "Evaluate this environment only. Default: every environment.",
+            "in": "query",
+            "name": "env",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "List only the exceptions. Default: false.",
+            "in": "query",
+            "name": "exceptions_only",
+            "required": false,
+            "schema": {
+              "enum": [
+                "true",
+                "false"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComplianceOutput"
+                }
+              }
+            },
+            "description": "The compliance rollup."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound `rocky.toml` or the models directory could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Classification versus masking",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
     "/api/v1/cost/month": {
       "get": {
         "description": "One month of production cost split across the data products, in physical units, with money in USD only where `[cost]` sets a price, and each `[product_budget.<name>]` checked with its breach events. The same bytes as `rocky cost --month <month> --by product --output json`, modulo the clock: `as_of` is the request instant, and storage in the current month accrues to it. Without `month`, the month that contains the request instant in the project's `[schedule].timezone`, the month `rocky product status` reports as `cost_month`. `money` is absent unless `money_status` is `priced`: a figure Rocky does not measure, or one with no price, is never `0`. Reads run history only.",
@@ -31535,6 +31611,88 @@
         ]
       }
     },
+    "/api/v1/recipes/{hash}/history": {
+      "get": {
+        "description": "Every recorded execution of one exact program (a recipe hash) across the 500 newest runs, newest run first. The same bytes as `rocky history --recipe <hash> --output json`. An unknown hash is `200` with no executions. Reads only.",
+        "operationId": "getRecipeHistory",
+        "parameters": [
+          {
+            "description": "Path parameter `hash`.",
+            "in": "path",
+            "name": "hash",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only runs that started at or after this: RFC 3339 or `YYYY-MM-DD`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipeHistoryOutput"
+                }
+              }
+            },
+            "description": "The executions of the recipe."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Every execution of one recipe",
+        "tags": [
+          "history"
+        ]
+      }
+    },
     "/api/v1/review/queue": {
       "get": {
         "description": "Every outstanding `require_review` escalation that a persisted plan can clear, ranked by blast radius, change class and staleness. The same bytes as `rocky review --queue --output json` for the same project and store, except `staleness_seconds` and `score`, which derive from the request instant. Compiles the project once per call to rank by blast radius, as the CLI does. Reads only.",
@@ -31770,6 +31928,98 @@
           }
         },
         "summary": "Project run history",
+        "tags": [
+          "history"
+        ]
+      }
+    },
+    "/api/v1/runs/{id}/replay-check": {
+      "get": {
+        "description": "Whether each model of a recorded run could be re-executed from its recording alone: provenance present, embedded IR parses, inputs resolvable, plus a static non-determinism flag. The same bytes as `rocky replay <id> --check --output json`. `id` may be `latest`. Nothing is executed or written.",
+        "operationId": "getRunReplayCheck",
+        "parameters": [
+          {
+            "description": "Path parameter `id`.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Check this model of the run only.",
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayCheckOutput"
+                }
+              }
+            },
+            "description": "The replayability verdicts."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No run has this id (or `latest` and no run is recorded), or the run did not execute `model`."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Replayability audit of one run",
         "tags": [
           "history"
         ]

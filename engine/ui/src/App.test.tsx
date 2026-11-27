@@ -10,6 +10,7 @@ import {
   WIDE_ENOUGH_FOR_THE_SIDEBAR,
   WAITING_REFRESH_MS,
   waitingLine,
+  type Waiting,
 } from "./App";
 import { NOT_YET_HEADING } from "./areas";
 import { GovernorScreen } from "./governor/GovernorScreen";
@@ -157,10 +158,13 @@ describe("EnginePanel", () => {
   });
 });
 
+/** A fake brief read: `decisions` waiting decisions, `runs` runs needing attention. */
+const w = (decisions: number | null, runs: number | null = 0): Waiting => ({ decisions, runs });
+
 describe("App", () => {
   const slots = {
     // Every App test gets a fake count, so none reaches jsdom's fetch.
-    fetchWaiting: async () => 0,
+    fetchWaiting: async () => w(0),
     engine: <span>engine slot</span>,
     estate: <span>estate slot</span>,
     review: <span>review slot</span>,
@@ -218,17 +222,17 @@ describe("App", () => {
     // Folded by default: the five real areas own the rail.
     expect(later?.closest("details")).not.toHaveAttribute("open");
     expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
-      "Needs you",
-      "Estate",
-      "Review",
-      "Products",
-      "Governance",
+      "Inbox",
+      "Project",
+      "Changes",
+      "Data products",
+      "Oversight",
     ]);
     const disabled = nav.querySelectorAll('[aria-disabled="true"]');
     expect(disabled).toHaveLength(6);
     // Not a link, so not in the tab order; its reason is on the page.
     for (const entry of disabled) expect(entry.closest("a")).toBeNull();
-    expect(within(nav).getByText("No page of its own yet. The runs table is on Estate.")).toBeInTheDocument();
+    expect(within(nav).getByText("No page of its own yet. The runs table is on Project.")).toBeInTheDocument();
     expect(screen.getByText("engine slot")).toBeInTheDocument();
   });
 
@@ -240,31 +244,53 @@ describe("App", () => {
   /** Let every pending read settle, so a "no badge" check is not vacuous. */
   const settle = () => act(async () => {});
 
-  it("badges Needs you and Review with what waits, keeping each link's name", async () => {
+  it("badges Inbox and Changes with what waits, keeping each link's name", async () => {
     window.history.pushState(null, "", "/ui/estate");
-    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => 2} />);
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(2)} />);
     const needs = await waitFor(() => {
-      const link = areas().getByRole("link", { name: "Needs you" });
-      expect(link).toHaveAccessibleDescription(waitingLine(2));
+      const link = areas().getByRole("link", { name: "Inbox" });
+      expect(link).toHaveAccessibleDescription(waitingLine(2, "item"));
       return link;
     });
     // The digit is beside the link, never in its text or its name.
-    expect(needs.textContent).toBe("Needs you");
-    expect(badgeOf("Needs you")).toBe("2");
-    expect(areas().getByRole("link", { name: "Review" })).toHaveAccessibleDescription(
+    expect(needs.textContent).toBe("Inbox");
+    expect(badgeOf("Inbox")).toBe("2");
+    expect(areas().getByRole("link", { name: "Changes" })).toHaveAccessibleDescription(
       "2 decisions wait on you",
     );
     // Only those two: nothing else in the sidebar waits on a person.
-    expect(areas().getByRole("link", { name: "Estate" })).not.toHaveAttribute("aria-describedby");
+    expect(areas().getByRole("link", { name: "Project" })).not.toHaveAttribute("aria-describedby");
     expect(waitingLine(1)).toBe("1 decision waits on you");
   });
 
+  it("counts attention runs in the Inbox badge but not in Changes", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(1, 2)} />);
+    await waitFor(() => expect(badgeOf("Inbox")).toBe("3"));
+    expect(areas().getByRole("link", { name: "Inbox" })).toHaveAccessibleDescription("3 items wait on you");
+    expect(badgeOf("Changes")).toBe("1");
+  });
+
+  it("shows no Inbox badge when runs were not read, even with decisions waiting", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(2, null)} />);
+    await waitFor(() => expect(badgeOf("Changes")).toBe("2"));
+    expect(badgeOf("Inbox")).toBeNull();
+  });
+
+  it("shows an Inbox badge for attention runs alone", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(0, 1)} />);
+    await waitFor(() => expect(badgeOf("Inbox")).toBe("1"));
+    expect(badgeOf("Changes")).toBeNull();
+  });
+
   it.each([
-    ["zero", async () => 0],
-    ["a section the engine could not read", async () => null],
+    ["zero", async () => w(0)],
+    ["a section the engine could not read", async () => w(null, null)],
     [
       "a refused read",
-      async (): Promise<number> => {
+      async (): Promise<Waiting> => {
         throw new Error("refused");
       },
     ],
@@ -274,12 +300,12 @@ describe("App", () => {
     render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
     await waitFor(() => expect(read).toHaveBeenCalled());
     await settle();
-    expect(badgeOf("Needs you")).toBeNull();
-    expect(areas().getByRole("link", { name: "Review" })).not.toHaveAttribute("aria-describedby");
+    expect(badgeOf("Inbox")).toBeNull();
+    expect(areas().getByRole("link", { name: "Changes" })).not.toHaveAttribute("aria-describedby");
   });
 
   it("reads nothing before the engine answers", async () => {
-    const read = vi.fn(async () => 1);
+    const read = vi.fn(async () => w(1));
     render(
       <App fetchMeta={() => new Promise<MetaOutput>(() => {})} {...slots} fetchWaiting={read} />,
     );
@@ -296,30 +322,30 @@ describe("App", () => {
     it("reads again on its interval, and clears a count it can no longer vouch for", async () => {
       vi.useFakeTimers();
       window.history.pushState(null, "", "/ui/estate");
-      const answers: (() => Promise<number>)[] = [
-        async () => 3,
+      const answers: (() => Promise<Waiting>)[] = [
+        async () => w(3),
         async () => {
           throw new Error("engine_busy");
         },
-        async () => 1,
+        async () => w(1),
       ];
-      const read = vi.fn(() => (answers.shift() ?? (async () => 1))());
+      const read = vi.fn(() => (answers.shift() ?? (async () => w(1)))());
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await settle();
-      expect(badgeOf("Review")).toBe("3");
+      expect(badgeOf("Changes")).toBe("3");
 
       await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS));
       expect(read).toHaveBeenCalledTimes(2);
-      expect(badgeOf("Review")).toBeNull();
+      expect(badgeOf("Changes")).toBeNull();
 
       await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS));
-      expect(badgeOf("Review")).toBe("1");
+      expect(badgeOf("Changes")).toBe("1");
     });
 
     it("never stacks a read on one still running", async () => {
       vi.useFakeTimers();
       window.history.pushState(null, "", "/ui/estate");
-      const read = vi.fn(() => new Promise<number>(() => {}));
+      const read = vi.fn(() => new Promise<Waiting>(() => {}));
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await settle();
       await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS * 3));
@@ -329,7 +355,7 @@ describe("App", () => {
     it("pauses while the tab is hidden, and reads at once when it comes back", async () => {
       vi.useFakeTimers();
       window.history.pushState(null, "", "/ui/estate");
-      const read = vi.fn(async () => 2);
+      const read = vi.fn(async () => w(2));
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await settle();
       expect(read).toHaveBeenCalledTimes(1);
@@ -347,11 +373,11 @@ describe("App", () => {
 
     it("reads again on navigation", async () => {
       window.history.pushState(null, "", "/ui/estate");
-      const read = vi.fn(async () => 2);
+      const read = vi.fn(async () => w(2));
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
       await settle();
-      areas().getByRole("link", { name: "Review" }).click();
+      areas().getByRole("link", { name: "Changes" }).click();
       await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
     });
   });
@@ -360,30 +386,30 @@ describe("App", () => {
     window.history.pushState(null, "", "/ui/governor");
     render(<App fetchMeta={readyMeta} {...slots} />);
     expect(screen.getByText("governor slot")).toBeInTheDocument();
-    // A bare governor path opens the brief, so Needs you is current.
-    expect(areas().getByRole("link", { name: "Needs you" })).toHaveAttribute("aria-current", "page");
+    // A bare governor path opens the brief, so Inbox is current.
+    expect(areas().getByRole("link", { name: "Inbox" })).toHaveAttribute("aria-current", "page");
 
-    areas().getByRole("link", { name: "Estate" }).click();
+    areas().getByRole("link", { name: "Project" }).click();
     await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
     expect(window.location.pathname).toBe("/ui/estate");
 
-    areas().getByRole("link", { name: "Governance" }).click();
+    areas().getByRole("link", { name: "Oversight" }).click();
     await waitFor(() => expect(window.location.pathname).toBe("/ui/governor/scorecard"));
     expect(screen.getByText("governor slot")).toBeInTheDocument();
 
     const current = screen
       .getByRole("navigation", { name: "Areas" })
       .querySelectorAll("[aria-current]");
-    expect([...current].map((node) => node.textContent)).toEqual(["Governance"]);
+    expect([...current].map((node) => node.textContent)).toEqual(["Oversight"]);
   });
 
   it.each([
-    // Governance has tabs, so its sidebar entry is the current section ("true").
-    ["/ui/governor/custody/freeze%3Aglobal", "Governance", "true", "governor slot"],
-    ["/ui/governor/audit/revenue%20daily", "Governance", "true", "governor slot"],
-    ["/ui/governor/products/revenue%20daily", "Products", "page", "governor slot"],
-    ["/ui/review/plan-1", "Review", "page", "review slot"],
-    ["/ui/nope", "Estate", "page", "estate slot"],
+    // Oversight has tabs, so its sidebar entry is the current section ("true").
+    ["/ui/governor/custody/freeze%3Aglobal", "Oversight", "true", "governor slot"],
+    ["/ui/governor/audit/revenue%20daily", "Oversight", "true", "governor slot"],
+    ["/ui/governor/products/revenue%20daily", "Data products", "page", "governor slot"],
+    ["/ui/review/plan-1", "Changes", "page", "review slot"],
+    ["/ui/nope", "Project", "page", "estate slot"],
   ])("deep-links %s under %s", (path, area, mark, slot) => {
     window.history.pushState(null, "", path);
     render(<App fetchMeta={readyMeta} {...slots} />);
@@ -392,12 +418,12 @@ describe("App", () => {
   });
 
   it.each([
-    ["/ui/governor", "Needs you"],
-    ["/ui/governor/scorecard", "Scorecard"],
-    ["/ui/governor/custody/freeze%3Aglobal", "Custody"],
-    ["/ui/governor/audit", "Audit"],
-    ["/ui/governor/products", "Products"],
-    ["/ui/estate", "Estate"],
+    ["/ui/governor", "Inbox"],
+    ["/ui/governor/scorecard", "Agent activity"],
+    ["/ui/governor/custody/freeze%3Aglobal", "Trace"],
+    ["/ui/governor/audit", "Audit log"],
+    ["/ui/governor/products", "Data products"],
+    ["/ui/estate", "Project"],
   ])("marks exactly one current page on the whole page at %s", (path, page) => {
     // The real governor tab bar, not a slot: the defect this pins was a tab
     // and a sidebar entry both claiming the page, which a slot cannot show.
@@ -419,14 +445,14 @@ describe("App", () => {
   it("follows Back and Forward", async () => {
     window.history.pushState(null, "", "/ui/estate");
     render(<App fetchMeta={readyMeta} {...slots} />);
-    areas().getByRole("link", { name: "Review" }).click();
+    areas().getByRole("link", { name: "Changes" }).click();
     await waitFor(() => expect(screen.getByText("review slot")).toBeInTheDocument());
 
     act(() => {
       window.history.back();
     });
     await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
-    expect(areas().getByRole("link", { name: "Estate" })).toHaveAttribute("aria-current", "page");
+    expect(areas().getByRole("link", { name: "Project" })).toHaveAttribute("aria-current", "page");
   });
 
   describe("the drawer below the breakpoint", () => {
@@ -440,7 +466,7 @@ describe("App", () => {
       window.history.pushState(null, "", "/ui/review");
       render(<App fetchMeta={readyMeta} {...slots} />);
       // The bar names where you are, since the sidebar is folded away.
-      expect(screen.getByText("Review", { selector: "div" })).toBeInTheDocument();
+      expect(screen.getByText("Changes", { selector: "div" })).toBeInTheDocument();
       const button = openButton();
       expect(button).toHaveAttribute("aria-expanded", "false");
       expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(0);
@@ -448,7 +474,7 @@ describe("App", () => {
       fireEvent.click(button);
       const dialog = await screen.findByRole("dialog");
       expect(button).toHaveAttribute("aria-expanded", "true");
-      expect(within(dialog).getByRole("link", { name: "Estate" })).toBeInTheDocument();
+      expect(within(dialog).getByRole("link", { name: "Project" })).toBeInTheDocument();
     });
 
     it("leaves one set of areas in the reading order while it is open", async () => {
@@ -466,7 +492,7 @@ describe("App", () => {
       const announced = [...document.querySelectorAll('[aria-current="page"]')].filter(
         (node) => node.closest('[aria-hidden="true"]') === null,
       );
-      expect(announced.map((node) => node.textContent)).toEqual(["Estate"]);
+      expect(announced.map((node) => node.textContent)).toEqual(["Project"]);
       // And the engine line is drawn twice but read once, from one request.
       expect(screen.getAllByText("engine slot")).toHaveLength(2);
     });
@@ -477,7 +503,7 @@ describe("App", () => {
       const button = openButton();
       fireEvent.click(button);
       const dialog = await screen.findByRole("dialog");
-      within(dialog).getByRole("link", { name: "Review" }).click();
+      within(dialog).getByRole("link", { name: "Changes" }).click();
       await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
       expect(window.location.pathname).toBe("/ui/review");
     });
@@ -577,7 +603,7 @@ describe("App", () => {
       fireEvent.click(button);
       const dialog = await screen.findByRole("dialog");
 
-      fireEvent.click(within(dialog).getByRole("link", { name: "Estate" }));
+      fireEvent.click(within(dialog).getByRole("link", { name: "Project" }));
 
       await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
       expect(window.location.pathname).toBe("/ui/estate");

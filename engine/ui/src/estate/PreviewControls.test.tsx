@@ -40,11 +40,11 @@ const copy = (model_name: string, copy_strategy: string, extra: Record<string, u
   ...extra,
 });
 
-describe("Preview create", () => {
+describe("Create branch", () => {
   it("is disabled on a read-only page and submits nothing", () => {
     const { client, submitted } = fakeJobs(job("succeeded"));
     renderControls(client, READ_ONLY);
-    const button = screen.getByRole("button", { name: "Create preview" });
+    const button = screen.getByRole("button", { name: "Create branch" });
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(submitted).toEqual([]);
@@ -56,7 +56,7 @@ describe("Preview create", () => {
     renderControls(client);
     fireEvent.change(screen.getByLabelText("Branch name"), { target: { value: "  pr_x  " } });
     fireEvent.change(screen.getByLabelText("Base git ref"), { target: { value: " origin/main " } });
-    fireEvent.click(screen.getByRole("button", { name: "Create preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create branch" }));
     const group = screen.getByRole("group");
     expect(group.textContent).toContain("warehouse schema branch__pr_x");
     expect(group.textContent).toContain("against origin/main");
@@ -66,8 +66,8 @@ describe("Preview create", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(screen.queryByRole("group")).toBeNull();
     expect(submitted).toEqual([]);
-    fireEvent.click(screen.getByRole("button", { name: "Create preview" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm create preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create branch" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm create branch" }));
     await waitFor(() =>
       expect(submitted).toEqual([{ kind: "preview", body: { name: "pr_x", base: "origin/main" } }]),
     );
@@ -76,18 +76,18 @@ describe("Preview create", () => {
   it("sends an empty body when both fields are blank, and says the name comes from git", async () => {
     const { client, submitted } = fakeJobs(job("succeeded", { result: {} }));
     renderControls(client);
-    fireEvent.click(screen.getByRole("button", { name: "Create preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create branch" }));
     expect(screen.getByRole("group").textContent).toContain("derived from the git branch");
     expect(screen.getByRole("group").textContent).toContain("against main");
-    fireEvent.click(screen.getByRole("button", { name: "Confirm create preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm create branch" }));
     await waitFor(() => expect(submitted).toEqual([{ kind: "preview", body: {} }]));
   });
 
   async function runWith(result: Record<string, unknown>) {
     const { client } = fakeJobs(job("succeeded", { result }));
     renderControls(client);
-    fireEvent.click(screen.getByRole("button", { name: "Create preview" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm create preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create branch" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm create branch" }));
   }
 
   it("says done, the schema, the copies and that the changed models were not re-run", async () => {
@@ -96,8 +96,8 @@ describe("Preview create", () => {
       prune_set: [{ model_name: "orders", reason: "changed" }],
       copy_set: [copy("customers", "ctas"), copy("items", "ctas")],
     });
-    await screen.findByText("Preview: done.", {}, { timeout: 3000 });
-    const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
+    await screen.findByText("Create branch: done.", {}, { timeout: 3000 });
+    const text = screen.getByRole("list", { name: "Create branch result" }).textContent ?? "";
     expect(text).toContain("Warehouse schema: branch__pr_x");
     expect(text).toContain("Copied from production: 2 models.");
     expect(text).toContain("planned but not re-run: orders");
@@ -111,9 +111,9 @@ describe("Preview create", () => {
       copy_set: [copy("customers", "ctas"), copy("items", "failed"), copy("stock", "planning_only")],
     });
     const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
-    expect(alert.textContent).toBe("Preview: branch registered, but not every model was copied.");
-    expect(screen.queryByText("Preview: done.")).toBeNull();
-    const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
+    expect(alert.textContent).toBe("Create branch: registered, but not every model was copied.");
+    expect(screen.queryByText("Create branch: done.")).toBeNull();
+    const text = screen.getByRole("list", { name: "Create branch result" }).textContent ?? "";
     expect(text).toContain("Copied from production: 1 model.");
     expect(text).toContain("Copy failed for: items.");
     expect(text).toContain("Planned but not copied");
@@ -128,8 +128,8 @@ describe("Preview create", () => {
       prune_set: [],
       copy_set: [copy("customers", "ctas"), copy("orders", "ctas")],
     });
-    await screen.findByText("Preview: done.", {}, { timeout: 3000 });
-    const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
+    await screen.findByText("Create branch: done.", {}, { timeout: 3000 });
+    const text = screen.getByRole("list", { name: "Create branch result" }).textContent ?? "";
     expect(text).toContain("Copied from production: 2 models.");
     expect(text).toContain("No changed models.");
     expect(text).not.toContain("nothing was copied");
@@ -139,9 +139,9 @@ describe("Preview create", () => {
   it("warns, never says done, when nothing was copied and nothing changed", async () => {
     await runWith({ branch_schema: "branch__pr_x", prune_set: [], copy_set: [] });
     const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
-    expect(alert.textContent).toBe("Preview: branch registered, but nothing was copied.");
-    expect(screen.queryByText("Preview: done.")).toBeNull();
-    const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
+    expect(alert.textContent).toBe("Create branch: registered, but nothing was copied.");
+    expect(screen.queryByText("Create branch: done.")).toBeNull();
+    const text = screen.getByRole("list", { name: "Create branch result" }).textContent ?? "";
     expect(text).toContain("No changed models, so nothing was copied.");
   });
 
@@ -164,7 +164,7 @@ describe("Preview create", () => {
     many.push(copy("x".repeat(200), "failed"));
     await runWith({ branch_schema: "b", prune_set: [], copy_set: many });
     await screen.findByRole("alert", {}, { timeout: 3000 });
-    const text = screen.getByRole("list", { name: "Preview result" }).textContent ?? "";
+    const text = screen.getByRole("list", { name: "Create branch result" }).textContent ?? "";
     expect(text).toContain("m9");
     expect(text).not.toContain("m10");
     expect(text).toContain("and 5 more");
@@ -178,10 +178,10 @@ describe("Preview create", () => {
       }),
     );
     renderControls(client);
-    fireEvent.click(screen.getByRole("button", { name: "Create preview" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm create preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create branch" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm create branch" }));
     const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
-    expect(alert.textContent).toContain("Preview: failed.");
+    expect(alert.textContent).toContain("Create branch: failed.");
     expect(alert.textContent).toContain("branch 'pr_x' already exists");
   });
 });

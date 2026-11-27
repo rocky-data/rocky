@@ -1,5 +1,7 @@
 /** Rendering helpers. Every function returns text; nothing here builds markup. */
 
+import type { PolicyCapability, PolicyEffect } from "@rocky-types/audit";
+
 /** What an absent or `null` value renders as (D14ii): a status, never a value. */
 export const NOT_RECORDED = "not recorded";
 
@@ -112,18 +114,76 @@ export function clipMiddle(value: string, head = 10, tail = 8): Clipped {
   };
 }
 
+/** A policy effect as the UI says it. The API and the CLI keep the raw value. */
+export function effectLabel(effect: PolicyEffect): string {
+  switch (effect) {
+    case "allow":
+      return "Allowed";
+    case "require_review":
+      return "Needs approval";
+    case "deny":
+      return "Blocked";
+    default: {
+      // A new engine effect is a type error here; at runtime the raw value
+      // shows rather than nothing.
+      const unknown: never = effect;
+      return String(unknown);
+    }
+  }
+}
+
 /**
- * The verdict cell for a decision row, mirroring `verdict_label` in the CLI's
- * `audit.rs`. An evaluation shows its policy effect. Any other row shows its
- * kind with the recorded effect beside it, so an approval's `allow` never
- * reads as a policy allow.
+ * A policy capability as the UI says it, in plain words. The API and the CLI
+ * keep the raw value (`schema_change.breaking`). A new engine capability is a
+ * type error here; at runtime the raw value shows rather than nothing.
+ */
+export function capabilityLabel(capability: PolicyCapability): string {
+  switch (capability) {
+    case "read":
+      return "read";
+    case "propose":
+      return "propose a change";
+    case "apply":
+      return "apply a change";
+    case "promote":
+      return "promote a change";
+    case "backfill":
+      return "backfill";
+    case "gc":
+      return "clean up old data";
+    case "restore":
+      return "restore";
+    case "retry":
+      return "retry a run";
+    case "run":
+      return "run";
+    case "quarantine":
+      return "quarantine";
+    case "schema_change.additive":
+      return "add columns (additive schema change)";
+    case "schema_change.breaking":
+      return "make a breaking schema change";
+    case "value_change":
+      return "change values";
+    default: {
+      const unknown: never = capability;
+      return String(unknown);
+    }
+  }
+}
+
+/**
+ * The verdict cell for a decision row, after `verdict_label` in the CLI's
+ * `audit.rs`. An evaluation shows its policy effect in words (`effectLabel`).
+ * Any other row shows its kind with the raw recorded effect beside it, so an
+ * approval's `allow` or a freeze's `deny` never reads as a policy verdict.
  */
 export function verdictLabel(entry: {
   kind: string;
-  effect: string;
+  effect: PolicyEffect;
   approval_channel?: string | null;
 }): string {
-  if (entry.kind === "evaluation") return entry.effect;
+  if (entry.kind === "evaluation") return effectLabel(entry.effect);
   if (entry.kind === "approval" && entry.approval_channel) {
     return `approval (${entry.approval_channel}) [effect ${entry.effect}]`;
   }

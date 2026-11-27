@@ -38,7 +38,7 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
         />
       </div>
       <StatusCard
-        label="tick lock"
+        label="scheduler lock"
         value={status.tick_lock.state}
         tone={lockTone(status.tick_lock.state)}
         sub={
@@ -118,15 +118,15 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
 export function SpoolCounts({ spool }: { spool: ScheduleSpoolOutput }) {
   const { counts } = spool;
   return (
-    <div className="grid gap-2 sm:grid-cols-3" role="group" aria-label="Waiting webhook demands">
+    <div className="grid gap-2 sm:grid-cols-3" role="group" aria-label="Queued webhook triggers">
       <StatusCard
-        label="waiting demands"
+        label="queued triggers"
         value={counts.pending}
         tone={counts.pending > 0 ? "pending" : "muted"}
-        sub="accepted by the webhook, not yet claimed by a tick"
+        sub="accepted by the webhook, not yet picked up by the scheduler"
       />
       <StatusCard
-        label="unreadable demands"
+        label="unreadable triggers"
         value={counts.skipped}
         tone={counts.skipped > 0 ? "risk" : "muted"}
         sub="in the spool, but could not be read"
@@ -135,7 +135,7 @@ export function SpoolCounts({ spool }: { spool: ScheduleSpoolOutput }) {
         label="quarantined"
         value={counts.corrupt}
         tone={counts.corrupt > 0 ? "risk" : "muted"}
-        sub="set aside by a tick as corrupt"
+        sub="set aside by the scheduler as corrupt"
       />
     </div>
   );
