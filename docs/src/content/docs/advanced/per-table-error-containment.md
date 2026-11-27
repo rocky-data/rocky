@@ -74,18 +74,18 @@ Without an abort, the run finishes and exits non-zero, and the JSON stays well-f
 
 ## `failure_kind` taxonomy
 
-`failure_kind` is a coarse classifier over the failure surface. Most variants partition the connector error spaces for Databricks and Snowflake. `compile-error` is the exception: it covers a model that fails to compile mid-run, which is not a connector failure at all. `unknown` is the fallback for a failure that reaches the output layer type-erased.
+`failure_kind` is a coarse classifier over the failure surface. Most variants partition the connector error spaces for Databricks, Snowflake, BigQuery and Trino. `compile-error` is the exception: it covers a model that fails to compile mid-run, which is not a connector failure at all. `unknown` is the fallback for a failure that reaches the output layer type-erased.
 
 | Variant | Meaning | Retry-safe? |
 |---|---|---|
 | `connection-failed` | TCP / TLS / DNS / connection-establishment failure -- the request never reached the warehouse. | Yes, with backoff. |
 | `auth-failed` | Credentials rejected or token expired -- 401, 403, or an auth-chain rejection. | No. Fix credentials before retrying. |
 | `query-rejected` | Warehouse parsed and rejected the SQL -- syntax error, missing column, missing permission, semantic analysis failure. | No. The SQL needs fixing. |
-| `transient` | Retry-worthy failure -- 5xx, network glitch, statement aborted by a transient warehouse condition, a transport timeout, a statement timeout on PostgreSQL, BigQuery or Trino. | Yes, except a BigQuery or Trino statement timeout. Those adapters do not cancel a statement yet, so a retry (`table_retries`, and the Trino run loop) can start a second copy while the first still runs. Not safe to retry until cancel support lands (#2768). |
+| `transient` | Retry-worthy failure -- 5xx, network glitch, statement aborted by a transient warehouse condition, a transport timeout, a statement timeout on PostgreSQL. | Yes. |
 | `quota-exceeded` | Rate limit hit or a configured cap reached -- 429, retry-budget exhaustion, account-level quota. | Yes, with extended backoff and an alert. |
 | `not-found` | Requested catalog / schema / table not present -- 404 from the warehouse, often an upstream rename. | No. Re-discovery or human triage needed. |
 | `compile-error` | The selected model has an `Error`-severity compile diagnostic, or Rocky withheld it after an upstream compile error. Rocky makes no warehouse call for it. Its declared descendants are withheld and listed in `contained[]`. Healthy branches can still run. Targets of failed or withheld models stay unchanged. The diagnostic or block reason is in `error`. | No. Fix the model SQL or its upstream; re-running without a change will not help. |
-| `unknown` | The failure could not be classified -- e.g. errors raised outside the connector layer that reach the output struct type-erased. Also a Databricks or Snowflake statement that passed its client deadline (`timeout_secs`) or that Rocky stopped waiting on: it may still be running. | Depends. Surface the raw `error` string. Never retry a statement that may still run. |
+| `unknown` | The failure could not be classified -- e.g. errors raised outside the connector layer that reach the output struct type-erased. Also a Databricks, Snowflake, BigQuery or Trino statement that passed its client deadline (`timeout_secs`) or that Rocky stopped waiting on: it may still be running. When Rocky had the statement's id, it sent a cancel first. Also a BigQuery job that finished without error but whose result Rocky lost: any changes it made are applied. | Depends. Surface the raw `error` string. Never retry a statement that may still run. |
 
 The classifier walks the `anyhow::Error` chain, downcasts to `AdapterError`, then probes `.inner()` for the typed connector enum. An error built with `anyhow::anyhow!("...{e}")` drops the type and becomes `unknown`. An error propagated with `?` or `.context(...)` keeps it.
 

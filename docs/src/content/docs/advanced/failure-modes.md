@@ -156,7 +156,7 @@ A `failure_kind: "transient"` entry in `errors[*]` has already been retried in t
 2. **Transient** (`failure_kind: "transient"` or `"connection-failed"`): the retry budget is exhausted. When the condition clears, run `rocky plan --resume-latest && rocky apply <plan-id>`. The single-step `rocky run --resume-latest` does the same.
 3. **Auth**: walk the adapter's auth order and check the env vars and `rocky.toml` against [Authentication](/reference/authentication/).
 4. **Quota**: check the warehouse's quota dashboard. Adaptive concurrency (AIMD: add one slot at a time, halve on a rate limit) backs off by itself, but a hard quota reset happens warehouse-side.
-5. **Statement timeout**: on Databricks and Snowflake it is `failure_kind: "unknown"`, and Rocky does not retry it, because the statement may still run. Check the warehouse's query history first. Then raise `timeout_secs` on the adapter. Better, check the [materialization strategy](/reference/glossary/#materialization-strategy). A multi-hour `FullRefresh` is often a missed `Merge` or `Incremental`; `rocky optimize` recommends one.
+5. **Statement timeout**: on Databricks, Snowflake, BigQuery and Trino it is `failure_kind: "unknown"`, and Rocky does not retry it, because the statement may still run. Rocky sends it a cancel first once it has the statement's id. Check the warehouse's query history first. Then raise `timeout_secs` on the adapter. Better, check the [materialization strategy](/reference/glossary/#materialization-strategy). A multi-hour `FullRefresh` is often a missed `Merge` or `Incremental`; `rocky optimize` recommends one.
 
 ---
 

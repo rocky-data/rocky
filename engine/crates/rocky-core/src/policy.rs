@@ -173,6 +173,21 @@ pub struct PolicyDecision {
     pub reason: String,
 }
 
+/// Whether `scope` matches every model with zero constraints: `scope.any`,
+/// or a scope with no matching predicate (only `max_downstreams`, which is a
+/// post-match condition). [`scope_constraints`] returns the empty set for
+/// such a scope whatever the attributes, so the default posture can never
+/// apply to a capability such a rule covers.
+pub fn scope_matches_every_model(scope: &PolicyScope) -> bool {
+    scope.any
+        || (scope.models.is_empty()
+            && scope.tags.is_empty()
+            && scope.classifications.is_empty()
+            && scope.exclude_classifications.is_empty()
+            && scope.contracted.is_none()
+            && scope.layer.is_none())
+}
+
 /// Returns the satisfied-constraint set for `scope` against `attrs`, or
 /// `None` when the scope is not satisfied (so the rule does not match).
 ///
@@ -2356,5 +2371,76 @@ mod tests {
         );
         assert_eq!(bronze_effect, PolicyEffect::Deny, "bronze is frozen");
         assert_eq!(silver_effect, PolicyEffect::Allow, "silver is not frozen");
+    }
+
+    /// `scope_matches_every_model` agrees with the evaluator's own matcher:
+    /// an every-model scope yields the empty constraint set for any model,
+    /// and each real predicate fails to match some model.
+    #[test]
+    fn scope_matches_every_model_mirrors_scope_constraints() {
+        let models = [
+            ModelAttributes::default(),
+            contracted_model(),
+            ModelAttributes {
+                name: "orders".to_string(),
+                tags: [("tier".to_string(), "gold".to_string())].into(),
+                classifications: ["pii".to_string()].into(),
+                layer: Some("gold".to_string()),
+                ..Default::default()
+            },
+        ];
+        let every = [
+            PolicyScope {
+                any: true,
+                ..Default::default()
+            },
+            PolicyScope {
+                max_downstreams: Some(5),
+                ..Default::default()
+            },
+        ];
+        for scope in &every {
+            assert!(scope_matches_every_model(scope), "{scope:?}");
+            for attrs in &models {
+                assert_eq!(
+                    scope_constraints(scope, attrs),
+                    Some(BTreeSet::new()),
+                    "{scope:?} on {attrs:?}"
+                );
+            }
+        }
+        let some = [
+            PolicyScope {
+                models: vec!["orders".to_string().into()],
+                ..Default::default()
+            },
+            PolicyScope {
+                tags: [("tier".to_string().into(), "gold".to_string().into())].into(),
+                ..Default::default()
+            },
+            PolicyScope {
+                classifications: vec!["pii".to_string().into()],
+                ..Default::default()
+            },
+            PolicyScope {
+                exclude_classifications: vec!["pii".to_string().into()],
+                ..Default::default()
+            },
+            PolicyScope {
+                contracted: Some(true),
+                ..Default::default()
+            },
+            PolicyScope {
+                layer: Some("gold".to_string().into()),
+                ..Default::default()
+            },
+        ];
+        for scope in &some {
+            assert!(!scope_matches_every_model(scope), "{scope:?}");
+            assert!(
+                models.iter().any(|a| scope_constraints(scope, a).is_none()),
+                "{scope:?} misses some model"
+            );
+        }
     }
 }

@@ -153,8 +153,8 @@ pub enum FinalOutcome {
 /// entry could not be read. It names no run.
 pub const CORRUPT_PRIOR_RUN_ID: &str = "<corrupt>";
 
-/// Result of [`IdempotencyBackend::check_and_claim`].
-#[derive(Debug, Clone)]
+/// Result of [`IdempotencyBackend::check_and_claim`] and [`IdempotencyBackend::peek`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdempotencyCheck {
     /// No prior entry; the caller claimed an `InFlight` stamp and should
     /// proceed to run normally.
@@ -443,6 +443,68 @@ impl IdempotencyBackend {
             IdempotencyBackend::ObjectStore { uri, .. } => {
                 let provider = provider_for_uri(uri)?;
                 object_store_check_and_claim(&provider, &entry, now).await
+            }
+        }
+    }
+
+    /// Classify `key` as [`check_and_claim`](Self::check_and_claim) would,
+    /// and write nothing.
+    ///
+    /// For a caller that must answer "is this key already done?" before it
+    /// may claim: `rocky run` asks it when its policy gate refuses a run, so a
+    /// retry of completed work still reports `skipped_idempotent` and a
+    /// refused run never claims its key. An absent key is
+    /// [`IdempotencyCheck::Proceed`]. The answer is a snapshot: a concurrent
+    /// claim can change it at once, so never act on a `Proceed` from here
+    /// without claiming.
+    pub async fn peek(
+        &self,
+        state_store: Option<&StateStore>,
+        key: &str,
+        config: &IdempotencyConfig,
+    ) -> Result<IdempotencyCheck, IdempotencyError> {
+        self.peek_at(state_store, key, config, Utc::now()).await
+    }
+
+    /// [`peek`](Self::peek) with an explicit `now`, so a test can inject the
+    /// clock.
+    pub async fn peek_at(
+        &self,
+        state_store: Option<&StateStore>,
+        key: &str,
+        config: &IdempotencyConfig,
+        now: DateTime<Utc>,
+    ) -> Result<IdempotencyCheck, IdempotencyError> {
+        // The entry a claim would write. Only its `dedup_on` is read, by the
+        // shared classifier.
+        let probe = IdempotencyEntry {
+            key: key.to_string(),
+            run_id: String::new(),
+            state: IdempotencyState::InFlight,
+            stamped_at: now,
+            expires_at: now + chrono::Duration::hours(config.in_flight_ttl_hours as i64),
+            dedup_on: config.dedup_on,
+        };
+        match self {
+            IdempotencyBackend::Local => {
+                let store = state_store.ok_or_else(|| {
+                    IdempotencyError::Config(
+                        "local idempotency backend requires an open StateStore".into(),
+                    )
+                })?;
+                Ok(match store.idempotency_get(key)? {
+                    None => IdempotencyCheck::Proceed,
+                    Some(prior) => classify_existing(prior, now, &probe),
+                })
+            }
+            // Valkey is the primary for both `valkey` and `tiered`: the claim
+            // never reads the redb mirror, so neither does this.
+            IdempotencyBackend::Valkey { url, prefix, .. } => {
+                valkey_peek(url, prefix, &probe).await
+            }
+            IdempotencyBackend::ObjectStore { uri, .. } => {
+                let provider = provider_for_uri(uri)?;
+                object_store_peek(&provider, &probe, now).await
             }
         }
     }
@@ -829,6 +891,40 @@ async fn valkey_check_and_claim(
     Ok(verdict)
 }
 
+/// [`IdempotencyBackend::peek`] on Valkey: one `GET`, classified as the claim
+/// classifies the value it finds. No `SET`, no script.
+async fn valkey_peek(
+    url: &str,
+    prefix: &str,
+    probe: &IdempotencyEntry,
+) -> Result<IdempotencyCheck, IdempotencyError> {
+    if url.is_empty() {
+        return Err(IdempotencyError::Config(
+            "valkey backend selected but `state.valkey_url` is unset".into(),
+        ));
+    }
+    let full_key = valkey_key(prefix, &probe.key);
+    let url = url.to_string();
+    let probe = probe.clone();
+    tokio::task::spawn_blocking(move || -> Result<IdempotencyCheck, IdempotencyError> {
+        let client =
+            redis::Client::open(url).map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+        let mut conn = client
+            .get_connection()
+            .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+        let existing: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(&full_key)
+            .query(&mut conn)
+            .map_err(|e| IdempotencyError::Valkey(e.to_string()))?;
+        Ok(match existing {
+            None => IdempotencyCheck::Proceed,
+            Some(raw) => classify_valkey_raw(&raw, &full_key, &probe),
+        })
+    })
+    .await
+    .map_err(|e| IdempotencyError::TaskJoin(e.to_string()))?
+}
+
 /// Compare-and-set for [`valkey_finalize`]. `KEYS[1]` is the claim key;
 /// `ARGV` is our run id, "1" to keep (write `ARGV[3]` with `EX ARGV[4]`) or "0"
 /// to delete, then the value and the TTL. Returns 1 when the key is absent or
@@ -1021,6 +1117,27 @@ fn contended(path: &str) -> IdempotencyError {
         path: path.to_string(),
         attempts: MAX_CONDITIONAL_ATTEMPTS,
     }
+}
+
+/// [`IdempotencyBackend::peek`] on `s3` / `gcs`: one read, classified as the
+/// claim classifies it. A body that is not an entry is stale to the claim
+/// (it takes it over), so it is not completed work here either.
+async fn object_store_peek(
+    provider: &ObjectStoreProvider,
+    probe: &IdempotencyEntry,
+    now: DateTime<Utc>,
+) -> Result<IdempotencyCheck, IdempotencyError> {
+    let rel_path = object_store_relative_path(&probe.key);
+    Ok(match observe_claim_at_path(provider, &rel_path).await? {
+        None => IdempotencyCheck::Proceed,
+        Some(ObservedClaim {
+            entry: Some(prior), ..
+        }) => classify_existing(prior, now, probe),
+        Some(ObservedClaim { entry: None, .. }) => IdempotencyCheck::AdoptStale {
+            prior_run_id: CORRUPT_PRIOR_RUN_ID.to_string(),
+            prior_state: IdempotencyState::InFlight,
+        },
+    })
 }
 
 async fn object_store_check_and_claim(
@@ -2435,5 +2552,80 @@ mod tests {
             "{verdict:?}"
         );
         del_raw(&mut conn, &full);
+    }
+
+    /// `peek` answers as the claim would, and writes nothing: a completed key
+    /// is `SkipCompleted`, an absent key stays absent, and a stored entry is
+    /// left byte-for-byte as it was.
+    #[tokio::test]
+    async fn peek_classifies_like_the_claim_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let cfg = IdempotencyConfig::default();
+        let now = Utc::now();
+        let backend = IdempotencyBackend::Local;
+
+        let absent = backend.peek_at(Some(&store), "k", &cfg, now).await.unwrap();
+        assert_eq!(absent, IdempotencyCheck::Proceed);
+        assert_eq!(store.idempotency_get("k").unwrap(), None, "peek claimed");
+
+        for (state, expected) in [
+            (
+                IdempotencyState::Succeeded,
+                IdempotencyCheck::SkipCompleted {
+                    run_id: "run-prior".into(),
+                },
+            ),
+            (
+                IdempotencyState::InFlight,
+                IdempotencyCheck::SkipInFlight {
+                    run_id: "run-prior".into(),
+                },
+            ),
+        ] {
+            let prior = mk_entry("run-prior", state, now, 24);
+            store.idempotency_put(&prior).unwrap();
+            let verdict = backend.peek_at(Some(&store), "k", &cfg, now).await.unwrap();
+            assert_eq!(verdict, expected, "{state:?}");
+            assert_eq!(store.idempotency_get("k").unwrap(), Some(prior));
+        }
+
+        // An expired entry is stale, as the claim judges it.
+        let expired = mk_entry("run-old", IdempotencyState::Succeeded, now, -1);
+        store.idempotency_put(&expired).unwrap();
+        let verdict = backend.peek_at(Some(&store), "k", &cfg, now).await.unwrap();
+        assert!(
+            matches!(verdict, IdempotencyCheck::AdoptStale { .. }),
+            "{verdict:?}"
+        );
+        assert_eq!(store.idempotency_get("k").unwrap(), Some(expired));
+    }
+
+    /// The object-store peek reads one object and writes none.
+    #[tokio::test]
+    async fn object_store_peek_writes_nothing() {
+        let (provider, _faults) = faulting_provider();
+        let now = t0();
+        let probe = mk_entry("", IdempotencyState::InFlight, now, 24);
+        assert_eq!(
+            object_store_peek(&provider, &probe, now).await.unwrap(),
+            IdempotencyCheck::Proceed
+        );
+        assert!(
+            provider
+                .get(&object_store_relative_path("k"))
+                .await
+                .is_err(),
+            "peek created the claim"
+        );
+        let done = mk_entry("run-prior", IdempotencyState::Succeeded, now, 24);
+        seed(&provider, &done).await;
+        assert_eq!(
+            object_store_peek(&provider, &probe, now).await.unwrap(),
+            IdempotencyCheck::SkipCompleted {
+                run_id: "run-prior".into()
+            }
+        );
+        assert_eq!(stored(&provider).await, done);
     }
 }

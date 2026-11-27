@@ -686,7 +686,8 @@ pub struct PartialFailure {
     /// never the exit code — both shapes are exit 2.
     pub check_gate_failed: bool,
     /// Whether a failed table's statement may still run on the warehouse (a
-    /// connector `Timeout` or `Abandoned`). Changes the resume advice only.
+    /// connector `Timeout` or `Abandoned`), or finished without Rocky reading
+    /// its result (a BigQuery `ResultLost`). Changes the resume advice only.
     pub statement_may_still_run: bool,
     /// Whether this run's record is persisted (#1836). Read by
     /// [`session_disposition`]; never changes the exit code, which stays 2
@@ -712,8 +713,9 @@ impl std::fmt::Display for PartialFailure {
             return write!(
                 f,
                 "{} table(s) failed during parallel execution (run_id: {}); at least one \
-                 statement may still be running on the warehouse, so confirm it has stopped \
-                 before you use --resume {}",
+                 statement may still be running on the warehouse, or has already finished without \
+                 Rocky reading its result (do not run that one again); confirm on the warehouse that it has \
+                 stopped, then check the table, and use --resume {} only if the change is not there",
                 self.count, self.run_id, self.run_id
             );
         }
@@ -2395,6 +2397,51 @@ async fn try_claim_idempotency(
     }
 }
 
+/// The prior run id when `key` holds completed work: the claim would answer
+/// `SkipCompleted`. Reads the key and claims nothing. `None` when the key is
+/// absent, in flight, stale, or cannot be read; a read error is logged, and
+/// the caller then refuses as it would have.
+async fn completed_idempotency_key(
+    state_cfg: &rocky_core::config::StateConfig,
+    state_path: &Path,
+    key: &str,
+) -> Option<String> {
+    use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck};
+
+    let backend = IdempotencyBackend::from_state_config(state_cfg);
+    // Only the local backend reads redb; `tiered` reads its Valkey primary,
+    // as the claim does.
+    let state_store = match backend {
+        IdempotencyBackend::Local => match StateStore::open_read_only(state_path) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                warn!(
+                    idempotency_key = key,
+                    error = %error,
+                    "could not open the state store to read the idempotency key; refusing"
+                );
+                return None;
+            }
+        },
+        _ => None,
+    };
+    match backend
+        .peek(state_store.as_ref(), key, &state_cfg.idempotency)
+        .await
+    {
+        Ok(IdempotencyCheck::SkipCompleted { run_id }) => Some(run_id),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                idempotency_key = key,
+                error = %error,
+                "could not read the idempotency key; refusing"
+            );
+            None
+        }
+    }
+}
+
 /// Emit a short-circuit `RunOutput` (status = `skipped_*`) and exit. No
 /// state-store mutation, no hook fires, no pipeline-start event — the run
 /// never actually started.
@@ -4030,7 +4077,7 @@ pub(crate) async fn run_with_direct_gate(
     // again after discovery (below); this gate refuses it up front only when
     // no `run` rule could allow any table.
     let branch_run = shadow_config.is_some_and(|c| c.branch.is_some());
-    super::run_policy_gate::gate_pre_run(
+    if let Err(refusal) = super::run_policy_gate::gate_pre_run(
         direct_gate,
         &loaded.config,
         config_path,
@@ -4046,7 +4093,30 @@ pub(crate) async fn run_with_direct_gate(
         },
         branch_run,
     )
-    .await?;
+    .await
+    {
+        // Ruled 2026-11-26: a retry whose key already completed keeps
+        // reporting `skipped_idempotent` (exit 0), as before the run gate
+        // refused `require_review`. Skipping writes nothing. The key is read,
+        // never claimed, so a refused run still leaves no stamp. A `deny`,
+        // an unloadable policy, or any other error refuses as it did.
+        if let Some(key) = idempotency_key
+            && refusal
+                .downcast_ref::<super::run_policy_gate::ReviewRequired>()
+                .is_some()
+            && let Some(prior_run_id) =
+                completed_idempotency_key(&loaded.config.state, state_path, key).await
+        {
+            emit_skipped_run_output(
+                key,
+                &prior_run_id,
+                rocky_core::state::RunStatus::SkippedIdempotent,
+                output_json,
+            )?;
+            return Ok(RunTermination::SkippedIdempotent { prior_run_id });
+        }
+        return Err(refusal);
+    }
 
     // -------------------------------------------------------------------
     // Idempotency check + claim (before any state mutation / run_id mint).
@@ -9033,8 +9103,9 @@ pub(crate) async fn run_with_direct_gate(
         if may_still_run {
             anyhow::bail!(
                 "{count} table(s) failed during parallel execution (run_id: {run_id}); at least one \
-                 statement may still be running on the warehouse, so confirm it has stopped before \
-                 you use --resume {run_id}"
+                 statement may still be running on the warehouse, or has already finished without \
+                 Rocky reading its result (do not run that one again); confirm on the warehouse that it has \
+                 stopped, then check the table, and use --resume {run_id} only if the change is not there"
             );
         }
         anyhow::bail!(
@@ -37681,7 +37752,9 @@ backend = "local"
         .to_string();
         assert!(
             running.contains("may still be running")
-                && running.contains("confirm it has stopped before you use --resume run-1")
+                && running.contains("already finished without Rocky reading its result")
+                && running.contains("confirm on the warehouse that it has stopped")
+                && running.contains("use --resume run-1 only if the change is not there")
                 && !running.contains("to retry"),
             "a statement that may still run must not be told to resume: {running}"
         );
@@ -38021,6 +38094,89 @@ backend = "local"
         );
         assert_eq!(errors[4].failure_kind, FailureKind::Transient);
         for skipped in &errors[..4] {
+            assert_eq!(skipped.failure_kind, FailureKind::Unknown);
+        }
+    }
+
+    /// #2768, part B: the same skip for BigQuery and Trino. A copy whose job
+    /// or query may still run (`Timeout`, `Abandoned`, or a BigQuery
+    /// `NoJobReference`), or a BigQuery job that finished without error but
+    /// lost its result (`ResultLost`), keeps its first error; an ordinary
+    /// transient failure of either adapter is still retried.
+    #[test]
+    fn auto_retry_skips_a_bigquery_or_trino_copy_whose_statement_may_still_run() {
+        use rocky_bigquery::connector::BigQueryError as BqE;
+        use rocky_core::statement_cancel::AbandonCancel;
+        use rocky_core::traits::AdapterError;
+        use rocky_trino::connector::TrinoError as TrE;
+
+        fn wrapped(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+            anyhow::Error::from(AdapterError::new(e)).context("copying the table")
+        }
+        let entry = |idx: usize, err: anyhow::Error| {
+            let class = classify_table_error(&err);
+            let mut entry = copy_table_error("t");
+            entry.task_index = Some(idx);
+            entry.failure_kind = class.failure_kind;
+            entry.cooldown_seconds = class.cooldown_seconds;
+            entry.may_still_run = class.may_still_run;
+            entry
+        };
+        let bq_503 = || BqE::ApiError {
+            status: "503 Service Unavailable".into(),
+            message: "unavailable".into(),
+        };
+        let trino_503 = || TrE::HttpStatus {
+            status: 503,
+            message: "unavailable".into(),
+        };
+        let errors = vec![
+            entry(
+                0,
+                wrapped(BqE::Abandoned {
+                    job_id: "j0".into(),
+                    cancel: AbandonCancel::Requested,
+                    cause: Box::new(BqE::Timeout { timeout_secs: 60 }),
+                }),
+            ),
+            entry(1, wrapped(BqE::Timeout { timeout_secs: 60 })),
+            entry(2, wrapped(BqE::NoJobReference)),
+            entry(
+                3,
+                wrapped(TrE::Abandoned {
+                    id: "q3".into(),
+                    cancel: AbandonCancel::NoAnswer,
+                    cause: Box::new(trino_503()),
+                }),
+            ),
+            entry(
+                4,
+                wrapped(TrE::Timeout {
+                    timeout_secs: 60,
+                    last_state: "RUNNING".into(),
+                }),
+            ),
+            entry(
+                5,
+                wrapped(BqE::ResultLost {
+                    job_id: "j5".into(),
+                    cause: Box::new(bq_503()),
+                }),
+            ),
+            // Ordinary transient failures of each adapter.
+            entry(6, wrapped(bq_503())),
+            entry(7, wrapped(trino_503())),
+        ];
+
+        assert_eq!(
+            super::auto_retry_indices(&errors),
+            vec![6, 7],
+            "only the ordinary failures are retried"
+        );
+        for retried in &errors[6..] {
+            assert_eq!(retried.failure_kind, FailureKind::Transient);
+        }
+        for skipped in &errors[..6] {
             assert_eq!(skipped.failure_kind, FailureKind::Unknown);
         }
     }

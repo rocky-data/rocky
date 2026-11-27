@@ -166,7 +166,7 @@ Two types have no page yet. They read these top-level fields:
 
 | `type` | Role | Fields |
 |--------|------|--------|
-| `"trino"` | Warehouse | `host` (coordinator URL, required). `token` for JWT bearer auth, else `username` + `password` for Basic auth. `username` also names the Trino user. `database` sets the default catalog. `timeout_secs` defaults to `300`. |
+| `"trino"` | Warehouse | `host` (coordinator URL, required). `token` for JWT bearer auth, else `username` + `password` for Basic auth. `username` also names the Trino user. `database` sets the default catalog. `timeout_secs` defaults to `300`; when it passes, Rocky cancels the query and does not retry it. |
 | `"iceberg"` | Discovery | `host` (REST catalog URL, required). `token` (optional bearer token). |
 
 

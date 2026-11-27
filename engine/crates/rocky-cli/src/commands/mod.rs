@@ -272,7 +272,7 @@ pub use test::declarative_test_output;
 #[cfg(feature = "duckdb")]
 pub use test::run_declarative_tests;
 #[cfg(feature = "duckdb")]
-pub use test::{run_test, run_test_with_selection, test_output};
+pub use test::{dialect_warning, run_test, run_test_with_selection, test_output};
 pub use test_adapter::{run_test_adapter, run_test_adapter_builtin};
 pub use tick::run_tick;
 pub use trace::{compute_trace, run_trace};

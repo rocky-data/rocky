@@ -10,9 +10,10 @@
 //! A fan-out abort inside a run (`fail_fast`, the error-rate abort) also stops
 //! waiting on statements: [`abort_fan_out`] cancels the ones the run's own
 //! adapter lists, then aborts the tasks. A client deadline and a poll error
-//! are handled inside the Databricks and Snowflake connectors, which cancel
-//! before they return. Only those two adapters list statements; every other
-//! adapter lists none, so nothing is cancelled and nothing is printed for it.
+//! are handled inside the Databricks, Snowflake, BigQuery and Trino
+//! connectors, which cancel before they return. Only those four adapters list
+//! statements; every other adapter lists none, so nothing is cancelled and
+//! nothing is printed for it.
 //!
 //! ```text
 //!   AdapterRegistry::from_config ──▶ track(name, adapter)     (weak reference)

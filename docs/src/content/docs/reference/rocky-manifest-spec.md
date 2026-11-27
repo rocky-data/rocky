@@ -134,7 +134,7 @@ The same manifest content can travel in more than one place:
 - `rocky-verify` prints each claim marked "asserted by the producer, not verified".
 - A producer writes v0.1 when it has none of them. A v0.1 document that carries any of them fails.
 - `deny` never appears. Rocky writes no manifest for a denied run.
-- `require_review` means the policy asked for review and the run path did not enforce it. It is not an approval. `rocky-verify` prints it as `require_review (review was not enforced on this run)`.
+- `require_review` means the policy asked for review. It is not an approval. An agent's `rocky run` refuses under `require_review`, as it does under `deny`, so Rocky writes no manifest for that run. `rocky-verify` prints it as `require_review (review required, not an approval)`.
 - Counts and `rule_id` must be written as plain integers, with no fraction or exponent (`4`, not `4.0`). `rocky-verify` rejects `4.0`, although the JSON Schema alone accepts it.
 - `rocky-verify` prints claims only for a document that passes verification and is v0.2. A failed document prints none. Every claim string is printed escaped. With `--json`, the report adds `schema_version` and, for a passing v0.2 document, the claims under `asserted_claims`.
 - `passed + failed + not_evaluated` must equal `total`. The verifier checks this sum.

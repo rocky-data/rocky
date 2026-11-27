@@ -34,8 +34,8 @@ pub const ABANDON_CANCEL_BUDGET: Duration = Duration::from_secs(3);
 /// The warehouse's own id for one running statement.
 ///
 /// Opaque to everyone but the adapter that made it: a Databricks
-/// `statement_id`, a Snowflake `statementHandle`. Only the adapter that
-/// registered a handle can cancel it.
+/// `statement_id`, a Snowflake `statementHandle`, a BigQuery job id, a Trino
+/// query id. Only the adapter that registered a handle can cancel it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StatementHandle(String);
 
