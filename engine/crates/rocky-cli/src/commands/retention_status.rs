@@ -60,15 +60,7 @@ pub async fn run_retention_status(
     // An unknown `--model` is a mistake, not an empty result: refuse it the
     // way `rocky compile --model` does, rather than reporting zero rows at
     // exit 0 (#1428).
-    if let Some(filter) = model_filter
-        && !compile
-            .project
-            .models
-            .iter()
-            .any(|m| m.config.name == filter)
-    {
-        return Err(anyhow::Error::new(super::ModelNotFound(filter.to_string())));
-    }
+    check_model_filter(&compile.project.models, model_filter)?;
 
     let mut rows: Vec<ModelRetentionStatus> = Vec::new();
     for model in &compile.project.models {
@@ -153,6 +145,47 @@ pub async fn run_retention_status(
     }
 
     Ok(())
+}
+
+/// Refuse a `--model` that names no model of the project.
+fn check_model_filter(models: &[rocky_core::models::Model], filter: Option<&str>) -> Result<()> {
+    if let Some(filter) = filter
+        && !models.iter().any(|m| m.config.name == filter)
+    {
+        return Err(anyhow::Error::new(super::ModelNotFound(filter.to_string())));
+    }
+    Ok(())
+}
+
+/// The declaration-only report (`rocky retention-status` without `--drift`)
+/// over an already compiled project.
+///
+/// Pure: it reads each model's declared retention and nothing else. It opens
+/// no state store, builds no adapter and probes no warehouse. The HTTP route
+/// calls it over the server's own compile.
+///
+/// # Errors
+///
+/// A [`super::ModelNotFound`] when `model_filter` names no model.
+pub(crate) fn retention_declared_output(
+    models: &[rocky_core::models::Model],
+    model_filter: Option<&str>,
+) -> Result<RetentionStatusOutput> {
+    check_model_filter(models, model_filter)?;
+    let rows = models
+        .iter()
+        .filter(|m| model_filter.is_none_or(|name| m.config.name == name))
+        .map(|m| {
+            let configured = m.config.retention.map(|r| r.duration_days);
+            ModelRetentionStatus {
+                model: m.config.name.clone(),
+                configured_days: configured,
+                warehouse_days: None,
+                in_sync: compute_in_sync(configured, None),
+            }
+        })
+        .collect();
+    Ok(RetentionStatusOutput::new(rows))
 }
 
 /// Compute the `in_sync` flag preserving the v1 semantics.

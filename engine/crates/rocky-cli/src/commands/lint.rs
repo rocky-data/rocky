@@ -23,6 +23,12 @@ fn default_severity(code: &str) -> LintSeverity {
     }
 }
 
+/// A `[lint]` section that names a rule the engine does not have. The HTTP
+/// route answers it as an invalid config, not as an internal failure.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct LintConfigError(pub String);
+
 /// `[lint]` resolved against the rule table.
 struct Settings {
     disabled: HashSet<&'static str>,
@@ -34,12 +40,12 @@ impl Settings {
     /// silently leaves a rule on.
     fn resolve(config: &LintConfig) -> Result<Self> {
         let known = |code: &str, key: &str| -> Result<&'static RuleInfo> {
-            style_lint::rule_info(code).with_context(|| {
+            style_lint::rule_info(code).ok_or_else(|| {
                 let codes: Vec<&str> = style_lint::RULES.iter().map(|r| r.code).collect();
-                format!(
+                anyhow::Error::new(LintConfigError(format!(
                     "[lint] {key}: unknown rule `{code}` (known rules: {})",
                     codes.join(", ")
-                )
+                )))
             })
         };
         let mut disabled = HashSet::new();
@@ -100,7 +106,34 @@ pub fn run_lint(config_path: &Path, paths: &[PathBuf], fix: bool, json: bool) ->
     Ok(())
 }
 
+/// The `rocky lint` report for `paths`, without `--fix`.
+///
+/// Pure: it reads the `.sql` files under `paths` and rewrites nothing.
+/// `relative_to` makes each reported file path relative to that directory,
+/// so the report carries no absolute local path.
+///
+/// # Errors
+///
+/// An unknown rule code in `[lint]`, or a path that cannot be read.
+pub(crate) fn lint_report(
+    lint: &LintConfig,
+    paths: &[PathBuf],
+    relative_to: &Path,
+) -> Result<LintOutput> {
+    let settings = Settings::resolve(lint)?;
+    lint_paths_displayed(paths, false, &settings, Some(relative_to))
+}
+
 fn lint_paths(paths: &[PathBuf], fix: bool, settings: &Settings) -> Result<LintOutput> {
+    lint_paths_displayed(paths, fix, settings, None)
+}
+
+fn lint_paths_displayed(
+    paths: &[PathBuf],
+    fix: bool,
+    settings: &Settings,
+    relative_to: Option<&Path>,
+) -> Result<LintOutput> {
     let default_root = [PathBuf::from("models")];
     let roots: &[PathBuf] = if paths.is_empty() {
         &default_root
@@ -116,7 +149,17 @@ fn lint_paths(paths: &[PathBuf], fix: bool, settings: &Settings) -> Result<LintO
     let mut ast_rules_skipped = Vec::new();
 
     for file in &files {
-        let display = file.display().to_string();
+        let display = match relative_to {
+            // A file outside the root keeps only its name: never an
+            // absolute local path.
+            Some(root) => match file.strip_prefix(root) {
+                Ok(relative) => relative.display().to_string(),
+                Err(_) => file
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            },
+            None => file.display().to_string(),
+        };
         let mut sql =
             std::fs::read_to_string(file).with_context(|| format!("reading {display}"))?;
 

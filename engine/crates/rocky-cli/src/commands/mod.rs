@@ -147,6 +147,7 @@ pub use brief::{BriefSince, compute_brief, run_brief};
 pub use catalog::{
     CatalogFormat, compute_catalog_output, default_out_dir as catalog_default_out_dir, run_catalog,
 };
+pub(crate) use catalog::{catalog_output_from_compiled, read_run_facts_request_scoped};
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::{
@@ -186,12 +187,16 @@ pub use export_schemas::{export_schemas, schemas_hash};
 pub use fmt::run_fmt;
 pub use freshness::run_freshness;
 pub use fulfill_api::propose_governed_run_plan;
+#[cfg(test)]
+pub(crate) use gc::tests::seed_one_derivable as seed_one_derivable_for_route_test;
+pub(crate) use gc::{AdapterCost, adapter_cost_from_config, gc_derivable_report_request_scoped};
 pub use gc::{run_gc_derivable, run_gc_plan};
 pub(crate) use history::parse_since;
 pub use history::{
     history_run_output, history_runs_output, history_runs_output_filtered, model_history_output,
     recipe_history_output, recipe_history_output_request_scoped, run_history,
 };
+pub(crate) use hooks::hooks_list_output;
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
 pub use imports_update::run_imports_update;
@@ -200,6 +205,7 @@ pub use init_adapter::run_init_adapter;
 pub use lineage::{column_lineage_output, lineage_output, run_lineage};
 pub use lineage_diff::run_lineage_diff;
 pub use lint::run_lint;
+pub(crate) use lint::{LintConfigError, lint_report};
 pub use list::{
     list_adapters, list_adapters_output, list_consumers, list_deps, list_models,
     list_models_output, list_models_selected, list_pipelines, list_pipelines_output, list_sources,
@@ -242,6 +248,7 @@ pub use replay::{
     run_replay_execute_warehouse,
 };
 pub use restore::run_restore_plan;
+pub(crate) use retention_status::retention_declared_output;
 pub use retention_status::run_retention_status;
 pub use review::{
     ApprovalContext, compute_review, compute_review_queue, compute_review_status,

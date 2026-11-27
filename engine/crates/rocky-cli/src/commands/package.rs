@@ -1318,8 +1318,16 @@ fn run_dbt(
 // list / remove
 // ---------------------------------------------------------------------------
 
-/// Execute `rocky package list`.
-pub fn run_package_list(config_path: &Path, output_json: bool) -> Result<()> {
+/// The `rocky package list` report, built from the lockfile and the files on
+/// disk. Pure: it reads and writes nothing else.
+///
+/// `lockfile` is [`LOCKFILE_NAME`], relative to the project root, so the
+/// report names no absolute path. The CLI prints the resolved path instead.
+///
+/// # Errors
+///
+/// An `E055` error when the lockfile cannot be read.
+pub(crate) fn compute_package_list(config_path: &Path) -> Result<PackageListOutput> {
     let root = project_root(config_path);
     let lock_path = root.join(LOCKFILE_NAME);
     let lock = PackagesLock::read(&lock_path).map_err(e055)?;
@@ -1358,22 +1366,31 @@ pub fn run_package_list(config_path: &Path, output_json: bool) -> Result<()> {
             files_incoming: incoming,
         });
     }
+    let count = entries.len();
+    Ok(PackageListOutput {
+        version: VERSION.to_string(),
+        command: "package_list".to_string(),
+        lockfile: LOCKFILE_NAME.to_string(),
+        packages: entries,
+        count,
+    })
+}
+
+/// Execute `rocky package list`.
+pub fn run_package_list(config_path: &Path, output_json: bool) -> Result<()> {
+    let lock_path = project_root(config_path).join(LOCKFILE_NAME);
+    let mut output = compute_package_list(config_path)?;
+    let entries = &output.packages;
     if output_json {
-        let count = entries.len();
-        print_json(&PackageListOutput {
-            version: VERSION.to_string(),
-            command: "package_list".to_string(),
-            lockfile: lock_path.display().to_string(),
-            packages: entries,
-            count,
-        })?;
+        output.lockfile = lock_path.display().to_string();
+        print_json(&output)?;
     } else if entries.is_empty() {
         println!(
             "No vendored packages ({} is empty or absent).",
             lock_path.display()
         );
     } else {
-        for e in &entries {
+        for e in entries {
             println!(
                 "{:<24} {:<28} {:<10} {} models, {} modified, {} missing, {} incoming",
                 e.name,

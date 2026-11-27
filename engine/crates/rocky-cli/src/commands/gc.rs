@@ -115,7 +115,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Resolved cost-model inputs: `(adapter_name, warehouse_type, dbu_per_hour,
 /// cost_per_dbu)`. `None` when the config can't be loaded or the adapter is
 /// not a billed warehouse.
-type AdapterCost = (String, WarehouseType, f64, f64);
+pub(crate) type AdapterCost = (String, WarehouseType, f64, f64);
 
 // ---------------------------------------------------------------------------
 // The eligibility checks — each a pure function, each fails closed.
@@ -670,22 +670,7 @@ fn gather_report(
 /// surfaces price rebuilds identically.
 fn load_adapter_cost(config_path: &Path) -> Option<AdapterCost> {
     match load_rocky_config(config_path) {
-        Ok(cfg) => {
-            let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-            let cost_per_dbu = cfg.cost.compute_cost_per_dbu_or_default();
-            let preferred = cfg
-                .adapters
-                .iter()
-                .find(|(k, _)| k.as_str() == "default")
-                .or_else(|| cfg.adapters.iter().next())?;
-            let wh = WarehouseType::from_adapter_type(&preferred.1.adapter_type)?;
-            Some((
-                preferred.1.adapter_type.clone(),
-                wh,
-                dbu_per_hour,
-                cost_per_dbu,
-            ))
-        }
+        Ok(cfg) => adapter_cost_from_config(&cfg),
         Err(err) => {
             warn!(
                 "failed to load config at {} — rebuild-cost USD estimates will be omitted: {err}",
@@ -694,6 +679,50 @@ fn load_adapter_cost(config_path: &Path) -> Option<AdapterCost> {
             None
         }
     }
+}
+
+/// The billed-warehouse cost inputs a loaded config names, or `None` when
+/// the adapter is not a billed warehouse.
+pub(crate) fn adapter_cost_from_config(
+    cfg: &rocky_core::config::RockyConfig,
+) -> Option<AdapterCost> {
+    let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
+    let cost_per_dbu = cfg.cost.compute_cost_per_dbu_or_default();
+    let preferred = cfg
+        .adapters
+        .iter()
+        .find(|(k, _)| k.as_str() == "default")
+        .or_else(|| cfg.adapters.iter().next())?;
+    let wh = WarehouseType::from_adapter_type(&preferred.1.adapter_type)?;
+    Some((
+        preferred.1.adapter_type.clone(),
+        wh,
+        dbu_per_hour,
+        cost_per_dbu,
+    ))
+}
+
+/// The `rocky gc --derivable --dry-run` report through the request-scoped
+/// store the HTTP routes use.
+///
+/// This is the only gc entry point the route reaches. It calls
+/// [`gather_report`] and nothing else: it never reaches [`run_gc_plan_in`],
+/// the plan store, the review ledger or an apply. Opening the store creates
+/// no file.
+///
+/// # Errors
+///
+/// The store error, unchanged, so the route can tell a busy store (`503`)
+/// from a failure.
+pub(crate) fn gc_derivable_report_request_scoped(
+    state_path: &Path,
+    adapter: Option<&AdapterCost>,
+    now: DateTime<Utc>,
+    min_age_days: i64,
+) -> Result<GcReportOutput> {
+    super::history::with_request_scoped_store(state_path, |store| {
+        gather_report(store, adapter, now, min_age_days)
+    })
 }
 
 fn print_table(report: &GcReportOutput) {
@@ -2139,7 +2168,7 @@ fn print_apply_table(output: &GcApplyOutput) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use chrono::Duration;
@@ -2583,6 +2612,15 @@ auto_create_schemas = true
                 hold: None,
             })
             .unwrap();
+    }
+
+    /// One old, unreferenced artifact with a recorded recipe, so the
+    /// inventory has a derivable candidate. For the HTTP route tests.
+    pub(crate) fn seed_one_derivable(state_path: &Path) {
+        let store = StateStore::open(state_path).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
     }
 
     /// Seed a content-addressed artifact whose `file_path` lives **under** its
