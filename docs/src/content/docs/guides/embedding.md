@@ -85,7 +85,6 @@ Read routes return the same payloads as the matching CLI command, byte for byte.
 | `GET /api/v1/audit` | `rocky audit --output json` (`?product=<name>` matches `--product <name>`) | - |
 | `GET /api/v1/cost/month?month=<YYYY-MM>` | `rocky cost --month <YYYY-MM> --by product --output json` | `as_of`. With no `month`, it reports the current month in `[schedule].timezone`. |
 | `GET /api/v1/compliance` (`?env=`, `?exceptions_only=true`) | `rocky compliance --output json` | - |
-| `GET /api/v1/optimize` | `rocky optimize --output json` | - |
 | `GET /api/v1/runs/{id}/replay-check` (`id` may be `latest`; `?model=`) | `rocky replay <id> --check --output json` | An unknown run is `404 run_not_found`. A `model` the run did not execute is `404 model_not_found`. |
 | `GET /api/v1/recipes/{hash}/history` (`?since=`) | `rocky history --recipe <hash> --output json` | - |
 | `GET /api/v1/policy` | `rocky policy show --output json` | See below |

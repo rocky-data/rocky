@@ -249,7 +249,13 @@ pub(crate) fn classify_model(
         store
             .get_provenance(run_id, model_name)
             .map_err(|e| e.to_string()),
-        &|| store.get_run(run_id).ok().flatten(),
+        &|| {
+            store
+                .get_run(run_id)
+                .ok()
+                .flatten()
+                .map(std::borrow::Cow::Owned)
+        },
         &|hash| {
             store
                 .list_artifacts_by_hash(hash)
@@ -267,10 +273,10 @@ pub(crate) fn classify_model(
 /// SQL parsing) and touches no store, so the HTTP route can run it after the
 /// store is dropped, and `rocky gc` can run it against the live store with
 /// the same verdicts.
-fn classify_model_from(
+fn classify_model_from<'r>(
     model_name: &str,
     provenance: Result<Option<ProvenanceRecord>, String>,
-    run: &dyn Fn() -> Option<RunRecord>,
+    run: &dyn Fn() -> Option<std::borrow::Cow<'r, RunRecord>>,
     artifact_present: &dyn Fn(&str) -> Result<bool, String>,
     producer_unrecorded: &dyn Fn(&str) -> bool,
 ) -> ReplayCheckModelOutput {
@@ -415,19 +421,25 @@ pub fn compute_replay_check(
     replay_check_from_store(&store, target, model_filter)
 }
 
-/// [`compute_replay_check`] with the request-local cache budget
-/// (`HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399), for the HTTP route.
-pub fn compute_replay_check_request_scoped(
+/// Step one of the HTTP route: every store read `replay --check` needs, with
+/// the request-local cache budget (`HISTORY_REQUEST_CACHE_BYTES` in
+/// `history.rs`, #1399). The store is dropped before this returns. Classify
+/// the result with [`classify_replay_facts`], outside the store's lock.
+pub fn read_replay_facts_request_scoped(
     state_path: &Path,
     target: &str,
     model_filter: Option<&str>,
-) -> Result<ReplayCheckOutput> {
-    // Read inside the store's lock, classify (IR parsing, SQL parsing) after
-    // it is dropped.
-    let facts = super::history::with_request_scoped_store(state_path, |store| {
+) -> Result<ReplayFacts> {
+    super::history::with_request_scoped_store(state_path, |store| {
         read_replay_facts(store, target, model_filter)
-    })?;
-    Ok(replay_check_from_facts(facts))
+    })
+}
+
+/// Step two of the HTTP route: classify what [`read_replay_facts_request_scoped`]
+/// read. IR parsing and SQL parsing only; touches no store.
+#[must_use]
+pub fn classify_replay_facts(facts: ReplayFacts) -> ReplayCheckOutput {
+    replay_check_from_facts(facts)
 }
 
 /// A model's provenance read: the record, or the text of the read error.
@@ -435,14 +447,14 @@ type ProvenanceRead = Result<Option<ProvenanceRecord>, String>;
 
 /// Everything `replay --check` reads from the store, taken in one pass so the
 /// store can be dropped before any classification work.
-struct ReplayFacts {
+pub struct ReplayFacts {
     record: RunRecord,
     /// One entry per execution that passes the model filter, in run order.
     models: Vec<(String, ProvenanceRead)>,
     /// Models of the run whose provenance read answered "none".
     unrecorded: std::collections::HashSet<String>,
-    /// Every blake3 hash in the artifact ledger (one scan), or the scan's
-    /// error text.
+    /// The artifact-ledger hashes the selected models' content upstreams
+    /// name (and no others), or the scan's error text.
     artifact_hashes: Result<std::collections::HashSet<String>, String>,
 }
 
@@ -452,14 +464,9 @@ fn read_replay_facts(
     model_filter: Option<&str>,
 ) -> Result<ReplayFacts> {
     let record = resolve(store, target)?;
-    let selected: Vec<&str> = record
-        .models_executed
-        .iter()
-        .map(|m| m.model_name.as_str())
-        .filter(|name| model_filter.is_none_or(|filter| *name == filter))
-        .collect();
+    let selects = |name: &str| model_filter.is_none_or(|filter| name == filter);
     if let Some(name) = model_filter
-        && selected.is_empty()
+        && !record.models_executed.iter().any(|m| m.model_name == name)
     {
         return Err(ReplayLookupError::ModelNotInRun {
             run_id: record.run_id.clone(),
@@ -467,25 +474,35 @@ fn read_replay_facts(
         }
         .into());
     }
-    let models: Vec<(String, ProvenanceRead)> = selected
+    // One provenance read per execution. The in-run producer probe needs
+    // "does this model have provenance" for every model of the run, not only
+    // the selected ones.
+    let mut models: Vec<(String, ProvenanceRead)> = Vec::new();
+    let mut unrecorded = std::collections::HashSet::new();
+    for exec in &record.models_executed {
+        let name = exec.model_name.as_str();
+        let read = store
+            .get_provenance(&record.run_id, name)
+            .map_err(|e| e.to_string());
+        if matches!(read, Ok(None)) {
+            unrecorded.insert(name.to_string());
+        }
+        if selects(name) {
+            models.push((name.to_string(), read));
+        }
+    }
+    let wanted: std::collections::HashSet<String> = models
         .iter()
-        .map(|name| {
-            let read = store
-                .get_provenance(&record.run_id, name)
-                .map_err(|e| e.to_string());
-            ((*name).to_string(), read)
+        .filter_map(|(_, read)| read.as_ref().ok()?.as_ref())
+        .flat_map(|prov| prov.upstreams.iter())
+        .filter_map(|u| match u {
+            UpstreamIdentity::Content { blake3_hash, .. } => Some(blake3_hash.clone()),
+            UpstreamIdentity::Watermark { .. } => None,
         })
         .collect();
-    // The in-run producer probe needs "does this model have provenance" for
-    // every model of the run, not only the selected ones.
-    let unrecorded = record
-        .models_executed
-        .iter()
-        .map(|m| m.model_name.as_str())
-        .filter(|name| matches!(store.get_provenance(&record.run_id, name), Ok(None)))
-        .map(str::to_string)
-        .collect();
-    let artifact_hashes = store.list_artifact_hashes().map_err(|e| e.to_string());
+    let artifact_hashes = store
+        .artifact_hashes_among(&wanted)
+        .map_err(|e| e.to_string());
     Ok(ReplayFacts {
         record,
         models,
@@ -507,7 +524,7 @@ fn replay_check_from_facts(facts: ReplayFacts) -> ReplayCheckOutput {
             classify_model_from(
                 &name,
                 provenance,
-                &|| Some(record.clone()),
+                &|| Some(std::borrow::Cow::Borrowed(&record)),
                 &|hash| match &artifact_hashes {
                     Ok(hashes) => Ok(hashes.contains(hash)),
                     Err(e) => Err(e.clone()),
@@ -2656,6 +2673,9 @@ mod tests {
             "e3",
             true,
         );
+        // `bad` has a provenance row the store cannot decode.
+        store.insert_corrupt_provenance_row("r", "bad").unwrap();
+        // `leaf` executed twice in this run (a partitioned build).
         store
             .record_run(&sample_run(
                 "r",
@@ -2666,20 +2686,39 @@ mod tests {
                     ("missing", "success"),
                     ("orphan", "success"),
                     ("consumer", "success"),
+                    ("leaf", "success"),
+                    ("bad", "success"),
                 ],
             ))
             .unwrap();
 
-        for filter in [None, Some("leaf"), Some("consumer"), Some("orphan")] {
-            let live = replay_check_from_store(&store, "r", filter).unwrap();
-            let facts = read_replay_facts(&store, "r", filter).unwrap();
-            let routed = replay_check_from_facts(facts);
-            assert_eq!(
-                serde_json::to_string(&live).unwrap(),
-                serde_json::to_string(&routed).unwrap(),
-                "filter {filter:?}"
-            );
+        // `latest` resolves to the only run, so it must equal `r`.
+        for target in ["r", "latest"] {
+            for filter in [
+                None,
+                Some("leaf"),
+                Some("consumer"),
+                Some("orphan"),
+                Some("bad"),
+            ] {
+                let live = replay_check_from_store(&store, target, filter).unwrap();
+                let facts = read_replay_facts(&store, target, filter).unwrap();
+                let routed = replay_check_from_facts(facts);
+                assert_eq!(
+                    serde_json::to_string(&live).unwrap(),
+                    serde_json::to_string(&routed).unwrap(),
+                    "target {target} filter {filter:?}"
+                );
+            }
         }
+        let leaf_twice = replay_check_from_store(&store, "latest", Some("leaf")).unwrap();
+        assert_eq!(leaf_twice.model_count, 2, "one entry per execution");
+        let bad = replay_check_from_store(&store, "r", Some("bad")).unwrap();
+        assert!(
+            bad.models[0].reasons[0].contains("provenance read failed"),
+            "{:?}",
+            bad.models[0].reasons
+        );
         let all = replay_check_from_store(&store, "r", None).unwrap();
         let verdict = |name: &str| {
             all.models

@@ -143,7 +143,7 @@ pub(crate) fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> 
 /// redb cache budget for request-local opens: open the store, read once, drop
 /// it. Every consumer of [`history_runs_output`] (the `GET /api/v1/runs`
 /// handler, `rocky history`, the MCP `history` tool) and the UI read routes
-/// (`/optimize`, `/runs/{id}/replay-check`, `/recipes/{hash}/history`) opens
+/// (`/runs/{id}/replay-check`, `/recipes/{hash}/history`) opens
 /// this way. The default ~1 GiB cache capacity only turns a full-table
 /// `list_runs` scan into retained RSS on glibc: +8.6 MB per request at 1,435
 /// rows, ratcheting with history size while the route is polled (#1399). 1 MiB
@@ -161,21 +161,12 @@ pub(crate) enum StoreBudget {
     Default,
 }
 
-#[cfg(test)]
-thread_local! {
-    /// The budget [`with_store`] last opened with on this thread. A test that
-    /// calls a route's read path reads it back to prove the route passed the
-    /// budget it claims.
-    pub(crate) static LAST_STORE_BUDGET: std::cell::Cell<Option<StoreBudget>> =
-        const { std::cell::Cell::new(None) };
-}
-
 /// Run `read` against the state store opened read-only with `budget` (an
 /// empty in-memory view when the file does not exist; nothing is created),
 /// and drop the store before returning.
 ///
 /// The one open every request-local read uses: `GET /api/v1/runs`,
-/// `/optimize`, `/runs/{id}/replay-check` and `/recipes/{hash}/history`.
+/// `/runs/{id}/replay-check` and `/recipes/{hash}/history`.
 /// redb holds an exclusive file lock while a handle lives, so `read` must do
 /// store reads only. Load config and models before calling it, compute after.
 pub(crate) fn with_store<T>(
@@ -183,8 +174,6 @@ pub(crate) fn with_store<T>(
     budget: StoreBudget,
     read: impl FnOnce(&StateStore) -> Result<T>,
 ) -> Result<T> {
-    #[cfg(test)]
-    LAST_STORE_BUDGET.with(|last| last.set(Some(budget)));
     let store = match budget {
         StoreBudget::RequestScoped => {
             StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?
@@ -868,7 +857,7 @@ mod tests {
     }
 
     /// The request-local open the UI read routes share
-    /// (`/optimize`, `/runs/{id}/replay-check`, `/recipes/{hash}/history`)
+    /// (`/runs/{id}/replay-check`, `/recipes/{hash}/history`)
     /// really caps redb's cache. A parity test cannot tell: a bigger cache
     /// returns the same rows. Evictions only happen when the cache is full,
     /// so a store bigger than the 1 MiB budget must evict on a full scan,

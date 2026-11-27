@@ -1496,38 +1496,6 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
-            path: "/api/v1/optimize",
-            operation_id: "getOptimize",
-            tag: "estate",
-            summary: "Materialization recommendations",
-            description: "Per-model materialization recommendations from production run \
-                 history, the models on disk and the `[cost]` pricing. The same bytes as \
-                 `rocky optimize --output json`. With no run history the recommendation list \
-                 is empty and says why. Reads only.",
-            path_params: &[],
-            query_params: &[],
-            header_params: &[],
-            request_body: None,
-            responses: &[
-                Resp {
-                    status: "200",
-                    description: "The recommendations.",
-                    body: Body::Component("OptimizeOutput"),
-                },
-                ENGINE_BUSY_OR_NOT_READY,
-                Resp {
-                    status: "500",
-                    description: "The bound `rocky.toml` could not be read (`config_invalid`), \
-                         or the state store could not be opened for reading (malformed, or \
-                         written by a newer engine).",
-                    body: Body::Component("ErrorEnvelope"),
-                },
-                STATE_NEEDS_MIGRATION,
-            ],
-            auth_exempt: false,
-        },
-        Route {
-            method: "get",
             path: "/api/v1/runs/{id}/replay-check",
             operation_id: "getRunReplayCheck",
             tag: "history",
@@ -2190,7 +2158,6 @@ mod tests {
             "AuditForOutput",
             "AuditOutput",
             "ComplianceOutput",
-            "OptimizeOutput",
             "ReplayCheckOutput",
             "RecipeHistoryOutput",
             "ErrorEnvelope",
@@ -2266,7 +2233,6 @@ mod tests {
             ("/api/v1/custody/{subject}", "AuditForOutput"),
             ("/api/v1/audit", "AuditOutput"),
             ("/api/v1/compliance", "ComplianceOutput"),
-            ("/api/v1/optimize", "OptimizeOutput"),
             ("/api/v1/runs/{id}/replay-check", "ReplayCheckOutput"),
             ("/api/v1/recipes/{hash}/history", "RecipeHistoryOutput"),
         ] {

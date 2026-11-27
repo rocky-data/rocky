@@ -5648,17 +5648,24 @@ impl StateStore {
             if !keep(&run) {
                 return None;
             }
+            let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
             for exec in run.models_executed {
                 if !open.contains(&exec.model_name) {
                     continue;
                 }
                 if let Some(execs) = history.get_mut(&exec.model_name) {
+                    touched.insert(exec.model_name.clone());
                     execs.push(project(exec));
                 }
             }
             // A run's executions of a model all count, as in the per-model
-            // call, so a model closes only after its whole run is read.
-            open.retain(|name| history.get(name).is_some_and(|execs| execs.len() < limit));
+            // call, so a model closes only after its whole run is read. Only
+            // a model this run touched can have filled up.
+            for name in touched {
+                if history.get(&name).is_none_or(|execs| execs.len() >= limit) {
+                    open.remove(&name);
+                }
+            }
             open.is_empty().then_some((1, ()))
         })?;
         for execs in history.values_mut() {
@@ -8195,6 +8202,25 @@ impl StateStore {
         Ok(())
     }
 
+    /// Test-only: write a byte blob under an `input_provenance` key that is
+    /// not valid `ProvenanceRecord` JSON, so [`Self::get_provenance`] fails
+    /// for that model.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_corrupt_provenance_row(
+        &self,
+        run_id: &str,
+        model_name: &str,
+    ) -> Result<(), StateError> {
+        let key = provenance_key(run_id, model_name);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(INPUT_PROVENANCE)?;
+            table.insert(key.as_str(), b"{not valid provenance json".as_slice())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
     /// Test-only: write a byte blob under a `run_history` key that is not valid
     /// `RunRecord` JSON, so a later scan hits a deserialization error. Used to
     /// prove callers fail closed on a corrupt history row.
@@ -8951,6 +8977,35 @@ impl StateStore {
             hashes.insert(record.blake3_hash);
         }
         Ok(hashes)
+    }
+
+    /// The members of `wanted` that appear as a `blake3_hash` in the
+    /// artifact ledger, from ONE scan that keeps only those hashes.
+    ///
+    /// For a caller that needs "is this hash recorded?" for a known set:
+    /// unlike [`Self::list_artifact_hashes`] it does not retain every hash in
+    /// the ledger. The scan stops once every wanted hash is found.
+    pub fn artifact_hashes_among(
+        &self,
+        wanted: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>, StateError> {
+        let mut found = std::collections::HashSet::new();
+        if wanted.is_empty() {
+            return Ok(found);
+        }
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+            if wanted.contains(&record.blake3_hash) {
+                found.insert(record.blake3_hash);
+                if found.len() == wanted.len() {
+                    break;
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// List every artifact recorded for a given run.

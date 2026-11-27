@@ -25,46 +25,10 @@ pub fn optimize_output(
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
 ) -> Result<OptimizeOutput> {
-    optimize_output_with(
-        state_path,
-        config_path,
-        models_dir,
-        model_filter,
-        StoreBudget::Default,
-    )
-}
-
-/// [`optimize_output`] with the request-local cache budget
-/// (`HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399). The HTTP route
-/// runs the same three steps through [`load_cost_config`],
-/// [`read_optimize_history`] and [`finish_optimize`], so each can sit in its
-/// own task.
-pub fn optimize_output_request_scoped(
-    state_path: &Path,
-    config_path: &Path,
-    models_dir: Option<&Path>,
-    model_filter: Option<&str>,
-) -> Result<OptimizeOutput> {
-    optimize_output_with(
-        state_path,
-        config_path,
-        models_dir,
-        model_filter,
-        StoreBudget::RequestScoped,
-    )
-}
-
-fn optimize_output_with(
-    state_path: &Path,
-    config_path: &Path,
-    models_dir: Option<&Path>,
-    model_filter: Option<&str>,
-    budget: StoreBudget,
-) -> Result<OptimizeOutput> {
     // Config loads BEFORE the store opens: redb's exclusive file lock must
     // not wait on disk work, or a writer retries out to `Busy`.
     let config = load_cost_config(config_path)?;
-    let reads = read_optimize_history(state_path, model_filter, budget)?;
+    let reads = read_optimize_history(state_path, model_filter)?;
     Ok(finish_optimize(reads, &config, models_dir))
 }
 
@@ -74,7 +38,7 @@ type ExecutionStats = (u64, Option<u64>);
 /// Everything `optimize` reads from the state store. Read in one short
 /// window so the store's file lock is not held while models load or while
 /// the recommendations compute.
-pub(crate) struct StoreReads {
+struct StoreReads {
     run_scope: crate::output::ProductionRunScope,
     total_runs: usize,
     /// `started_at` of the oldest and the newest run read.
@@ -99,7 +63,7 @@ pub(crate) struct StoreReads {
 /// uses; this command opens no warehouse connection either. A `rocky.toml`
 /// that is there but does not load is a hard error: a wrong price is worse
 /// than no price. The error keeps its `ConfigError` for the CLI's span report.
-pub(crate) fn load_cost_config(config_path: &Path) -> Result<CostConfig> {
+fn load_cost_config(config_path: &Path) -> Result<CostConfig> {
     Ok(
         match rocky_core::config::load_optional_project_config(Some(config_path))
             .with_context(|| format!("failed to load config from {}", config_path.display()))?
@@ -111,12 +75,8 @@ pub(crate) fn load_cost_config(config_path: &Path) -> Result<CostConfig> {
 }
 
 /// Step 2: every state-store read `optimize` needs, and nothing else.
-pub(crate) fn read_optimize_history(
-    state_path: &Path,
-    model_filter: Option<&str>,
-    budget: StoreBudget,
-) -> Result<StoreReads> {
-    super::history::with_store(state_path, budget, |store| {
+fn read_optimize_history(state_path: &Path, model_filter: Option<&str>) -> Result<StoreReads> {
+    super::history::with_store(state_path, StoreBudget::Default, |store| {
         // Get all runs to extract model names and compute stats.
         //
         // Production runs only (#2201): a shadow or branch run built a copy
@@ -171,7 +131,7 @@ pub(crate) fn read_optimize_history(
 /// Step 3: load the models and compute the recommendations. The store is
 /// already closed. With no run history there is nothing to recommend, so the
 /// models are not loaded.
-pub(crate) fn finish_optimize(
+fn finish_optimize(
     reads: StoreReads,
     config: &CostConfig,
     models_dir: Option<&Path>,
@@ -423,30 +383,6 @@ mod tests {
         ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource, StateStore,
     };
 
-    /// The route's read path opens the store with the request budget, the CLI
-    /// path with redb's default. Read back from the funnel's test record, so
-    /// a route that passed the wrong budget fails here.
-    #[test]
-    fn optimize_opens_the_store_with_the_budget_its_caller_names() {
-        use super::super::history::LAST_STORE_BUDGET;
-        let tmp = tempfile::tempdir().unwrap();
-        let state_path = record_history(tmp.path(), "m", 2, 100, None);
-        let config = tmp.path().join("rocky.toml");
-
-        LAST_STORE_BUDGET.with(|b| b.set(None));
-        optimize_output_request_scoped(&state_path, &config, None, None).unwrap();
-        assert_eq!(
-            LAST_STORE_BUDGET.with(std::cell::Cell::get),
-            Some(StoreBudget::RequestScoped)
-        );
-
-        optimize_output(&state_path, &config, None, None).unwrap();
-        assert_eq!(
-            LAST_STORE_BUDGET.with(std::cell::Cell::get),
-            Some(StoreBudget::Default)
-        );
-    }
-
     /// Config loads before the store opens: with another handle holding the
     /// store, a broken config answers a config error at once, not `Busy`
     /// after the open's retries.
@@ -458,7 +394,7 @@ mod tests {
         write(&config, "this is [not valid toml");
         let _held = StateStore::open(&state_path).unwrap();
 
-        let err = optimize_output_request_scoped(&state_path, &config, None, None)
+        let err = optimize_output(&state_path, &config, None, None)
             .expect_err("a broken config must fail");
         assert!(
             err.downcast_ref::<rocky_core::config::ConfigError>()

@@ -187,7 +187,6 @@ pub use fmt::run_fmt;
 pub use freshness::run_freshness;
 pub use fulfill_api::propose_governed_run_plan;
 pub use gc::{run_gc_derivable, run_gc_plan};
-pub(crate) use history::StoreBudget;
 pub(crate) use history::parse_since;
 pub use history::{
     history_run_output, history_runs_output, history_runs_output_filtered, model_history_output,
@@ -209,8 +208,7 @@ pub use list::{
 pub use load::run_load;
 pub use lsp::run_lsp;
 pub use metrics::{metrics_output, run_metrics};
-pub(crate) use optimize::{finish_optimize, load_cost_config, read_optimize_history};
-pub use optimize::{optimize_output, optimize_output_request_scoped, run_optimize};
+pub use optimize::{optimize_output, run_optimize};
 pub use package::{
     PackageBuildOptions, run_package_add, run_package_list, run_package_remove, run_package_update,
 };
@@ -239,8 +237,9 @@ pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
 pub use replay::{
-    ReplayLookupError, compute_replay_check, compute_replay_check_request_scoped, run_replay,
-    run_replay_check, run_replay_execute, run_replay_execute_warehouse,
+    ReplayFacts, ReplayLookupError, classify_replay_facts, compute_replay_check,
+    read_replay_facts_request_scoped, run_replay, run_replay_check, run_replay_execute,
+    run_replay_execute_warehouse,
 };
 pub use restore::run_restore_plan;
 pub use retention_status::run_retention_status;

@@ -31309,58 +31309,6 @@
         ]
       }
     },
-    "/api/v1/optimize": {
-      "get": {
-        "description": "Per-model materialization recommendations from production run history, the models on disk and the `[cost]` pricing. The same bytes as `rocky optimize --output json`. With no run history the recommendation list is empty and says why. Reads only.",
-        "operationId": "getOptimize",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OptimizeOutput"
-                }
-              }
-            },
-            "description": "The recommendations."
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "The bound `rocky.toml` could not be read (`config_invalid`), or the state store could not be opened for reading (malformed, or written by a newer engine)."
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
-          }
-        },
-        "summary": "Materialization recommendations",
-        "tags": [
-          "estate"
-        ]
-      }
-    },
     "/api/v1/policy": {
       "get": {
         "description": "The `[policy]` rules in file order with their positional ids (the `matched_rule` that `policy check` reports), the default agent effect, and the freezes in force that this read could see, from the decision ledger and the durable freeze markers. Read `freeze_sources` before treating the list as exhaustive: `not_consulted` means no `[policy]` block, so nothing is enforced; `local_mirror` means a remote `[state]` backend whose authoritative ledger this read-only route does not download, so another pod's freeze can be missing while an apply still denies. A missing `rocky.toml` is the default posture. A source that exists but cannot be read is a `500`, never an empty list. The same bytes as `rocky policy show --output json`.",

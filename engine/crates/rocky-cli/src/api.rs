@@ -127,7 +127,7 @@ use crate::output::{
 };
 
 use crate::output::ConfigStatus;
-use crate::output::{ComplianceOutput, OptimizeOutput, RecipeHistoryOutput, ReplayCheckOutput};
+use crate::output::{ComplianceOutput, RecipeHistoryOutput, ReplayCheckOutput};
 use rocky_core::process::GroupSignal;
 use rocky_server::auth::TokenScope;
 use rocky_server::jobs::{CancelMessage, CancelRequest};
@@ -229,7 +229,6 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/audit/scorecard", get(audit_scorecard))
         .route("/api/v1/custody/{subject}", get(custody_chain))
         .route("/api/v1/compliance", get(compliance))
-        .route("/api/v1/optimize", get(optimize))
         .route("/api/v1/runs/{id}/replay-check", get(replay_check))
         .route("/api/v1/recipes/{hash}/history", get(recipe_history))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
@@ -1020,7 +1019,6 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/audit/scorecard",
         "GET /api/v1/custody/{subject}",
         "GET /api/v1/compliance",
-        "GET /api/v1/optimize",
         "GET /api/v1/runs/{id}/replay-check",
         "GET /api/v1/recipes/{hash}/history",
         "POST /api/v1/hooks/trigger/{pipeline}",
@@ -2478,44 +2476,6 @@ async fn compliance(
     Ok(PrettyJson(output))
 }
 
-/// `GET /api/v1/optimize` — canonical [`OptimizeOutput`].
-///
-/// The same bytes as `rocky optimize --output json`: materialization
-/// recommendations from production run history and the models on disk. Reads
-/// only. A busy state store is `503 engine_busy`.
-async fn optimize(
-    State(state): State<Arc<ServerState>>,
-) -> Result<PrettyJson<OptimizeOutput>, ApiError> {
-    let Some(config_path) = state.config_path.clone() else {
-        return Err(ApiError::engine_not_ready());
-    };
-    let state_path = state_path_for(&state);
-    let models_dir = state.models_dir.clone();
-    // Three steps, so the process-wide store permit (and redb's file lock)
-    // covers only the state reads: config loads first, the reads run under the
-    // permit, and the models load and the maths run after both are released.
-    let config =
-        tokio::task::spawn_blocking(move || crate::commands::load_cost_config(&config_path))
-            .await
-            .map_err(|e| map_join_err(&e))?
-            .map_err(|e| ApiError::config_invalid(&format!("{e:#}")))?;
-    let reads = store_read(&state, move || {
-        crate::commands::read_optimize_history(
-            &state_path,
-            None,
-            crate::commands::StoreBudget::RequestScoped,
-        )
-    })
-    .await?
-    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
-    let output = tokio::task::spawn_blocking(move || {
-        crate::commands::finish_optimize(reads, &config, Some(&models_dir))
-    })
-    .await
-    .map_err(|e| map_join_err(&e))?;
-    Ok(PrettyJson(output))
-}
-
 /// Query string of `GET /api/v1/runs/{id}/replay-check`.
 #[derive(Debug, Deserialize)]
 struct ReplayCheckQuery {
@@ -2534,12 +2494,11 @@ async fn replay_check(
     ApiQuery(query): ApiQuery<ReplayCheckQuery>,
 ) -> Result<PrettyJson<ReplayCheckOutput>, ApiError> {
     let state_path = state_path_for(&state);
-    let output = store_read(&state, move || {
-        crate::commands::compute_replay_check_request_scoped(
-            &state_path,
-            &id,
-            query.model.as_deref(),
-        )
+    // Two steps, so the process-wide store permit covers only the reads: the
+    // funnel reads run under it, and IR parsing, SQL parsing and
+    // classification run after it is released.
+    let facts = store_read(&state, move || {
+        crate::commands::read_replay_facts_request_scoped(&state_path, &id, query.model.as_deref())
     })
     .await?
     .map_err(|e| {
@@ -2557,6 +2516,9 @@ async fn replay_check(
             None => map_state_err(e, state.mutation_permit.running_job()),
         }
     })?;
+    let output = tokio::task::spawn_blocking(move || crate::commands::classify_replay_facts(facts))
+        .await
+        .map_err(|e| map_join_err(&e))?;
     Ok(PrettyJson(output))
 }
 
@@ -6576,7 +6538,7 @@ mod tests {
         assert_eq!(err.code, "engine_not_ready");
     }
 
-    // --- /compliance, /optimize, /runs/{id}/replay-check, /recipes/{hash}/history ---
+    // --- /compliance, /runs/{id}/replay-check, /recipes/{hash}/history ---
 
     /// A project with one recorded run (`run-1`: `raw`, `revenue_daily`), the
     /// second model stamped with a recipe hash. Returns the server state.
@@ -6597,8 +6559,8 @@ mod tests {
         (state, state_path)
     }
 
-    /// The four read routes answer 200 with the CLI command's bytes, and the
-    /// models-only server (no bound config) refuses the config-backed two.
+    /// The read routes answer 200 with the CLI command's bytes, and the
+    /// models-only server (no bound config) refuses the config-backed one.
     #[tokio::test]
     async fn ui_read_routes_match_the_command_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -6625,17 +6587,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
-
-        let resp = reqwest::get(format!("{base}/api/v1/optimize"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let text = resp.text().await.unwrap();
-        let expected = {
-            let _gate = store_gate(&state).await;
-            crate::commands::optimize_output(&state_path, &config, Some(&models_dir), None).unwrap()
-        };
-        assert_eq!(text, reference_bytes(&expected));
 
         for target in ["run-1", "latest"] {
             let resp = reqwest::get(format!("{base}/api/v1/runs/{target}/replay-check"))
@@ -6689,12 +6640,12 @@ mod tests {
         assert_eq!(err.code, "bad_request");
 
         let bare = spawn_router(test_state()).await;
-        for path in ["/api/v1/compliance", "/api/v1/optimize"] {
-            let resp = reqwest::get(format!("{bare}{path}")).await.unwrap();
-            assert_eq!(resp.status(), 503, "{path}");
-            let err: ErrorEnvelope = resp.json().await.unwrap();
-            assert_eq!(err.code, "engine_not_ready", "{path}");
-        }
+        let resp = reqwest::get(format!("{bare}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
     }
 
     /// An unknown run id, an unknown model of a known run, and `latest` on an
@@ -6742,7 +6693,6 @@ mod tests {
         let held = rocky_core::state::StateStore::open(&state_path).unwrap();
         let base = spawn_router(state).await;
         for path in [
-            "/api/v1/optimize",
             "/api/v1/runs/run-1/replay-check",
             "/api/v1/recipes/recipe-abc/history",
         ] {
@@ -6764,7 +6714,6 @@ mod tests {
         let other = pinned_server(state.models_dir.clone(), state.config_path.clone(), &absent);
         let base = spawn_router(other).await;
         for path in [
-            "/api/v1/optimize",
             "/api/v1/runs/latest/replay-check",
             "/api/v1/recipes/recipe-abc/history",
         ] {
@@ -6783,23 +6732,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert!(!absent.exists());
-    }
-
-    /// A `rocky.toml` the engine cannot parse is `500 config_invalid` on
-    /// `/optimize`, as it is on `/compliance`, not `internal_error`.
-    #[tokio::test]
-    async fn optimize_on_unparseable_config_is_config_invalid() {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, _state_path) = read_routes_fixture(dir.path());
-        let config = state.config_path.clone().unwrap();
-        std::fs::write(&config, "this is [not valid toml").unwrap();
-        let base = spawn_router(state).await;
-        let resp = reqwest::get(format!("{base}/api/v1/optimize"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 500);
-        let err: ErrorEnvelope = resp.json().await.unwrap();
-        assert_eq!(err.code, "config_invalid");
     }
 
     /// `/compliance` loads the config the way the rest of `rocky serve` does:
