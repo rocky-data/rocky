@@ -7191,15 +7191,17 @@ mod tests {
         out
     }
 
-    /// `body` as JSON with the clock-derived catalog fields removed.
-    fn catalog_without_clock(text: &str) -> serde_json::Value {
-        let mut value: serde_json::Value = serde_json::from_str(text).unwrap();
-        value.as_object_mut().unwrap().remove("generated_at");
-        value["stats"]
-            .as_object_mut()
-            .unwrap()
-            .remove("duration_ms");
-        value
+    /// `body` with the clock-derived catalog lines removed: the top-level
+    /// `generated_at` and `stats.duration_ms`. It works on the pretty-printed
+    /// text, so no response body goes through a deserializer.
+    fn catalog_without_clock(text: &str) -> String {
+        text.lines()
+            .filter(|line| {
+                !line.starts_with("  \"generated_at\":")
+                    && !line.starts_with("    \"duration_ms\":")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// No hook command argument reaches the `/hooks` body, whatever form the
@@ -7603,15 +7605,27 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
         assert!(!text.contains(&cwd), "{text}");
-        let lint: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let files: std::collections::BTreeSet<&str> = lint["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["file"].as_str().unwrap())
-            .collect();
+        // The served bytes must equal the same computation the route runs.
+        // The body is compared as text and never deserialized.
+        let expected = {
+            let config =
+                rocky_core::config::load_optional_project_config(state.config_path.as_deref())
+                    .unwrap();
+            let roots = crate::commands::served_model_roots(
+                config.as_ref(),
+                state.config_path.as_deref(),
+                &state.models_dir,
+                state.models_dir_is_explicit,
+            );
+            let lint_config = config.map(|config| config.lint).unwrap_or_default();
+            let root = std::path::absolute(served_project_root(&state)).unwrap();
+            crate::commands::lint_report(&lint_config, &roots, &root).unwrap()
+        };
+        assert_eq!(text, reference_bytes(&expected));
+        let files: std::collections::BTreeSet<&str> =
+            expected.findings.iter().map(|f| f.file.as_str()).collect();
         assert!(files.contains("other/extra.sql"), "{files:?}");
-        assert!(lint["files_checked"].as_u64().unwrap() >= 4, "{text}");
+        assert!(expected.files_checked >= 4, "{expected:?}");
         assert!(
             files
                 .iter()
@@ -7625,20 +7639,8 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
         assert!(!text.contains(&cwd), "{text}");
-        let catalog: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let extra = catalog["assets"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|a| a["model_name"] == "extra")
-            .expect("the second pipeline's model is in the catalog");
-        let id = extra["columns"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "id")
-            .unwrap();
-        assert_eq!(id["description"], "the extra id", "{extra}");
+        assert!(text.contains("\"model_name\": \"extra\""), "{text}");
+        assert!(text.contains("\"description\": \"the extra id\""), "{text}");
 
         for path in ["/api/v1/packages", "/api/v1/hooks", "/api/v1/retention"] {
             let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
