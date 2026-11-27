@@ -9,14 +9,17 @@ sidebar:
 
 ![A tour of the Rocky browser UI: the Project screen with its lineage, the changes waiting for approval, an agent's breaking change that needs approval, the Inbox, a model's trace, and a data product's delivery and cost](/demo-ui-tour.gif)
 
-The UI ships inside the release binaries and the container image. A sidebar lists eleven areas. Five open a screen today:
+The UI ships inside the release binaries and the container image. A sidebar lists eleven areas in three groups, each under a small uppercase heading. Five open a screen today:
 
 ```
-  Inbox              what waits for you now
-  Project            models, their lineage, runs and schedules
-  Changes            changes that need approval, one change in full
-  Data products      each data product, and its history
-  Oversight          agent activity, compliance, trace, audit log
+  WORK
+    Inbox            what waits for you now
+    Changes          changes that need approval, one change in full
+  DATA
+    Project          models, their lineage, runs and schedules
+    Data products    each data product, and its history
+  GOVERN
+    Oversight        agent activity, compliance, trace, audit log
 ```
 
 The other six are not links. See [Areas without a screen](#areas-without-a-screen). On a screen narrower than 1024 pixels the sidebar folds behind an **Areas** button.
