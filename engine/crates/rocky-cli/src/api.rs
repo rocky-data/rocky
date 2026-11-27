@@ -2923,6 +2923,7 @@ async fn doctor_local(
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
     let state_path = state_path_for(&state);
+    let config_path_for_scrub = config_path.clone();
     // The local checks await nothing that blocks, so the report is built on the
     // store's blocking thread, behind the same gate every store read takes.
     let output = store_read(&state, move || {
@@ -2935,7 +2936,47 @@ async fn doctor_local(
         ))
     })
     .await?;
-    Ok(PrettyJson(output))
+    Ok(PrettyJson(scrub_doctor_output(
+        output,
+        &config_path_for_scrub,
+    )))
+}
+
+/// Make a doctor report safe to serve: the quoted TOML source lines go (the
+/// same scrub `config_invalid` applies), and the config path and the project
+/// root it sits in become relative to the project root.
+fn scrub_doctor_output(
+    mut output: crate::commands::DoctorOutput,
+    config_path: &std::path::Path,
+) -> crate::commands::DoctorOutput {
+    let config = absolute_path(config_path);
+    let root = config
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let config_name = config.file_name().map_or_else(
+        || "rocky.toml".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let scrub = |text: &str| -> String {
+        let text = without_toml_source_snippet(text);
+        let text = text.replace(&config.to_string_lossy().into_owned(), &config_name);
+        let text = text.replace(&config_path.to_string_lossy().into_owned(), &config_name);
+        let prefix = format!("{}/", root.to_string_lossy());
+        text.replace(&prefix, "")
+            .replace(root.to_string_lossy().as_ref(), ".")
+    };
+    for check in &mut output.checks {
+        check.message = scrub(&check.message);
+        for (key, value) in &mut check.details {
+            *key = scrub(key);
+            *value = scrub(value);
+        }
+    }
+    for suggestion in &mut output.suggestions {
+        *suggestion = scrub(suggestion);
+    }
+    output
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -3382,7 +3423,7 @@ fn too_many_requests_response(retry_after: std::time::Duration) -> Response {
 /// registered in [`super::commands::export_schemas`], so it stays out of the
 /// Pydantic/TypeScript codegen cascade.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct JobRequest {
     /// `--filter <component=value>` for `run`/`plan`.
     filter: Option<String>,
@@ -3979,11 +4020,13 @@ async fn submit_compact(
 /// `POST /api/v1/jobs/diff` — the structural model diff: `rocky ci-diff`
 /// (read-only; no mutation permit). Body `{"base": "<git ref>",
 /// "semantic": <bool>}`, both optional: `base` defaults to `main` and
-/// `semantic` to `false`. It diffs the `HEAD` commit; uncommitted edits are
-/// not compared. The result is the command's `CiDiffOutput`. At most one diff
+/// `semantic` to `false`. Any other field is `400 bad_request`. It diffs the
+/// `HEAD` commit; uncommitted edits are not compared. The result is the command's `CiDiffOutput`. At most one diff
 /// runs at a time: a second submission is refused `409 mutation_in_progress`
-/// with the running job's id. The job writes no state, file or cache, and its
-/// git commands never take git's index lock.
+/// with the running job's id. The job changes nothing under the project,
+/// `.git` included. It reads the seed from `HEAD`, and its git commands never
+/// take the index lock or fetch from a partial clone's remote (a missing object
+/// fails the job and names the partial clone).
 async fn submit_diff(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -4864,17 +4907,21 @@ fn job_subprocess_args(
             }
         }
         JobKind::Diff => {
-            // `rocky ci-diff [<base>]`: the ref is positional and its own
-            // entry; `validate_base_field` has ruled out a leading `-`.
-            if let Some(base) = &request.base {
-                args.push(base.into());
-            }
+            // `rocky ci-diff [<base>]`. The job reads the seed from `HEAD`,
+            // never from the working tree, so an uncommitted seed cannot run.
+            // The ref is positional and its own entry, after `--` so git-style
+            // flag parsing never sees it.
             if let Some(models) = &dirs.models {
                 args.push("--models".into());
                 args.push(models.into());
             }
             if request.semantic == Some(true) {
                 args.push("--semantic".into());
+            }
+            args.push("--seed-from-head".into());
+            if let Some(base) = &request.base {
+                args.push("--".into());
+                args.push(base.into());
             }
         }
         JobKind::Test | JobKind::Ci => {
@@ -5545,6 +5592,9 @@ const HTTP_API_SESSION_SOURCE_ENV: &str = "ROCKY_SESSION_SOURCE";
 /// The value `run_audit::detect_session_source` maps to `SessionSource::HttpApi`.
 const HTTP_API_SESSION_SOURCE: &str = "http_api";
 
+/// Git's switch that stops it fetching a missing object from a promisor remote.
+const DIFF_NO_LAZY_FETCH_ENV: &str = "GIT_NO_LAZY_FETCH";
+
 fn job_subprocess_command(
     exe: std::path::PathBuf,
     kind: JobKind,
@@ -5566,14 +5616,19 @@ fn job_subprocess_command(
     if kind == JobKind::Promote {
         cmd.env_remove(crate::commands::APPROVAL_SKIP_ENV);
     }
-    // A diff only reads. `ci-diff` sets this on each git command it starts;
-    // setting it on the child as well covers any git call added later. It is
-    // never set on this server process.
+    // A diff only reads. `ci-diff` sets `GIT_OPTIONAL_LOCKS` on each git
+    // command it starts; setting it on the child as well covers any git call
+    // added later. `GIT_NO_LAZY_FETCH` stops git fetching a missing object
+    // from a partial clone's remote, which would write into the repository.
+    // `ROCKY_TRACE_DISABLE` stops the child writing `.rocky/traces`. None of
+    // these is ever set on this server process.
     if kind == JobKind::Diff {
         cmd.env(
             crate::commands::GIT_OPTIONAL_LOCKS_ENV,
             crate::commands::GIT_OPTIONAL_LOCKS_VALUE,
         );
+        cmd.env(DIFF_NO_LAZY_FETCH_ENV, "1");
+        cmd.env(rocky_observe::traces::TRACE_DISABLE_ENV, "1");
     }
     // An approval records the approver in the shared policy-decision ledger.
     // The server's own `ROCKY_PRINCIPAL_ID` / `ROCKY_PRINCIPAL` name the
@@ -16767,14 +16822,21 @@ adapter = "db"
             argv(&full),
             [
                 &head[..],
-                &["origin/main", "--models", "/p/models", "--semantic"]
+                &[
+                    "--models",
+                    "/p/models",
+                    "--semantic",
+                    "--seed-from-head",
+                    "--",
+                    "origin/main"
+                ]
             ]
             .concat()
         );
         let plain = JobRequest::default();
         assert_eq!(
             argv(&plain),
-            [&head[..], &["--models", "/p/models"]].concat()
+            [&head[..], &["--models", "/p/models", "--seed-from-head"]].concat()
         );
         let off: JobRequest =
             serde_json::from_value(serde_json::json!({ "semantic": false })).unwrap();
@@ -16786,6 +16848,29 @@ adapter = "db"
     /// process does not.
     #[test]
     fn diff_job_child_carries_git_optional_locks_zero() {
+        let env_named = |kind: JobKind, name: &'static str| {
+            let cmd = job_subprocess_command(
+                std::path::PathBuf::from("/bin/rocky"),
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &JobProjectDirs::default(),
+                std::path::Path::new("/p/state.redb"),
+                &JobRequest::default(),
+            );
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        for name in ["GIT_NO_LAZY_FETCH", "ROCKY_TRACE_DISABLE"] {
+            assert_eq!(
+                env_named(JobKind::Diff, name).as_deref(),
+                Some("1"),
+                "{name}"
+            );
+            assert_eq!(env_named(JobKind::Ci, name), None, "{name}");
+            assert!(std::env::var_os(name).is_none(), "{name} set process-wide");
+        }
         let env_of = |kind: JobKind| {
             let cmd = job_subprocess_command(
                 std::path::PathBuf::from("/bin/rocky"),
@@ -16804,6 +16889,90 @@ adapter = "db"
         assert_eq!(env_of(JobKind::Ci), None);
         assert_eq!(env_of(JobKind::Run), None);
         assert!(std::env::var_os("GIT_OPTIONAL_LOCKS").is_none());
+    }
+
+    /// A field the diff job does not take is refused, not ignored: a
+    /// `working_tree` that answered `202` would run a `HEAD` diff in silence.
+    #[tokio::test]
+    async fn diff_route_refuses_a_field_it_does_not_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state.clone()).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/jobs/diff"))
+            .json(&serde_json::json!({ "working_tree": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let envelope: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(envelope.code, "bad_request");
+        assert!(
+            envelope.message.contains("working_tree"),
+            "{}",
+            envelope.message
+        );
+        assert_eq!(state.diff_permit.running_job(), None);
+    }
+
+    /// An invalid `rocky.toml` reports its line and column, never the quoted
+    /// source line, and names no absolute path, in every check that repeats it.
+    #[tokio::test]
+    async fn doctor_route_drops_the_source_line_and_the_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\n\n[[hook.on_pipeline_start]]\n\
+             command = \"curl -H 'Bearer ERRSECRET1'\n",
+        )
+        .unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/doctor")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("line 5"), "{body}");
+        assert!(!body.contains("ERRSECRET1"), "{body}");
+        let root_text = root.to_string_lossy();
+        assert!(!body.contains(root_text.as_ref()), "{body}");
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        assert!(
+            !body.contains(canonical.to_string_lossy().as_ref()),
+            "{body}"
+        );
+    }
+
+    /// The local doctor writes nothing: not the spool's sentinel, which
+    /// `count_corrupt` would create, and not any other file.
+    #[tokio::test]
+    async fn doctor_route_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let spool = root.join(".rocky").join("pending-demands");
+        std::fs::create_dir_all(&spool).unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        wait_compiled(&state).await;
+        let base = spawn_router(state).await;
+        let before = tree_snapshot(dir.path());
+        let resp = reqwest::get(format!("{base}/api/v1/doctor")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "spool"),
+            "the spool check must have run: {body}"
+        );
+        assert!(!spool.join(".spool-sentinel").exists());
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            tree_snapshot(dir.path()).keys().collect::<Vec<_>>(),
+            "the doctor route created a file"
+        );
     }
 
     /// `GET /api/v1/doctor` runs the local set only: no `state_rw`,

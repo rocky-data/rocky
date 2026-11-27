@@ -10,7 +10,11 @@
 //! - every `git` the job starts sees `GIT_OPTIONAL_LOCKS=0`, even though the
 //!   server itself runs without it (a `git` shim on `PATH` records what each
 //!   call saw);
-//! - the job leaves no `index.lock` behind.
+//! - the job changes nothing under the project, `.git` included: every file is
+//!   hashed before and after. That covers `.rocky/traces`, the git index, and
+//!   an uncommitted `data/seed.sql` whose `COPY ... TO` would write a file if
+//!   the job ran it (the job reads the seed from `HEAD`);
+//! - in a partial clone a missing object fails the job and fetches nothing.
 
 #![cfg(unix)]
 
@@ -57,6 +61,42 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> (String, String) {
         head.lines().next().unwrap_or("").to_string(),
         body.to_string(),
     )
+}
+
+/// A hash of every file under `root`, `.git` included, by relative path.
+fn tree_hash(root: &Path) -> std::collections::BTreeMap<PathBuf, u64> {
+    use std::hash::{Hash, Hasher};
+    fn walk(dir: &Path, root: &Path, out: &mut std::collections::BTreeMap<PathBuf, u64>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    hasher.finish(),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The paths whose bytes differ between two tree hashes, or exist in one only.
+fn changed_paths(
+    before: &std::collections::BTreeMap<PathBuf, u64>,
+    after: &std::collections::BTreeMap<PathBuf, u64>,
+) -> Vec<PathBuf> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect()
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -197,10 +237,29 @@ fn the_diff_job_returns_the_cli_output_and_runs_every_git_without_optional_locks
     let (shim, log) = git_shim(dir.path());
     let (server, port) = serve(dir.path(), &root, &shim);
 
+    // An uncommitted seed that writes a file when it runs. The job must read
+    // the seed from HEAD, so it never runs this one.
+    let leaked = root.join("leaked.csv");
+    let seed = root.join("data").join("seed.sql");
+    let mut text = std::fs::read_to_string(&seed).expect("the seed");
+    text.push_str(&format!(
+        "\nCOPY (SELECT 1 AS x) TO '{}' (FORMAT CSV);\n",
+        leaked.display()
+    ));
+    std::fs::write(&seed, text).unwrap();
+
     // Start from an empty log: only the job's own git calls count.
     std::fs::write(&log, "").unwrap();
+    let before = tree_hash(&root);
     let job = diff_job(port, r#"{"base":"HEAD~1","semantic":true}"#);
     assert_eq!(job["state"], "succeeded", "{job}");
+    let after = tree_hash(&root);
+    assert_eq!(
+        changed_paths(&before, &after),
+        Vec::<PathBuf>::new(),
+        "the job wrote under the project"
+    );
+    assert!(!leaked.exists(), "the job ran the uncommitted seed");
 
     // Read before the CLI runs below: only the job's own git calls are in the
     // log now. A job that lost the env would log `unset` here.
@@ -245,6 +304,42 @@ fn the_diff_job_returns_the_cli_output_and_runs_every_git_without_optional_locks
     assert!(
         !root.join(".git").join("index.lock").exists(),
         "the diff left a git index lock"
+    );
+    drop(server);
+}
+
+#[test]
+fn a_partial_clone_missing_object_fails_the_job_and_fetches_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = project_with_a_dropped_column(dir.path());
+    git(&source, &["config", "uploadpack.allowFilter", "true"]);
+    git(
+        &source,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    let clone = dir.path().join("clone");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            &format!("file://{}", source.display()),
+            clone.to_str().unwrap(),
+        ],
+    );
+    let (shim, _log) = git_shim(dir.path());
+    let (server, port) = serve(dir.path(), &clone, &shim);
+
+    let before = tree_hash(&clone);
+    let job = diff_job(port, r#"{"base":"HEAD~1"}"#);
+    assert_eq!(job["state"], "failed", "{job}");
+    let error = job["error"].as_str().unwrap_or_default();
+    assert!(error.contains("partial clone"), "{job}");
+    assert_eq!(
+        changed_paths(&before, &tree_hash(&clone)),
+        Vec::<PathBuf>::new(),
+        "the job fetched or wrote under the clone"
     );
     drop(server);
 }

@@ -11777,7 +11777,7 @@
             "type": "string"
           },
           {
-            "description": "`rocky ci-diff` — the structural model diff between a git ref and the `HEAD` commit, with the column lineage it moves. Uncommitted edits are not compared. Read-only: it writes no state, file or cache, and every git command it runs sets `GIT_OPTIONAL_LOCKS=0`. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
+            "description": "`rocky ci-diff` — the structural model diff between a git ref and the `HEAD` commit, with the column lineage it moves. Uncommitted edits are not compared. Read-only: it changes nothing under the project, `.git` included. It reads `data/seed.sql` from `HEAD`, and its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job and nothing is fetched. The server still records the job in its state store. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
             "enum": [
               "diff"
             ],
@@ -11786,6 +11786,7 @@
         ]
       },
       "JobRequest": {
+        "additionalProperties": false,
         "description": "Optional JSON body for a job submission. Every field is optional; an empty body runs the verb with its defaults (all pipelines, no filter). Unknown fields are ignored so an embedder on a newer client stays forward-compatible.\n\nDerives `JsonSchema` (crate-visible) so the OpenAPI generator can emit the `POST /api/v1/jobs/{run|plan|apply}` request-body schema from this single source of truth rather than a hand-copied duplicate. It is deliberately not registered in [`super::commands::export_schemas`], so it stays out of the Pydantic/TypeScript codegen cascade.",
         "properties": {
           "base": {
@@ -30424,7 +30425,7 @@
     },
     "/api/v1/jobs/diff": {
       "post": {
-        "description": "Submit a `diff` job: `rocky ci-diff`, the structural model diff between a git ref and `HEAD`, with the column lineage it moves. The result is the `ci-diff` output. It is read-only: it writes no state, file or cache, every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, and it takes no mutation permit, so it never blocks a run. At most one diff runs at a time: a second submission answers `409 mutation_in_progress` with the running job's id. Body fields, both optional: `base` (a git ref, default `main`, validated before the job starts) and `semantic` (also run the breaking-change classifier). It diffs the `HEAD` commit: uncommitted edits are not compared.",
+        "description": "Submit a `diff` job: `rocky ci-diff`, the structural model diff between a git ref and `HEAD`, with the column lineage it moves. The result is the `ci-diff` output. It is read-only: it changes nothing under the project, `.git` included. It reads `data/seed.sql` from `HEAD`, never from the working tree. Its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job with a message that names the partial clone, and nothing is fetched. The server still records the job in its state store. It takes no mutation permit, so it never blocks a run. At most one diff runs at a time: a second submission answers `409 mutation_in_progress` with the running job's id. Body fields, both optional: `base` (a git ref, default `main`, validated before the job starts) and `semantic` (also run the breaking-change classifier). Any other field is `400 bad_request`. It diffs the `HEAD` commit: uncommitted edits are not compared.",
         "operationId": "submitDiffJob",
         "parameters": [
           {

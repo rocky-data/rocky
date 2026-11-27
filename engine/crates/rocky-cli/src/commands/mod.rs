@@ -151,7 +151,8 @@ pub(crate) use catalog::{catalog_output_from_compiled, read_run_facts_request_sc
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::{
-    CiDiffMode, ci_diff_mode, extract_base_compile, project_ir_from_compile, run_ci_diff,
+    CiDiffMode, SeedRead, ci_diff_mode, extract_base_compile, project_ir_from_compile, run_ci_diff,
+    seed_read,
 };
 pub(crate) use ci_diff::{GIT_OPTIONAL_LOCKS_ENV, GIT_OPTIONAL_LOCKS_VALUE};
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};

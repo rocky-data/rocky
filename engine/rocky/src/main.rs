@@ -2207,6 +2207,11 @@ enum Command {
         /// uncommitted edits are ignored.
         #[arg(long)]
         working_tree: bool,
+        /// Read `data/seed.sql` from the `HEAD` commit instead of the working
+        /// tree, so an uncommitted seed never runs. `rocky serve`'s diff job
+        /// passes it. The default reads the file on disk.
+        #[arg(long)]
+        seed_from_head: bool,
     },
 
     /// Per-changed-column downstream impact, formatted for PR review
@@ -5815,6 +5820,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             semantic,
             working_tree,
+            seed_from_head,
         } => rocky_cli::commands::run_ci_diff(
             &cli.config,
             &state_path,
@@ -5824,6 +5830,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             semantic,
             cli.cache_ttl,
             rocky_cli::commands::ci_diff_mode(working_tree),
+            rocky_cli::commands::seed_read(seed_from_head),
         ),
         Command::LineageDiff {
             base_ref,

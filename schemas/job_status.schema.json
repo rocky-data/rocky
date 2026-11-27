@@ -89,7 +89,7 @@
           "type": "string"
         },
         {
-          "description": "`rocky ci-diff` — the structural model diff between a git ref and the `HEAD` commit, with the column lineage it moves. Uncommitted edits are not compared. Read-only: it writes no state, file or cache, and every git command it runs sets `GIT_OPTIONAL_LOCKS=0`. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
+          "description": "`rocky ci-diff` — the structural model diff between a git ref and the `HEAD` commit, with the column lineage it moves. Uncommitted edits are not compared. Read-only: it changes nothing under the project, `.git` included. It reads `data/seed.sql` from `HEAD`, and its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job and nothing is fetched. The server still records the job in its state store. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
           "enum": [
             "diff"
           ],
