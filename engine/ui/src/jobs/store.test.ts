@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { JobKind, JobState, JobStatus } from "@rocky-types/job_status";
 import { ApiError } from "../api";
-import { JobStore, jobKey, type JobClient } from "./store";
+import { JobStore, defaultJobClient, jobKey, type JobClient } from "./store";
 
 function job(kind: JobKind, state: JobState, id = "job_1"): JobStatus {
   return {
@@ -276,5 +276,158 @@ describe("JobStore", () => {
     expect(store.get("apply")?.view.kind).toBe("done");
     expect(store.get("apply")?.closed).toBe(false);
     store.dispose();
+  });
+});
+
+describe("JobStore reads and cancels with deadlines and back-off", () => {
+  it("doubles the wait between failed reads and caps it at 30 s", async () => {
+    vi.useFakeTimers();
+    try {
+      const at: number[] = [];
+      const client: JobClient = {
+        submit: vi.fn(async () => ({ job_id: "job_1" })),
+        status: vi.fn(async () => {
+          at.push(Date.now());
+          throw new TypeError("Failed to fetch");
+        }),
+        cancel: vi.fn(),
+      };
+      const store = new JobStore(1_000, 60_000);
+      store.start("run", "run", "Run", client);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(200_000);
+      const waits = at.slice(1).map((t, i) => t - at[i]);
+      expect(waits.slice(0, 8)).toEqual([2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000]);
+      expect(store.get("run")?.failedReads).toBe(at.length);
+      store.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([401, 403, 404])("marks the job lost, outcome unknown, on a %i read", async (status) => {
+    const client: JobClient = {
+      submit: vi.fn(async () => ({ job_id: "job_5" })),
+      status: vi.fn(async () => {
+        throw new ApiError(status, { code: "nope", message: "no" });
+      }),
+      cancel: vi.fn(),
+    };
+    const store = new JobStore(2);
+    store.start("run", "run", "Run", client);
+    await until(() => store.get("run")?.view.kind === "lost");
+    expect(client.status).toHaveBeenCalledTimes(1);
+    store.dispose();
+  });
+
+  it("clears a refused cancel when the job ends", async () => {
+    let end = false;
+    const client: JobClient = {
+      submit: vi.fn(async () => ({ job_id: "job_1" })),
+      status: vi.fn(async () => job("run", end ? "succeeded" : "running")),
+      cancel: vi.fn(async () => {
+        throw new ApiError(409, { code: "job_not_running", message: "the job has ended" });
+      }),
+    };
+    const store = new JobStore(2, 60_000);
+    store.start("run", "run", "Run", client);
+    await until(() => store.get("run")?.view.kind === "running");
+    store.cancel("run");
+    await until(() => store.get("run")?.cancel.kind === "refused");
+    end = true;
+    await until(() => store.get("run")?.view.kind === "done");
+    expect(store.get("run")?.cancel.kind).toBe("idle");
+    store.dispose();
+  });
+});
+
+describe("defaultJobClient deadlines", () => {
+  /** AbortSignal.timeout on the fake clock, so a test can pass the deadline. */
+  function fakeTimeoutSignal() {
+    return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")), ms);
+      return controller.signal;
+    });
+  }
+
+  /** A fetch that never answers, and rejects when its signal aborts. */
+  function stalledFetch() {
+    return vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }),
+    );
+  }
+
+  it("counts a stalled status read as a failed read, then reads again", async () => {
+    vi.useFakeTimers();
+    const timeout = fakeTimeoutSignal();
+    const stalled = stalledFetch();
+    vi.stubGlobal("fetch", stalled);
+    try {
+      const client: JobClient = {
+        ...defaultJobClient,
+        submit: vi.fn(async () => ({ job_id: "job_1" })),
+      };
+      const store = new JobStore(1_000, 60_000);
+      store.start("run", "run", "Run", client);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stalled).toHaveBeenCalledTimes(1);
+      expect(timeout).toHaveBeenCalledWith(15_000);
+      expect(store.get("run")?.failedReads).toBe(0);
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(store.get("run")?.failedReads).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.get("run")?.failedReads).toBe(1);
+      expect(store.get("run")?.view.kind).toBe("running");
+      // Backed off to 2 s, then read again.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(stalled).toHaveBeenCalledTimes(2);
+      store.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts a stalled cancel as refused, and lets the button be pressed again", async () => {
+    vi.useFakeTimers();
+    const timeout = fakeTimeoutSignal();
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push(String(input));
+        if (!String(input).endsWith("/cancel")) {
+          return Promise.resolve(new Response(JSON.stringify(job("run", "running")), { status: 200 }));
+        }
+        return stalledFetch()(input, init);
+      }),
+    );
+    try {
+      const client: JobClient = { ...defaultJobClient, submit: vi.fn(async () => ({ job_id: "job_1" })) };
+      const store = new JobStore(1_000, 60_000);
+      store.start("run", "run", "Run", client);
+      await vi.advanceTimersByTimeAsync(0);
+      store.cancel("run");
+      expect(store.get("run")?.cancel.kind).toBe("sending");
+      await vi.advanceTimersByTimeAsync(15_000);
+      const cancel = store.get("run")?.cancel;
+      expect(cancel?.kind).toBe("refused");
+      expect(cancel?.kind === "refused" && cancel.error.message).toMatch(/did not answer/);
+      expect(store.get("run")?.terminates).toBe(0);
+      // A second press goes out again.
+      store.cancel("run");
+      expect(store.get("run")?.cancel.kind).toBe("sending");
+      expect(calls.filter((url) => url.endsWith("/cancel"))).toHaveLength(2);
+      store.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
