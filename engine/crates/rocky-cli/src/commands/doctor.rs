@@ -721,7 +721,7 @@ async fn collect_health_checks_in(
     //      and folding this in would have warned exactly where it was not
     //      needed and stayed silent where it was (#1712).
     if run("spool")
-        && let Some(check) = spool_check(config_path, &mut suggestions)
+        && let Some(check) = spool_check(config_path, &mut suggestions, check_set)
     {
         checks.push(check);
     }
@@ -1088,7 +1088,11 @@ async fn state_concurrency_check(
 /// "no webhooks here" — the shape of #1668/#1707/#1739. A path that is present
 /// but cannot be inspected is a WARNING, not silence: absence is unproven, and
 /// a spool nobody can read is exactly the state this check exists to surface.
-fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<HealthCheck> {
+fn spool_check(
+    config_path: &Path,
+    suggestions: &mut Vec<String>,
+    check_set: DoctorCheckSet,
+) -> Option<HealthCheck> {
     use rocky_core::path_presence::PathPresence;
     use rocky_core::schedule::spool;
 
@@ -1124,7 +1128,13 @@ fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<Heal
         }
     }
 
-    let (status, message) = match spool::count_corrupt(&rocky_dir) {
+    // The local set is a read-only probe: `count_corrupt` can create the
+    // spool's sentinel file, so it counts without creating anything.
+    let counted = match check_set {
+        DoctorCheckSet::All => spool::count_corrupt(&rocky_dir),
+        DoctorCheckSet::Local => spool::count_corrupt_read_only(&rocky_dir),
+    };
+    let (status, message) = match counted {
         Ok(0) => (
             HealthStatus::Healthy,
             "no quarantined webhook demands".to_string(),
@@ -1550,7 +1560,7 @@ mod tests {
         std::fs::write(&config_path, "").unwrap();
 
         let mut suggestions = Vec::new();
-        assert!(super::spool_check(&config_path, &mut suggestions).is_none());
+        assert!(super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All).is_none());
         assert!(suggestions.is_empty());
     }
 
@@ -1565,7 +1575,8 @@ mod tests {
         std::fs::write(spool.join("abc123"), "{}").unwrap();
 
         let mut suggestions = Vec::new();
-        let check = super::spool_check(&config_path, &mut suggestions).expect("spool exists");
+        let check = super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All)
+            .expect("spool exists");
         assert!(matches!(check.status, HealthStatus::Healthy), "{check:?}");
         assert!(suggestions.is_empty());
     }
@@ -1582,7 +1593,8 @@ mod tests {
         std::fs::write(spool.join("ghi789.corrupt-1757000001"), "also not json").unwrap();
 
         let mut suggestions = Vec::new();
-        let check = super::spool_check(&config_path, &mut suggestions).expect("spool exists");
+        let check = super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All)
+            .expect("spool exists");
         assert!(matches!(check.status, HealthStatus::Warning), "{check:?}");
         assert!(check.message.contains('2'), "names the count: {check:?}");
         assert_eq!(suggestions.len(), 1, "{suggestions:?}");
@@ -1619,7 +1631,7 @@ mod tests {
         );
 
         let mut suggestions = Vec::new();
-        let check = super::spool_check(&config_path, &mut suggestions)
+        let check = super::spool_check(&config_path, &mut suggestions, DoctorCheckSet::All)
             .expect("a dangling spool is NOT absent");
         assert!(matches!(check.status, HealthStatus::Warning), "{check:?}");
         assert!(

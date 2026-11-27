@@ -625,6 +625,34 @@ pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
     Ok(n)
 }
 
+/// [`count_corrupt`] that never creates a file.
+///
+/// [`count_corrupt`] may write the spool's sentinel when a listing does not
+/// show it (#1903). This reads the directory once and counts. A missing
+/// directory yields `0`. A listing that a platform masks (an SMB share with
+/// access-based enumeration) reads as empty here, where [`count_corrupt`]
+/// would refuse it, so use it only where a write is worse than a missed count:
+/// a read-only health probe.
+///
+/// # Errors
+///
+/// A spool directory that exists but cannot be listed.
+pub fn count_corrupt_read_only(rocky_dir: &Path) -> io::Result<usize> {
+    let dir = spool_dir(rocky_dir);
+    let entries = match std::fs::read_dir(dir.as_path()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut n = 0;
+    for entry in entries {
+        if entry?.file_name().to_string_lossy().contains(CORRUPT_INFIX) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// What one [`sweep_tombstones`] pass did, so the caller can log it instead of
 /// discarding it (#1716).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

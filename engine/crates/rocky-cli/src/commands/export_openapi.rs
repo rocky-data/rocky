@@ -1014,14 +1014,18 @@ fn route_table() -> Vec<Route> {
             summary: "Submit a model diff job",
             description: "Submit a `diff` job: `rocky ci-diff`, the structural model diff \
                  between a git ref and `HEAD`, with the column lineage it moves. The result \
-                 is the `ci-diff` output. It is read-only: it writes no state, file or cache, \
-                 every git command it starts sets `GIT_OPTIONAL_LOCKS=0`, and it takes no \
-                 mutation permit, so it never blocks a run. At most one diff runs at a time: \
+                 is the `ci-diff` output. It is read-only: it changes nothing under the project, \
+                 `.git` included. It reads `data/seed.sql` from `HEAD`, never from the \
+                 working tree. Its git commands set `GIT_OPTIONAL_LOCKS=0` and \
+                 `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job \
+                 with a message that names the partial clone, and nothing is fetched. The \
+                 server still records the job in its state store. It takes no mutation \
+                 permit, so it never blocks a run. At most one diff runs at a time: \
                  a second submission answers `409 mutation_in_progress` with the running \
                  job's id. Body fields, both optional: `base` (a git ref, default `main`, \
                  validated before the job starts) and `semantic` (also run the \
-                 breaking-change classifier). It diffs the `HEAD` commit: uncommitted \
-                 edits are not compared.",
+                 breaking-change classifier). Any other field is `400 bad_request`. It diffs the \
+                 `HEAD` commit: uncommitted edits are not compared.",
             path_params: &[],
             query_params: &[],
             header_params: &["X-Rocky-Principal"],

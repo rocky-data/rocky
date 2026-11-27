@@ -138,6 +138,43 @@ pub(crate) const GIT_OPTIONAL_LOCKS_ENV: &str = "GIT_OPTIONAL_LOCKS";
 /// `0`: skip every optional lock.
 pub(crate) const GIT_OPTIONAL_LOCKS_VALUE: &str = "0";
 
+/// The project's `data/seed.sql` as committed at `HEAD`, or `None` when the
+/// commit holds none or git cannot read it. Read with `git show`, never from
+/// the working tree. `./` makes the path relative to `project_root`, where
+/// `git_in` runs.
+fn committed_seed(project_root: &Path) -> Option<String> {
+    let output = git_in(Some(project_root))
+        .args(["show", "HEAD:./data/seed.sql"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        debug!(
+            "no seed at HEAD: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Whether the repository is a partial clone (it has a promisor remote), whose
+/// missing objects git would fetch on demand unless `GIT_NO_LAZY_FETCH=1`.
+fn is_partial_clone(repo_dir: Option<&Path>) -> bool {
+    git_in(repo_dir)
+        .args([
+            "config",
+            "--get-regexp",
+            r"^(remote\..*\.promisor|extensions\.partialclone)$",
+        ])
+        .output()
+        .is_ok_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|line| !line.trim_end().ends_with(" false"))
+        })
+}
+
 /// Build a `git` invocation, optionally rooted at an explicit repository
 /// directory instead of the process's current one.
 ///
@@ -228,6 +265,16 @@ fn flatten_changed(files: Vec<ChangedFile>) -> Vec<(char, String)> {
             std::iter::once((file.status, file.path)).chain(old)
         })
         .collect()
+}
+
+/// The [`SeedRead`] selected by the `--seed-from-head` flag.
+#[must_use]
+pub fn seed_read(seed_from_head: bool) -> SeedRead {
+    if seed_from_head {
+        SeedRead::Head
+    } else {
+        SeedRead::WorkingTree
+    }
 }
 
 /// The [`CiDiffMode`] selected by the `--working-tree` flag.
@@ -1045,6 +1092,11 @@ pub(crate) enum BaseCompileError {
     /// The ref exists, but its models could not be read out of git.
     #[error("{0}")]
     Unreadable(String),
+    /// A partial clone does not hold an object the diff needs, and no fetch was
+    /// allowed (`GIT_NO_LAZY_FETCH=1`, which the `diff` job sets). Never read
+    /// as "the base has no models": the diff would be silently wrong.
+    #[error("{0}")]
+    PartialCloneObjectMissing(String),
 }
 
 /// Compile the models directory as committed at `base_ref` (any commit-ish,
@@ -1111,11 +1163,18 @@ fn compile_models_at_ref(
             .output()
             .map_err(|e| unreadable(e.to_string()))?;
         if !show_output.status.success() {
-            return Err(unreadable(
-                String::from_utf8_lossy(&show_output.stderr)
-                    .trim()
-                    .to_string(),
-            ));
+            let detail = String::from_utf8_lossy(&show_output.stderr)
+                .trim()
+                .to_string();
+            if is_partial_clone(repo_dir) {
+                return Err(BaseCompileError::PartialCloneObjectMissing(format!(
+                    "this repository is a partial clone and '{file_path}' at '{base_ref}' is \
+                     not stored locally ({detail}). The diff does not fetch from the remote \
+                     when GIT_NO_LAZY_FETCH=1, as in a `rocky serve` diff job. Fetch the \
+                     objects first, for example `git fetch` or checking the base out, then retry"
+                )));
+            }
+            return Err(unreadable(detail));
         }
         std::fs::write(&dest, &show_output.stdout).map_err(|e| unreadable(e.to_string()))?;
         wrote_any = true;
@@ -1581,6 +1640,44 @@ pub(crate) fn compute_ci_diff_in(
     with_seed: bool,
     repo_dir: Option<&Path>,
 ) -> Result<CiDiffData> {
+    compute_ci_diff_seeded(
+        config_path,
+        state_path,
+        base_ref,
+        models_dir,
+        cache_ttl_override,
+        mode,
+        with_seed,
+        SeedRead::WorkingTree,
+        repo_dir,
+    )
+}
+
+/// Where the project's `data/seed.sql` is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedRead {
+    /// The file on disk: what `rocky compile` reads, and the CLI's default.
+    WorkingTree,
+    /// The copy committed at `HEAD`, through `git show`. Nothing is read from
+    /// the working tree, so an uncommitted seed never runs. The `diff` job uses
+    /// this: it compares `base...HEAD`, so `HEAD` is the seed that belongs to
+    /// what it compares.
+    Head,
+}
+
+/// [`compute_ci_diff_in`] with the seed's source chosen.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_ci_diff_seeded(
+    config_path: &Path,
+    state_path: &Path,
+    base_ref: &str,
+    models_dir: &Path,
+    cache_ttl_override: Option<u64>,
+    mode: CiDiffMode,
+    with_seed: bool,
+    seed_read: SeedRead,
+    repo_dir: Option<&Path>,
+) -> Result<CiDiffData> {
     validate_base_ref(base_ref)?;
 
     // Load cached source schemas once and seed both compiles (current
@@ -1677,12 +1774,28 @@ pub(crate) fn compute_ci_diff_in(
         let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
             .ok()
             .flatten();
-        let project_root = config_path.parent().unwrap_or_else(|| Path::new("."));
-        super::compile::fill_from_default_seed(
-            project_root,
-            project_config.as_ref(),
-            &mut source_schemas,
-        );
+        let project_root = config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        match seed_read {
+            SeedRead::WorkingTree => {
+                super::compile::fill_from_default_seed(
+                    project_root,
+                    project_config.as_ref(),
+                    &mut source_schemas,
+                );
+            }
+            SeedRead::Head => {
+                if let Some(seed_sql) = committed_seed(project_root) {
+                    super::compile::fill_from_seed_text(
+                        &seed_sql,
+                        project_config.as_ref(),
+                        &mut source_schemas,
+                    );
+                }
+            }
+        }
     }
 
     // Compile the head side: keep the full result so callers can reach into
@@ -1693,8 +1806,18 @@ pub(crate) fn compute_ci_diff_in(
     let head_compile = if models_dir.is_dir() {
         let compiled = match mode {
             CiDiffMode::Head => {
-                compile_models_at_ref("HEAD", models_dir, source_schemas.clone(), None, repo_dir)
-                    .map_err(anyhow::Error::msg)
+                match compile_models_at_ref(
+                    "HEAD",
+                    models_dir,
+                    source_schemas.clone(),
+                    None,
+                    repo_dir,
+                ) {
+                    Err(BaseCompileError::PartialCloneObjectMissing(message)) => {
+                        anyhow::bail!(message)
+                    }
+                    other => other.map_err(anyhow::Error::msg),
+                }
             }
             CiDiffMode::WorkingTree => compile_head(models_dir, source_schemas.clone()),
         };
@@ -1714,7 +1837,11 @@ pub(crate) fn compute_ci_diff_in(
         .unwrap_or_default();
 
     let base_compile = if models_dir.is_dir() {
-        extract_base_compile_in(base_side, models_dir, source_schemas, None, repo_dir).ok()
+        match compile_models_at_ref(base_side, models_dir, source_schemas, None, repo_dir) {
+            Ok(result) => Some(result),
+            Err(BaseCompileError::PartialCloneObjectMissing(message)) => anyhow::bail!(message),
+            Err(_) => None,
+        }
     } else {
         None
     };
@@ -1827,8 +1954,9 @@ pub fn run_ci_diff(
     semantic: bool,
     cache_ttl_override: Option<u64>,
     mode: CiDiffMode,
+    seed_read: SeedRead,
 ) -> Result<()> {
-    let data = compute_ci_diff(
+    let data = compute_ci_diff_seeded(
         config_path,
         state_path,
         base_ref,
@@ -1836,6 +1964,8 @@ pub fn run_ci_diff(
         cache_ttl_override,
         mode,
         true,
+        seed_read,
+        None,
     )?;
     let mode = data.mode;
     let header = format!("Rocky CI Diff ({base_ref}...{})\n", mode.head_label());
