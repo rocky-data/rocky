@@ -2892,16 +2892,21 @@ auto_create_schemas = true
     }
 
     /// The facts split and the one-pass refcounts give `rocky gc` the verdicts
-    /// the per-hash implementation gave, on a ledger with every shape: a
-    /// derivable artifact, a fresh one, bytes shared by two producers, a
+    /// the per-hash implementation gave, in the same order, field for field.
+    /// The ledger has every shape: a derivable artifact, a fresh one, the
+    /// min-age boundary from both sides, two hashes with one `written_at`,
+    /// bytes shared by three producers (two of them tied on `written_at`), a
     /// multi-input recipe whose upstream is in the ledger and one whose
-    /// upstream is not, and a row with no provenance and no run.
+    /// upstream is not, a producer that recorded no provenance, and a row with
+    /// neither provenance nor run.
     #[test]
     fn facts_verdicts_equal_the_per_hash_reference() {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
-        let old = Utc::now() - Duration::days(30);
-        let fresh = Utc::now() - Duration::hours(1);
+        let now = Utc::now();
+        let old = now - Duration::days(30);
+        let fresh = now - Duration::hours(1);
+        let tied = now - Duration::days(20);
         let hd = "d".repeat(64);
         let he = "e".repeat(64);
         let hf = "f".repeat(64);
@@ -2913,6 +2918,7 @@ auto_create_schemas = true
         record_run(&store, "r1", "orders");
         seed(&store, "r2", "items", "SELECT 2 AS id", &[], HB, 300, fresh);
         record_run(&store, "r2", "items");
+        // Bytes shared by three producers; two of them tie on `written_at`.
         seed(
             &store,
             "r3",
@@ -2921,7 +2927,7 @@ auto_create_schemas = true
             &[],
             HC,
             700,
-            old,
+            tied,
         );
         record_run(&store, "r3", "shared_a");
         seed(
@@ -2932,9 +2938,20 @@ auto_create_schemas = true
             &[],
             HC,
             700,
-            old - Duration::days(1),
+            tied,
         );
         record_run(&store, "r4", "shared_b");
+        seed(
+            &store,
+            "r7",
+            "shared_c",
+            "SELECT 3 AS id",
+            &[],
+            HC,
+            700,
+            old,
+        );
+        record_run(&store, "r7", "shared_c");
         seed(
             &store,
             "r5",
@@ -2957,41 +2974,87 @@ auto_create_schemas = true
             old,
         );
         record_run(&store, "r6", "lost_input");
+        // The min-age boundary: exactly 7 days old, and one second short.
+        let at_boundary = "1".repeat(64);
+        let under_boundary = "2".repeat(64);
+        seed(
+            &store,
+            "r10",
+            "boundary_at",
+            "SELECT 6 AS id",
+            &[],
+            &at_boundary,
+            11,
+            now - Duration::days(7),
+        );
+        record_run(&store, "r10", "boundary_at");
+        seed(
+            &store,
+            "r11",
+            "boundary_under",
+            "SELECT 7 AS id",
+            &[],
+            &under_boundary,
+            12,
+            now - Duration::days(7) + Duration::seconds(1),
+        );
+        record_run(&store, "r11", "boundary_under");
+        // Two different hashes with one `written_at`.
+        for (run, model, hash) in [("r12", "tie_x", "3"), ("r13", "tie_y", "4")] {
+            seed(
+                &store,
+                run,
+                model,
+                "SELECT 8 AS id",
+                &[],
+                &hash.repeat(64),
+                21,
+                tied,
+            );
+            record_run(&store, run, model);
+        }
+        // A producer that recorded no provenance: the run exists, the
+        // provenance does not.
+        record_run(&store, "r8", "bare");
+        let artifact = |hash: String, run: &str, model: &str| ArtifactRecord {
+            blake3_hash: hash,
+            run_id: run.to_string(),
+            model_name: model.to_string(),
+            file_path: format!("s3://b/{model}.parquet"),
+            commit_version: 0,
+            size_bytes: 50,
+            written_at: old,
+        };
         store
-            .record_artifact(&ArtifactRecord {
-                blake3_hash: "9".repeat(64),
-                run_id: "r9".to_string(),
-                model_name: "ghost".to_string(),
-                file_path: "s3://b/ghost.parquet".to_string(),
-                commit_version: 0,
-                size_bytes: 50,
-                written_at: old,
-            })
+            .record_artifact(&artifact("8".repeat(64), "r8", "bare"))
+            .unwrap();
+        // Neither provenance nor run.
+        store
+            .record_artifact(&artifact("9".repeat(64), "r9", "ghost"))
             .unwrap();
 
-        let now = Utc::now();
         let view = |candidates: Vec<EvictionCandidate>| -> Vec<serde_json::Value> {
-            let mut rows: Vec<serde_json::Value> = candidates
+            candidates
                 .into_iter()
                 .map(|c| {
                     serde_json::json!({
                         "output": serde_json::to_value(&c.output).unwrap(),
+                        "artifact": serde_json::to_value(&c.artifact).unwrap(),
                         "recipe_hash": c.recipe_hash,
                         "input_hash": c.input_hash,
+                        "input_proof_class": c.input_proof_class,
                         "env_hash": c.env_hash,
+                        "hash_scheme": c.hash_scheme,
                         "storage_prefix": c.storage_prefix,
-                        "file_path": c.artifact.file_path,
                     })
                 })
-                .collect();
-            rows.sort_by_key(|r| r["output"]["blake3_hash"].as_str().unwrap().to_string());
-            rows
+                .collect()
         };
         let reference = view(gather_eviction_candidates_reference(&store, None, now, 7).unwrap());
         let split = view(gather_eviction_candidates(&store, None, now, 7).unwrap());
-        assert_eq!(split, reference);
+        assert_eq!(split, reference, "same rows, same order, every field");
 
-        assert_eq!(reference.len(), 6);
+        assert_eq!(reference.len(), 11);
         let by_model = |model: &str| {
             reference
                 .iter()
@@ -3000,13 +3063,19 @@ auto_create_schemas = true
         };
         assert_eq!(by_model("orders")["output"]["derivable"], true);
         assert_eq!(by_model("items")["output"]["derivable"], false);
-        assert_eq!(by_model("shared_a")["output"]["refcount"], 2);
+        assert_eq!(by_model("boundary_at")["output"]["derivable"], true);
+        assert_eq!(by_model("boundary_under")["output"]["derivable"], false);
         assert_eq!(by_model("ghost")["output"]["derivable"], false);
+        assert_eq!(by_model("bare")["output"]["derivable"], false);
+        assert_eq!(by_model("joined")["output"]["derivable"], false);
+        // The representative of the shared hash is the newest, then the
+        // lowest run id: `shared_a` (r3), not `shared_b` (r4) or `shared_c`.
+        assert_eq!(by_model("shared_a")["output"]["refcount"], 3);
         assert!(
             reference
                 .iter()
-                .any(|r| r["output"]["derivable"] == false && r["output"]["model_name"] == "joined"),
-            "a multi-input recipe is not derivable"
+                .all(|r| r["output"]["model_name"] != "shared_b"
+                    && r["output"]["model_name"] != "shared_c")
         );
     }
 

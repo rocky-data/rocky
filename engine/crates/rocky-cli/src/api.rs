@@ -2718,7 +2718,7 @@ async fn hooks_list(
             .map(|config| config.hooks)
             .unwrap_or_default();
         let registry = rocky_core::hooks::HookRegistry::from_config(&hooks);
-        Ok(crate::commands::hooks_list_output(&registry))
+        Ok(crate::commands::hooks_list_output_program_only(&registry))
     })
     .await
     .map_err(|e| map_join_err(&e))?
@@ -7176,6 +7176,57 @@ mod tests {
         value
     }
 
+    /// No hook command argument reaches the `/hooks` body, whatever form the
+    /// secret takes.
+    #[tokio::test]
+    async fn hooks_route_serves_the_program_and_no_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, config, _state_path) = pure_routes_fixture(dir.path());
+        let secrets = [
+            "BearerSECRET1",
+            "PASSWORDSECRET2",
+            "USERSECRET3",
+            "PWSECRET3",
+            "QUOTEDSECRET4",
+            "TOKENSECRET5",
+            "APIKEYSECRET6",
+            "HEADERSECRET7",
+        ];
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        for command in [
+            "curl -H 'Authorization: Bearer BearerSECRET1' https://api.example.com/x",
+            "deploy.sh --password=PASSWORDSECRET2",
+            "curl -u USERSECRET3:PWSECRET3 https://h.example/x",
+            "echo \u{201c}https://h.example/QUOTEDSECRET4",
+            "notify.sh token=TOKENSECRET5 https://h.example/y",
+            "notify.sh apikey=APIKEYSECRET6",
+            "curl -H 'X-Api-Key: HEADERSECRET7' https://h.example/z",
+        ] {
+            text.push_str(&format!(
+                "\n[[hook.on_pipeline_error]]\ncommand = {command:?}\n"
+            ));
+        }
+        std::fs::write(&config, &text).unwrap();
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/hooks")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        for secret in secrets {
+            assert!(!body.contains(secret), "{secret} leaked: {body}");
+        }
+        for fragment in [
+            "Bearer",
+            "--password",
+            "-u ",
+            "token=",
+            "apikey=",
+            "X-Api-Key",
+        ] {
+            assert!(!body.contains(fragment), "{fragment} leaked: {body}");
+        }
+        assert!(body.contains("\"command\": \"curl …\""), "{body}");
+    }
+
     /// Each route answers 200 with the command's payload, names no absolute
     /// path, leaks no secret, and writes nothing under the project or state.
     #[tokio::test]
@@ -7258,12 +7309,10 @@ mod tests {
         let registry = rocky_core::hooks::HookRegistry::from_config(&loaded.hooks);
         assert_eq!(
             text,
-            reference_bytes(&crate::commands::hooks_list_output(&registry))
+            reference_bytes(&crate::commands::hooks_list_output_program_only(&registry))
         );
-        assert!(
-            text.contains(&format!("--token ${{{PURE_HOOK_VAR}}}")),
-            "{text}"
-        );
+        assert!(text.contains("\"command\": \"notify.sh …\""), "{text}");
+        assert!(!text.contains("--token"), "no argument is served: {text}");
         assert!(
             text.contains("\"url\": \"https://hooks.example.com\""),
             "{text}"
@@ -7589,9 +7638,10 @@ mod tests {
         );
     }
 
-    /// Both request-scoped store reads go through the one funnel: every open
-    /// of the state path carries the request-scoped cache budget. Reading
-    /// the store any other way leaves no record, or a default-budget one.
+    /// `/catalog` and `/gc/derivable` open the store through the funnel
+    /// (`with_store`), once per request, with the request-scoped cache budget.
+    /// This probes those two routes only. It does not count opens made
+    /// outside the funnel.
     #[tokio::test]
     async fn catalog_and_gc_open_the_store_through_the_request_scoped_funnel() {
         let dir = tempfile::tempdir().unwrap();

@@ -152,6 +152,59 @@ pub(crate) fn hooks_list_output(registry: &HookRegistry) -> HooksListOutput {
     }
 }
 
+/// [`hooks_list_output`] for the HTTP route: each shell hook's `command` is
+/// cut to its program.
+///
+/// A command line often carries a secret in an argument, in a form no pattern
+/// list can promise to catch. The route therefore shows the program only: the
+/// basename of the first word that is not a `NAME=value` assignment, followed
+/// by ` …` when anything else was on the line. The CLI prints the full
+/// command, because it reads the user's own file.
+pub(crate) fn hooks_list_output_program_only(registry: &HookRegistry) -> HooksListOutput {
+    let mut output = hooks_list_output(registry);
+    for hook in &mut output.hooks {
+        hook.command = command_program(&hook.command);
+    }
+    output
+}
+
+/// The program of a command line, with ` …` when arguments were dropped.
+fn command_program(command: &str) -> String {
+    let is_assignment = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let mut words = command.split_whitespace().peekable();
+    let mut dropped = false;
+    while words.peek().is_some_and(|word| is_assignment(word)) {
+        words.next();
+        dropped = true;
+    }
+    let Some(first) = words.next() else {
+        return "…".to_string();
+    };
+    dropped |= words.next().is_some();
+    let first = first.trim_matches(|c| matches!(c, '"' | '\''));
+    // Only a plain path is a program name. Anything else (a URL, a quoted
+    // blob, non-ASCII text) shows nothing.
+    let plain = !first.contains("://")
+        && first.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '~' | '/' | '\\' | ':' | '-')
+        });
+    let program = first.rsplit(['/', '\\']).next().unwrap_or_default();
+    if !plain || program.is_empty() {
+        return "…".to_string();
+    }
+    if dropped {
+        format!("{program} …")
+    } else {
+        program.to_string()
+    }
+}
+
 /// The `rocky hooks list --output json` rows.
 fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
     let mut entries: Vec<HookEntry> = Vec::new();
@@ -159,12 +212,8 @@ fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
         for hook in registry.hooks_for(event) {
             entries.push(HookEntry {
                 event: event.config_key().to_string(),
-                // A resolved `${VAR}` value prints as `${NAME}` (#1919). A
-                // literal URL is cut to scheme and host, and a bearer or
-                // token value is withheld: a command often carries one.
-                command: redact_command(&rocky_core::secret_registry::render_placeholders(
-                    &hook.command,
-                )),
+                // A resolved `${VAR}` value prints as `${NAME}` (#1919).
+                command: rocky_core::secret_registry::render_placeholders(&hook.command),
                 timeout_ms: hook.timeout_ms,
                 on_failure: format!("{:?}", hook.on_failure),
                 env_keys: {
@@ -250,96 +299,6 @@ fn redact_webhook_url(url: &str) -> String {
     format!("{scheme}://{host}")
 }
 
-/// Whether `value` is only a variable reference (`${NAME}` or `$NAME`): the
-/// name is safe to show, the value never appears.
-fn is_variable_reference(value: &str) -> bool {
-    let name = value
-        .strip_prefix("${")
-        .and_then(|v| v.strip_suffix('}'))
-        .or_else(|| value.strip_prefix('$'));
-    name.is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-}
-
-/// Replace a secret-looking value with `<redacted>`, keeping any quotes
-/// around it and a bare variable reference as it is.
-fn redact_value(word: &str) -> String {
-    let quotes = |c: char| matches!(c, '"' | '\'');
-    let core = word.trim_matches(quotes);
-    if core.is_empty() || is_variable_reference(core) {
-        return word.to_string();
-    }
-    let lead = &word[..word.len() - word.trim_start_matches(quotes).len()];
-    let trail = &word[word.trim_end_matches(quotes).len()..];
-    format!("{lead}<redacted>{trail}")
-}
-
-/// Cut every URL inside `word` to `scheme://host`.
-fn redact_urls_in(word: &str) -> String {
-    let mut out = String::with_capacity(word.len());
-    let mut rest = word;
-    while let Some(at) = rest.find("://") {
-        let before = &rest[..at];
-        let scheme_start = before
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(0, |i| i + 1);
-        let after = &rest[at + 3..];
-        let end = after
-            .find(|c: char| matches!(c, '"' | '\'' | '<' | '>' | ')' | '`') || c.is_whitespace())
-            .unwrap_or(after.len());
-        out.push_str(&before[..scheme_start]);
-        out.push_str(&redact_webhook_url(&rest[scheme_start..at + 3 + end]));
-        rest = &after[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// A shell hook's command with the secrets it may carry withheld.
-///
-/// A literal URL is cut to scheme and host. The value after `Bearer`,
-/// `--token` (or any `--*token` flag) or inside `token=` is replaced by
-/// `<redacted>`. A bare `${NAME}` or `$NAME` stays: it shows the variable's
-/// name, never its value.
-fn redact_command(command: &str) -> String {
-    let mut out = String::with_capacity(command.len());
-    let mut redact_next = false;
-    let mut rest = command;
-    while !rest.is_empty() {
-        let space_len = rest.len() - rest.trim_start().len();
-        out.push_str(&rest[..space_len]);
-        rest = &rest[space_len..];
-        let word_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let word = &rest[..word_len];
-        rest = &rest[word_len..];
-        if word.is_empty() {
-            continue;
-        }
-        if redact_next {
-            redact_next = false;
-            out.push_str(&redact_value(word));
-            continue;
-        }
-        let bare = word
-            .trim_matches(|c| matches!(c, '"' | '\''))
-            .to_ascii_lowercase();
-        if bare == "bearer"
-            || (bare.starts_with('-') && !bare.contains('=') && bare.ends_with("token"))
-        {
-            redact_next = true;
-            out.push_str(word);
-            continue;
-        }
-        if let Some(at) = word.to_ascii_lowercase().find("token=") {
-            let (key, value) = word.split_at(at + "token=".len());
-            out.push_str(key);
-            out.push_str(&redact_value(value));
-            continue;
-        }
-        out.push_str(&redact_urls_in(word));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,45 +379,26 @@ mod tests {
     }
 
     #[test]
-    fn a_command_loses_its_urls_and_tokens_but_keeps_variable_names() {
-        for (command, leaked) in [
+    fn the_route_shows_the_program_only() {
+        for (command, want) in [
+            ("notify.sh", "notify.sh"),
+            ("/opt/bin/notify.sh --token abc", "notify.sh …"),
             (
-                "curl -H \"Authorization: Bearer abc123SECRET\" https://api.example.com/v1/x?key=URLSECRET",
-                ["abc123SECRET", "URLSECRET"],
+                "curl -H \"Authorization: Bearer SECRET1\" https://h/x",
+                "curl …",
             ),
-            (
-                "notify.sh --token tok-SECRET1 --url https://h.example/p/PATHSECRET",
-                ["tok-SECRET1", "PATHSECRET"],
-            ),
-            (
-                "notify.sh --api-token=EQSECRET2 --x https://u:PW@h.example/p",
-                ["EQSECRET2", "PW@"],
-            ),
-            (
-                "run.sh TOKEN=ENVSECRET3 'https://h.example/a/QUOTEDSECRET'",
-                ["ENVSECRET3", "QUOTEDSECRET"],
-            ),
+            ("TOKEN=SECRET2 deploy.sh", "deploy.sh …"),
+            ("A=1 B=2 ./run", "run …"),
+            ("\"/usr/bin/x\" --password=SECRET3", "x …"),
+            ("C:\\tools\\hook.exe -u u:SECRET4", "hook.exe …"),
+            ("héllo\u{201c}https://h/SECRET5", "…"),
+            ("", "…"),
+            ("TOKEN=SECRET6", "…"),
         ] {
-            let got = redact_command(command);
-            for secret in leaked {
-                assert!(!got.contains(secret), "{secret} leaked in {got}");
-            }
-            assert!(got.contains("<redacted>") || got.contains("://"), "{got}");
+            let got = command_program(command);
+            assert_eq!(got, want, "{command}");
+            assert!(!got.contains("SECRET"), "{got}");
         }
-        assert_eq!(
-            redact_command("curl -sS https://api.example.com/v1/x?key=1 -d x"),
-            "curl -sS https://api.example.com -d x"
-        );
-        // A variable reference shows its name, never a value.
-        assert_eq!(
-            redact_command("notify.sh --token ${ROCKY_T} --x=$HOME Bearer ${B} token=${T2}"),
-            "notify.sh --token ${ROCKY_T} --x=$HOME Bearer ${B} token=${T2}"
-        );
-        assert_eq!(
-            redact_command("echo  hi\tthere"),
-            "echo  hi\tthere",
-            "whitespace is kept"
-        );
     }
 
     #[test]
@@ -479,5 +419,28 @@ mod tests {
         assert_eq!(output.hooks.len(), 1);
         assert_eq!(output.webhooks.len(), 1);
         assert_eq!(output.total, 2, "total counts shell hooks and webhooks");
+    }
+
+    #[test]
+    fn the_cli_list_keeps_the_full_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [[hook.on_pipeline_start]]\n\
+             command = \"curl -u u:p -H 'Authorization: Bearer abc' https://h.example/x?k=v\"\n",
+        )
+        .unwrap();
+        let config = load_rocky_config(&path).unwrap();
+        let registry = HookRegistry::from_config(&config.hooks);
+        assert_eq!(
+            hooks_list_output(&registry).hooks[0].command,
+            "curl -u u:p -H 'Authorization: Bearer abc' https://h.example/x?k=v"
+        );
+        assert_eq!(
+            hooks_list_output_program_only(&registry).hooks[0].command,
+            "curl …"
+        );
     }
 }

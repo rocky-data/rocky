@@ -1623,7 +1623,7 @@ fn route_table() -> Vec<Route> {
             operation_id: "getHooks",
             tag: "project",
             summary: "Configured hooks",
-            description: "The shell hooks and the webhooks `rocky.toml` configures. The same bytes as `rocky hooks list --output json`. A command prints a resolved `${VAR}` as `${NAME}`, a literal URL in it as scheme and host, and the value after `Bearer` or `--token` as `<redacted>`. A webhook URL is cut to its scheme and host. With no `rocky.toml` the list is empty. Runs no hook and calls no endpoint.",
+            description: "The shell hooks and the webhooks `rocky.toml` configures. The payload of `rocky hooks list --output json`, except that each command is cut to its program (`curl …`) and never shows its arguments. A webhook URL is cut to its scheme and host. With no `rocky.toml` the list is empty. Runs no hook and calls no endpoint.",
             path_params: &[],
             query_params: &[],
             header_params: &[],

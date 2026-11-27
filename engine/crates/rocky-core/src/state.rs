@@ -14237,6 +14237,42 @@ mod tests {
         );
     }
 
+    /// `artifact_refcounts` answers what `refcount_for_hash` answers for every
+    /// hash, in one pass, and has no entry for a hash with no row.
+    #[test]
+    fn artifact_refcounts_match_the_per_hash_count() {
+        let (store, _dir) = temp_store();
+        let row = |run: &str, model: &str, hash: &str| ArtifactRecord {
+            blake3_hash: hash.to_string(),
+            run_id: run.to_string(),
+            model_name: model.to_string(),
+            file_path: format!("s3://b/{run}-{model}.parquet"),
+            commit_version: 0,
+            size_bytes: 1,
+            written_at: Utc::now(),
+        };
+        for r in [
+            row("r1", "a", "h-one"),
+            row("r1", "b", "h-three"),
+            row("r2", "b", "h-three"),
+            row("r3", "b", "h-three"),
+            row("r2", "c", "h-two"),
+            row("r3", "c", "h-two"),
+        ] {
+            store.record_artifact(&r).unwrap();
+        }
+        let counts = store.artifact_refcounts().unwrap();
+        assert_eq!(counts.len(), 3);
+        for (hash, want) in [("h-one", 1), ("h-two", 2), ("h-three", 3)] {
+            assert_eq!(counts[hash], want, "{hash}");
+            assert_eq!(store.refcount_for_hash(hash).unwrap(), want, "{hash}");
+        }
+        assert!(!counts.contains_key("h-none"));
+        assert_eq!(store.refcount_for_hash("h-none").unwrap(), 0);
+        let (empty, _dir) = temp_store();
+        assert!(empty.artifact_refcounts().unwrap().is_empty());
+    }
+
     /// The cap must actually BIND, not merely be passed.
     ///
     /// The parity test above is not evidence of that: it reads the same

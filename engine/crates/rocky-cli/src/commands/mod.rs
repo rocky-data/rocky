@@ -202,7 +202,7 @@ pub use history::{
     history_run_output, history_runs_output, history_runs_output_filtered, model_history_output,
     recipe_history_output, recipe_history_output_request_scoped, run_history,
 };
-pub(crate) use hooks::hooks_list_output;
+pub(crate) use hooks::hooks_list_output_program_only;
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
 pub use imports_update::run_imports_update;

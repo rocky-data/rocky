@@ -108,8 +108,9 @@ pub fn run_lint(config_path: &Path, paths: &[PathBuf], fix: bool, json: bool) ->
 
 /// The directories the server reads models from, absolute: every
 /// transformation pipeline's existing models directory, as the server's own
-/// compile reads them (#2011). An explicit `--models`, or a project with no
-/// such pipeline, gives `models_dir` alone.
+/// compile reads them (#2011). An explicit `--models`, a project with no such
+/// pipeline, or a project whose pipelines the loader refuses (so the compile
+/// fell back to `models_dir`) gives `models_dir` alone.
 pub(crate) fn served_model_roots(
     config: Option<&rocky_core::config::RockyConfig>,
     config_path: Option<&Path>,
@@ -119,15 +120,27 @@ pub(crate) fn served_model_roots(
     let mut roots: Vec<PathBuf> = Vec::new();
     if let (false, Some(config), Some(config_path)) = (models_dir_is_explicit, config, config_path)
     {
-        for tx in config
+        // The server compiles the union only when the loader accepts it. A
+        // refusal (a model name shared across pipelines, say) makes it compile
+        // `models_dir` alone, and these roots must match that compile.
+        let has_pipeline = config
             .pipelines
             .values()
-            .filter_map(|pipeline| pipeline.as_transformation())
-        {
-            if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
-                crate::models_loader::locate_models_dir(&tx.models, config_path)
+            .any(|pipeline| pipeline.as_transformation().is_some());
+        let union_loads = has_pipeline
+            && rocky_compiler::models_loader::load_transformation_models(config_path, config)
+                .is_ok();
+        if union_loads {
+            for tx in config
+                .pipelines
+                .values()
+                .filter_map(|pipeline| pipeline.as_transformation())
             {
-                roots.push(dir);
+                if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
+                    crate::models_loader::locate_models_dir(&tx.models, config_path)
+                {
+                    roots.push(dir);
+                }
             }
         }
     }
@@ -515,5 +528,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn served_roots_fall_back_to_models_dir_when_the_loader_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in ["models", "other"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(root.join(sub).join("dup.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                root.join(sub).join("dup.toml"),
+                "name = \"dup\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"dup\"\n",
+            )
+            .unwrap();
+        }
+        let config_path = root.join("rocky.toml");
+        let toml = |extra: &str| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n\n{extra}"
+            )
+        };
+        let second = "[pipeline.q]\ntype = \"transformation\"\nmodels = \"other/**\"\n\n\
+                      [pipeline.q.target.governance]\nauto_create_schemas = true\n";
+        let models_dir = root.join("models");
+
+        std::fs::write(&config_path, toml(second)).unwrap();
+        let config = rocky_core::config::load_optional_project_config(Some(&config_path))
+            .unwrap()
+            .unwrap();
+        // The same model name in two pipelines: the loader refuses.
+        assert_eq!(
+            served_model_roots(Some(&config), Some(&config_path), &models_dir, false),
+            [std::path::absolute(&models_dir).unwrap()]
+        );
+        // Without the clash both roots are served.
+        std::fs::remove_file(root.join("other").join("dup.sql")).unwrap();
+        std::fs::remove_file(root.join("other").join("dup.toml")).unwrap();
+        std::fs::write(root.join("other").join("solo.sql"), "SELECT 2 AS id\n").unwrap();
+        std::fs::write(
+            root.join("other").join("solo.toml"),
+            "name = \"solo\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"solo\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            served_model_roots(Some(&config), Some(&config_path), &models_dir, false).len(),
+            2
+        );
     }
 }
