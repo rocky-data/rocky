@@ -10808,11 +10808,19 @@
             "format": "uint",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "webhooks": {
+            "description": "Configured `[hook.webhooks]` endpoints. Each URL is cut to its scheme and host, because a webhook URL often carries a token in its path or query. Empty for a project with no webhooks.",
+            "items": {
+              "$ref": "#/components/schemas/WebhookEntry"
+            },
+            "type": "array"
           }
         },
         "required": [
           "hooks",
-          "total"
+          "total",
+          "webhooks"
         ],
         "type": "object"
       },
@@ -29025,6 +29033,63 @@
         ],
         "description": "Supports both single-webhook and multi-webhook syntax per event.\n\nSingle: `[hook.webhooks.on_pipeline_start]` Multiple: `[[hook.webhooks.on_pipeline_start]]`"
       },
+      "WebhookEntry": {
+        "description": "One configured webhook in [`HooksListOutput`].",
+        "properties": {
+          "async_mode": {
+            "description": "Whether the webhook is fire-and-forget.",
+            "type": "boolean"
+          },
+          "event": {
+            "type": "string"
+          },
+          "header_keys": {
+            "description": "Names of the headers the webhook sets. Never their values.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "method": {
+            "type": "string"
+          },
+          "on_failure": {
+            "type": "string"
+          },
+          "preset": {
+            "description": "The preset the webhook was built from, when it names one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retry_count": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "timeout_ms": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "url": {
+            "description": "The endpoint's scheme and host only (`https://hooks.example.com`). Never the path, query, port or credentials. A URL that does not parse prints as `<redacted>`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "async_mode",
+          "event",
+          "header_keys",
+          "method",
+          "on_failure",
+          "retry_count",
+          "timeout_ms",
+          "url"
+        ],
+        "type": "object"
+      },
       "WebhookSecretStatus": {
         "description": "Whether `ROCKY_WEBHOOK_SECRET` can actually sign a webhook.\n\nNamed by operator consequence rather than by error kind — the question this answers is \"what happens if I turn the scheduler on?\".",
         "oneOf": [
@@ -29406,6 +29471,58 @@
         ]
       }
     },
+    "/api/v1/catalog": {
+      "get": {
+        "description": "The column-level lineage snapshot: every asset with its typed columns, every edge, and each asset's last successful run. The same bytes as `rocky catalog --output json`, except `generated_at` and `duration_ms`. Built from the project the server already compiled: it compiles nothing, queries no warehouse and writes none of the CLI's `.rocky/catalog` files. Run history is read from the state store; a busy store is `503`, never a catalog with unknown run fields.",
+        "operationId": "getCatalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogOutput"
+                }
+              }
+            },
+            "description": "The catalog."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound `rocky.toml` or the state store could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Project-wide column lineage",
+        "tags": [
+          "lineage"
+        ]
+      }
+    },
     "/api/v1/compile": {
       "get": {
         "description": "Canonical compile result. Byte-identical to `rocky compile --output json`, except the wall-clock `compile_timings`, which is inherently non-deterministic.",
@@ -29778,6 +29895,79 @@
         ]
       }
     },
+    "/api/v1/gc/derivable": {
+      "get": {
+        "description": "The derivability inventory: which content-addressed artifacts a recorded recipe could rebuild. The same bytes as `rocky gc --derivable --dry-run --output json`. Reads the artifact ledger and writes nothing: no plan file, no review row, no eviction.",
+        "operationId": "getGcDerivable",
+        "parameters": [
+          {
+            "description": "Minimum written-age in days. Default: 7.",
+            "in": "query",
+            "name": "min_age_days",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GcReportOutput"
+                }
+              }
+            },
+            "description": "The inventory."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Derivable-artifact inventory",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
     "/api/v1/health": {
       "get": {
         "description": "Auth-exempt liveness probe. Server-lifecycle only: it carries no project state. No CLI counterpart.",
@@ -29798,6 +29988,48 @@
         "summary": "Liveness probe",
         "tags": [
           "meta"
+        ]
+      }
+    },
+    "/api/v1/hooks": {
+      "get": {
+        "description": "The shell hooks and the webhooks `rocky.toml` configures. The same bytes as `rocky hooks list --output json`. A command prints a resolved `${VAR}` as `${NAME}`. A webhook URL is cut to its scheme and host. Runs no hook and calls no endpoint.",
+        "operationId": "getHooks",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HooksListOutput"
+                }
+              }
+            },
+            "description": "The hooks."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound `rocky.toml` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Configured hooks",
+        "tags": [
+          "project"
         ]
       }
     },
@@ -30832,6 +31064,48 @@
         ]
       }
     },
+    "/api/v1/lint": {
+      "get": {
+        "description": "The style findings for every `.sql` file under the models directory, with the `[lint]` section of `rocky.toml` applied. The same findings as `rocky lint --output json` without `--fix`, with file paths relative to the project root. Rewrites nothing.",
+        "operationId": "getLint",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LintOutput"
+                }
+              }
+            },
+            "description": "The findings."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound `rocky.toml` or the models directory could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "SQL style findings",
+        "tags": [
+          "project"
+        ]
+      }
+    },
     "/api/v1/meta": {
       "get": {
         "description": "Feature-detection endpoint. Every field is computed per request (engine version, state-schema version, schema-set hash, config hash, capabilities, routes).",
@@ -31309,6 +31583,48 @@
         ]
       }
     },
+    "/api/v1/packages": {
+      "get": {
+        "description": "The packages recorded in `packages.lock` and how each one's files compare with the lockfile hashes. The same bytes as `rocky package list --output json`, except `lockfile`, which is the lockfile's name relative to the project root. Reads only.",
+        "operationId": "getPackages",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageListOutput"
+                }
+              }
+            },
+            "description": "The vendored packages."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The lockfile could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Vendored packages",
+        "tags": [
+          "project"
+        ]
+      }
+    },
     "/api/v1/policy": {
       "get": {
         "description": "The `[policy]` rules in file order with their positional ids (the `matched_rule` that `policy check` reports), the default agent effect, and the freezes in force that this read could see, from the decision ledger and the durable freeze markers. Read `freeze_sources` before treating the list as exhaustive: `not_consulted` means no `[policy]` block, so nothing is enforced; `local_mirror` means a remote `[state]` backend whose authoritative ledger this read-only route does not download, so another pod's freeze can be missing while an apply still denies. A missing `rocky.toml` is the default posture. A source that exists but cannot be read is a `500`, never an empty list. The same bytes as `rocky policy show --output json`.",
@@ -31690,6 +32006,69 @@
         "summary": "Every execution of one recipe",
         "tags": [
           "history"
+        ]
+      }
+    },
+    "/api/v1/retention": {
+      "get": {
+        "description": "Each model's declared retention. The same bytes as `rocky retention-status --output json` without `--drift`. It never probes the warehouse.",
+        "operationId": "getRetention",
+        "parameters": [
+          {
+            "description": "Report this model only.",
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionStatusOutput"
+                }
+              }
+            },
+            "description": "The declared retention."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "`model` names no model of the project."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Declared retention per model",
+        "tags": [
+          "project"
         ]
       }
     },
