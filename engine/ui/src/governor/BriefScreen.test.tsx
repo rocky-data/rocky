@@ -180,16 +180,20 @@ describe("BriefScreen", () => {
     expect(within(drift).queryByRole("table")).toBeNull();
 
     const freshness = screen.getByRole("region", { name: "Freshness" });
-    expect(
-      within(freshness).getByText(
-        `${NOT_RECORDED}: no freshness checks are configured, so nothing was observed`,
-      ),
-    ).toBeInTheDocument();
+    // A grey "-", the engine's reason in its title.
+    const missing = within(freshness).getByTitle(
+      `${NOT_RECORDED}: no freshness checks are configured, so nothing was observed`,
+    );
+    expect(missing).toHaveTextContent("-");
+    expect(missing).toHaveClass("text-muted");
+    expect(missing).not.toHaveClass("text-warn-ink");
     expect(within(freshness).queryByRole("table")).toBeNull();
 
     const cost = screen.getByRole("region", { name: "Cost" });
     expect(within(cost).getByText("run-cost-1")).toBeInTheDocument();
-    expect(within(cost).getAllByText(NOT_RECORDED).length).toBeGreaterThanOrEqual(2);
+    // Cost and cost per run are missing: two grey dashes, never the old words.
+    expect(within(cost).getAllByTitle(/no cost was recorded/).length).toBeGreaterThanOrEqual(2);
+    expect(within(cost).queryByText(NOT_RECORDED)).toBeNull();
 
     const autonomy = screen.getByRole("region", { name: "Agent limits" });
     expect(within(autonomy).getByText("freeze:global")).toBeInTheDocument();
@@ -278,7 +282,95 @@ describe("BriefScreen", () => {
     );
     const summary = await screen.findByRole("region", { name: "Summary" });
     expect(summary.textContent).not.toMatch(/Nothing needs you/);
-    expect(summary.textContent).toMatch(/Runs: not recorded\./);
+    expect(summary.textContent).toMatch(/Runs: -/);
+    expect(within(summary).getByTitle(/^not recorded/)).toHaveClass("text-muted");
+    // The card says the same, and does not say "caught up" over a section it could not read.
+    const card = screen.getByRole("region", { name: "Waiting on you" });
+    expect(within(card).getByText(/^Runs:/)).toBeInTheDocument();
+    expect(within(card).getByTitle(/^not recorded/)).toHaveTextContent("-");
+    expect(within(card).queryByText("You're all caught up")).toBeNull();
+  });
+
+  it("does not say caught up while a change freeze or degraded rule is in force", async () => {
+    render(
+      <BriefScreen
+        load={async () => ({
+          ...BRIEF,
+          escalations: { ...BRIEF.escalations, total: 0, pending: [] },
+          runs: { ...BRIEF.runs, attention: [] },
+        })}
+        now={NOW}
+      />,
+    );
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(summary.textContent).toMatch(/1 change freeze in force, 1 degraded rule/);
+    const card = screen.getByRole("region", { name: "Waiting on you" });
+    expect(within(card).queryByText("You're all caught up")).toBeNull();
+    expect(within(card).getByText(/Nothing to approve, but 1 change freeze in force, 1 degraded rule/)).toBeInTheDocument();
+  });
+
+  it("keeps the waiting card, then the digest line, then the details, in that order", async () => {
+    render(<BriefScreen load={async () => BRIEF} now={NOW} />);
+    const card = await screen.findByRole("region", { name: "Waiting on you" });
+    const digest = screen.getByText(/Digest generated/);
+    const details = screen.getByRole("heading", { name: "Details" });
+    expect(card.compareDocumentPosition(digest) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(digest.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("draws a blocked share in the blocked colour, never the failure colour", async () => {
+    render(
+      <BriefScreen
+        load={async () => ({
+          ...BRIEF,
+          agent_activity: { ...BRIEF.agent_activity, total: 3, deny: 1 },
+        })}
+        now={NOW}
+      />,
+    );
+    const activity = await screen.findByRole("region", { name: "Agent activity" });
+    const bar = within(activity).getByRole("img", { name: /1 blocked/ });
+    const blockedSegment = bar.lastElementChild as HTMLElement;
+    expect(blockedSegment).toHaveClass("bg-block");
+    expect(blockedSegment).not.toHaveClass("bg-fail");
+    const legend = within(activity).getByText("1 blocked", { ignore: "[aria-label]" });
+    expect(legend.firstElementChild).toHaveClass("bg-block");
+    expect(legend.firstElementChild).not.toHaveClass("bg-fail");
+  });
+
+  it("says who asked for what on which model, one line per decision, in plain words", async () => {
+    const pending = [
+      {
+        ...BRIEF.escalations.pending[0],
+        model: "revenue_daily",
+        capability: "schema_change.breaking" as const,
+        principal: "agent" as const,
+        decision_ref: "decision:esc-a",
+      },
+      {
+        ...BRIEF.escalations.pending[0],
+        model: "m_a",
+        capability: "backfill" as const,
+        principal: "human" as const,
+        decision_ref: "decision:esc-b",
+      },
+    ];
+    render(
+      <BriefScreen
+        load={async () => ({ ...BRIEF, escalations: { ...BRIEF.escalations, total: 2, pending } })}
+        now={NOW}
+      />,
+    );
+    const card = await screen.findByRole("region", { name: "Waiting on you" });
+    const lines = within(within(card).getByRole("list", { name: "Decisions in this change" })).getAllByRole(
+      "listitem",
+    );
+    expect(lines).toHaveLength(2);
+    expect(lines[0].textContent).toBe("make a breaking schema change·revenue_daily·agent");
+    expect(lines[1].textContent).toBe("backfill·m_a·human");
+    // The raw capability stays reachable, and never reads as the label.
+    expect(within(card).queryByText("schema_change.breaking")).toBeNull();
+    expect(within(lines[0]).getByTitle("schema_change.breaking")).toBeInTheDocument();
   });
 
   it("never counts a section it could not read in the summary line", async () => {
@@ -293,10 +385,10 @@ describe("BriefScreen", () => {
     );
     const summary = await screen.findByRole("region", { name: "Summary" });
     expect(summary.textContent).not.toMatch(/waits on you|Nothing needs you/);
-    expect(summary.textContent).toMatch(/Approval requests: not recorded\./);
-    expect(
-      within(screen.getByRole("region", { name: "Waiting on you" })).getByText(/^Approval requests: not recorded/),
-    ).toBeInTheDocument();
+    expect(summary.textContent).toMatch(/Approval requests: -/);
+    const card = screen.getByRole("region", { name: "Waiting on you" });
+    expect(within(card).getByText(/^Approval requests:/)).toBeInTheDocument();
+    expect(within(card).getAllByTitle(/^not recorded/)[0]).toHaveTextContent("-");
   });
 
   it("says a quiet window in the section's own words", async () => {

@@ -9,7 +9,7 @@ import type { PreviewRowsOutput } from "@rocky-types/preview_rows";
 import statusFixture from "@rocky-fixtures/review_status.json";
 import { ApiError } from "../api";
 import { READ_ONLY_REASON, WriteAccessProvider } from "../operator";
-import { PlanDetail, type PlanLoaders, describeFinding, productNameFromId } from "./PlanDetail";
+import { PlanDetail, type PlanLoaders, describeFinding, productNameFromId, replanCommand } from "./PlanDetail";
 
 // The status panel reads a payload captured from the live engine, so a shape
 // change there fails this test rather than passing against a hand-written
@@ -784,6 +784,36 @@ describe("PlanDetail", () => {
     );
     await screen.findByRole("region", { name: "Approval" });
     expect(project).not.toHaveBeenCalled();
+  });
+
+  it("names the command that re-plans, per kind, and none where the refusal cannot happen", async () => {
+    expect(replanCommand("run")).toBe("rocky plan");
+    expect(replanCommand("ai_authored")).toBe("rocky plan");
+    expect(replanCommand("backfill")).toBe("rocky backfill");
+    for (const kind of ["promote", "gc", "restore", "compact", "archive", "something_new"]) {
+      expect(replanCommand(kind)).toBeNull();
+    }
+    const { unmount } = render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "backfill", reviewed: true, product_id: undefined })) })}
+        />
+      </WriteAccessProvider>,
+    );
+    const hint = await screen.findByText(/plan_models_changed/);
+    expect(hint.querySelector("code")?.textContent).toBe("rocky backfill");
+    unmount();
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "gc", reviewed: true, product_id: undefined })) })}
+        />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("button", { name: "Apply change" });
+    expect(screen.queryByText(/plan_models_changed/)).toBeNull();
   });
 
   it("keeps Apply change for a change that is not an archive change", async () => {

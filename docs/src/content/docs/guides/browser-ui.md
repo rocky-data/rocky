@@ -62,13 +62,13 @@ To run the UI somewhere other than your own machine, use the [container image](/
 
 ## Inbox
 
-The sidebar shows a badge on Inbox and on Changes when decisions wait on you. The number is the count the Inbox lists. The page reads it again on each navigation, and every 30 seconds while the tab is visible. No badge means nothing waits, or the count could not be read (for example, while a run holds the state store).
+The sidebar shows a badge on Inbox when something waits on you, and on Changes when approval decisions wait. The Inbox badge counts what the **Waiting on you** card lists: approval decisions plus runs that need attention. The Changes badge counts decisions only. The page reads both again on each navigation, and every 30 seconds while the tab is visible. No badge means nothing waits, or a count could not be read (for example, while a run holds the state store). If the digest could not read the runs, the Inbox shows no badge, because it cannot vouch for a total. Open the Inbox to see which part is missing.
 
-The page shows the digest that `rocky brief` prints, for a window you pick (7 days by default). A summary line comes first: decisions waiting, how the runs went, and whether a change freeze or degraded rule is in force. Cards follow. The first lists each change that waits for approval as a row with a **Review change** button. The others are agent activity (with a bar of allowed, needed approval and blocked), runs, agent limits (degraded rules and active change freezes), cost, drift, freshness, quality and the scheduler.
+The page shows the digest that `rocky brief` prints, for a window you pick (7 days by default). The UI and the CLI use different words: the Inbox is `rocky brief` (it prints "Needs you"), an approval request is an escalation, and an action is a capability. A summary line comes first: decisions waiting, how the runs went, and whether a change freeze or degraded rule is in force. Cards follow. The first lists each change that waits for approval as a row with a **Review change** button. The others are agent activity (with a bar of allowed, needed approval and blocked), runs, agent limits (degraded rules and active change freezes), cost, drift, freshness, quality and the scheduler.
 
 ![The Inbox: a badge of 1 on Inbox and on Changes, a summary line saying one change waits and two runs succeeded, one change for revenue_daily with a Review change button, and a bar over ten agent decisions, five allowed and five that needed approval](/ui-governor-brief.png)
 
-A card says so when its data was not available. A signal the engine could not read shows as **not recorded**, never as zero. A part with nothing in the window says so in its own words, such as "no runs in the window".
+A card says so when its data was not available. A signal the engine could not read shows as a grey `-`, and hovering it gives the reason. It is never shown as zero. A part with nothing in the window says so in its own words, such as "no runs in the window".
 
 ## Project
 

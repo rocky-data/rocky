@@ -554,13 +554,7 @@ function Approval({
             onClick={() => apply.start({ plan_id: planId })}
           />
           <JobLine label="Apply change" view={apply.view} cancel={apply.cancel} />
-          {status.reviewed && (
-            <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Apply runs the models on disk, and first checks they still match this change. If
-              you edited them after the change was made, apply refuses (plan_models_changed):
-              run <code>rocky plan</code> and approve again.
-            </p>
-          )}
+          {status.reviewed && <ModelsChangedHint kind={status.kind} />}
         </div>
       )}
 
@@ -571,6 +565,40 @@ function Approval({
         </div>
       )}
     </section>
+  );
+}
+
+/**
+ * The command that makes a fresh plan after `plan_models_changed`, by plan
+ * kind, or `null` when that refusal does not apply to the kind. The engine
+ * runs the models check (`verify_plan_models_for_apply`) for run and
+ * AI-authored plans (made by `rocky plan`), for replication plans (also
+ * `rocky plan`, which checks its own config snapshot) and for backfill plans
+ * (made by `rocky backfill`, not `rocky plan`). Promote, gc, restore, compact
+ * and archive plans never refuse with it, so no hint is better than a wrong one.
+ */
+export function replanCommand(kind: string): string | null {
+  switch (kind) {
+    case "run":
+    case "ai_authored":
+    case "replication":
+      return "rocky plan";
+    case "backfill":
+      return "rocky backfill";
+    default:
+      return null;
+  }
+}
+
+function ModelsChangedHint({ kind }: { kind: string }) {
+  const command = replanCommand(kind);
+  if (command === null) return null;
+  return (
+    <p className="text-xs text-muted">
+      Apply runs the models on disk, and first checks they still match this change. If you edited
+      them after the change was made, apply refuses (plan_models_changed): run <code>{command}</code>
+      {kind === "backfill" ? " with the same flags" : ""} and approve again.
+    </p>
   );
 }
 
