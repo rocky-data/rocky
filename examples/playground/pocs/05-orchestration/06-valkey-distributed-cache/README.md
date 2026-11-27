@@ -12,6 +12,8 @@ through Valkey. `[state] backend = "valkey"` works in local redb and replicates
 to Valkey. `[cache.schemas] replicate = true` includes the schema cache, so a
 fresh instance warms up without re-describing sources.
 
+If Valkey is unreachable, state sync warns and the run continues on local state.
+
 `backend = "tiered"` means Valkey + S3 and also requires `s3_bucket`; this POC
 stays Valkey-only. The three-tier `rocky-cache` crate (memory, Valkey, source)
 is internal and not driven by the `rocky.toml` `[cache]` surface.
@@ -36,7 +38,7 @@ docker compose down   # cleanup
 
 ```text
 === Check Valkey state ===
-  rocky:state:poc:v32:state.redb        # only when Valkey (Docker) is running
+  rocky:state:poc:v<N>:state.redb        # only when Valkey (Docker) is running
 
 POC complete: replicated schema cache + Valkey state backend configured.
 ```
