@@ -11,6 +11,7 @@ export const GOVERNOR_TABS = [
   { id: "brief", label: "Brief", producer: "GET /api/v1/brief", area: "needs-you" },
   { id: "scorecard", label: "Agent activity", producer: "GET /api/v1/audit/scorecard", area: "governance" },
   { id: "agents", label: "Agents", producer: "GET /api/v1/audit?since=<N>d", area: "governance" },
+  { id: "compliance", label: "Compliance", producer: "GET /api/v1/compliance", area: "governance" },
   { id: "custody", label: "Trace", producer: "GET /api/v1/custody/{subject}", area: "governance" },
   { id: "audit", label: "Audit log", producer: "GET /api/v1/audit", area: "governance" },
   {
@@ -32,6 +33,7 @@ export function governorTabFromSegment(segment: string | undefined): GovernorTab
   switch (segment) {
     case "scorecard":
     case "agents":
+    case "compliance":
     case "custody":
     case "audit":
     case "products":

@@ -126,7 +126,11 @@ use crate::output::{
     WebhookSecretStatus, cap_model_sql,
 };
 
+use crate::commands::package::PackageListOutput;
 use crate::output::ConfigStatus;
+use crate::output::{
+    CatalogOutput, GcReportOutput, HooksListOutput, LintOutput, RetentionStatusOutput,
+};
 use crate::output::{ComplianceOutput, RecipeHistoryOutput, ReplayCheckOutput};
 use rocky_core::process::GroupSignal;
 use rocky_server::auth::TokenScope;
@@ -231,6 +235,12 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/compliance", get(compliance))
         .route("/api/v1/runs/{id}/replay-check", get(replay_check))
         .route("/api/v1/recipes/{hash}/history", get(recipe_history))
+        .route("/api/v1/catalog", get(catalog))
+        .route("/api/v1/packages", get(packages))
+        .route("/api/v1/hooks", get(hooks_list))
+        .route("/api/v1/retention", get(retention))
+        .route("/api/v1/gc/derivable", get(gc_derivable))
+        .route("/api/v1/lint", get(lint))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -487,11 +497,15 @@ impl ApiError {
     /// (e.g. a concurrent CLI `rocky run`) has no job id, so it stays `None`.
     /// `500` — a `rocky.toml` the engine could not read or parse. Deliberately
     /// not the retryable `503`: retrying will not make an invalid config parse.
+    ///
+    /// The message loses the TOML source snippet: the quoted line can hold a
+    /// literal token. The line, column and reason stay. The CLI's report is
+    /// unchanged.
     fn config_invalid(message: &str) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_invalid",
-            message,
+            without_toml_source_snippet(message),
             Some("fix the config and retry; `rocky validate` reports the specific error"),
         )
     }
@@ -1021,6 +1035,12 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/compliance",
         "GET /api/v1/runs/{id}/replay-check",
         "GET /api/v1/recipes/{hash}/history",
+        "GET /api/v1/catalog",
+        "GET /api/v1/packages",
+        "GET /api/v1/hooks",
+        "GET /api/v1/retention",
+        "GET /api/v1/gc/derivable",
+        "GET /api/v1/lint",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -2442,6 +2462,26 @@ struct ComplianceQuery {
     exceptions_only: bool,
 }
 
+/// Drop the source lines a TOML parse error quotes.
+///
+/// `toml` renders `TOML parse error at line L, column C`, then a gutter line
+/// (`  |`), the source line (`L | text`), a caret line (`  |   ^`) and the
+/// reason. Only the source line can carry a literal secret, but the whole
+/// snippet goes: the header already gives the line and column.
+fn without_toml_source_snippet(message: &str) -> String {
+    let is_snippet = |line: &str| {
+        let rest = line
+            .trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit());
+        rest.trim_start().starts_with('|')
+    };
+    message
+        .lines()
+        .filter(|line| !is_snippet(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `GET /api/v1/compliance` — canonical [`ComplianceOutput`].
 ///
 /// The same bytes as `rocky compliance --output json` for the project the
@@ -2553,6 +2593,293 @@ async fn recipe_history(
     })
     .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// The project root a pure read route reads from: the config's directory, or
+/// with no bound config the directory that holds the models directory.
+fn served_project_root(state: &ServerState) -> std::path::PathBuf {
+    match state.config_path.as_deref() {
+        Some(config) => crate::commands::product::product_command_root(config),
+        None => state
+            .models_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from("."),
+                std::path::Path::to_path_buf,
+            ),
+    }
+}
+
+/// The message of an error that reached a read route's response, with the
+/// absolute project root, models directory and working directory replaced by
+/// `.`, so the body names no absolute local path.
+///
+/// Only absolute forms are replaced. A relative root such as `models` is a
+/// word that ordinary text uses, and it names no local path by itself.
+fn scrubbed_message(message: &str, state: &ServerState) -> String {
+    let mut roots: Vec<String> = Vec::new();
+    let mut add = |path: &std::path::Path| {
+        if let Ok(absolute) = std::path::absolute(path) {
+            let absolute = absolute.display().to_string();
+            // `<root>/.` first, so the dot is not left behind.
+            roots.push(format!("{absolute}/."));
+            roots.push(absolute);
+        }
+    };
+    add(&served_project_root(state));
+    add(&state.models_dir);
+    if let Ok(cwd) = std::env::current_dir() {
+        add(&cwd);
+    }
+    // Longest first, so `/p/models` is replaced before `/p`.
+    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+    let mut message = message.to_string();
+    for root in roots {
+        if root.len() > 1 {
+            message = message.replace(&root, ".");
+        }
+    }
+    message
+}
+
+/// Map an error from a pure, config-reading route. A `rocky.toml` the engine
+/// cannot read is `500 config_invalid`; anything else is `500 internal_error`.
+/// Both messages are scrubbed of absolute paths.
+fn map_pure_read_err(err: &anyhow::Error, state: &ServerState) -> ApiError {
+    let message = scrubbed_message(&format!("{err:#}"), state);
+    if err
+        .downcast_ref::<rocky_core::config::ConfigError>()
+        .is_some()
+        || err
+            .downcast_ref::<crate::commands::LintConfigError>()
+            .is_some()
+    {
+        ApiError::config_invalid(&message)
+    } else {
+        ApiError::internal(message)
+    }
+}
+
+/// `GET /api/v1/catalog` — canonical [`CatalogOutput`].
+///
+/// The column-level lineage snapshot `rocky catalog --output json` prints,
+/// built from the project the server already compiled, with the descriptions
+/// of every model root. It compiles nothing, reads no warehouse and writes
+/// none of the CLI's `.rocky/catalog` files. Run history comes from the state
+/// store: a busy store is `503 engine_busy`, never a catalog with unknown run
+/// fields. A store that does not exist yet reads as empty and is not created.
+/// Before the first compile finishes it is `503 engine_not_ready`. With no
+/// bound config it still answers, as the CLI does.
+async fn catalog(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<CatalogOutput>, ApiError> {
+    if state.compile_result.read().await.is_none() {
+        return Err(ApiError::engine_not_ready());
+    }
+    let state_path = state_path_for(&state);
+    // The permit covers the run-history read only. The catalog is built after
+    // it is released.
+    let facts = store_read(&state, move || {
+        crate::commands::read_run_facts_request_scoped(&state_path)
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    let shared = Arc::clone(&state);
+    let output = tokio::task::spawn_blocking(move || {
+        let lock = shared.compile_result.blocking_read();
+        let result = lock.as_ref()?;
+        Some(crate::commands::catalog_output_from_compiled(
+            result,
+            shared.config_path.as_deref(),
+            &shared.models_dir,
+            shared.models_dir_is_explicit,
+            &facts,
+        ))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .ok_or_else(ApiError::engine_not_ready)?
+    .map_err(|e| map_pure_read_err(&e, &state))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/packages` — canonical [`PackageListOutput`].
+///
+/// What `rocky package list --output json` prints: the vendored packages in
+/// `rocky-packages.lock` and how each one's files compare with the lockfile
+/// hashes. It reads the lockfile and the files it names and writes nothing.
+/// `lockfile` is the lockfile's name relative to the project root, where the
+/// CLI prints its resolved path.
+async fn packages(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<PackageListOutput>, ApiError> {
+    let root = served_project_root(&state);
+    let output =
+        tokio::task::spawn_blocking(move || crate::commands::package::compute_package_list(&root))
+            .await
+            .map_err(|e| map_join_err(&e))?
+            .map_err(|e| map_pure_read_err(&e, &state))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/hooks` — canonical [`HooksListOutput`].
+///
+/// What `rocky hooks list --output json` prints, plus the `[hook.webhooks]`
+/// endpoints. Runs no hook and calls no endpoint. Each command is cut to its
+/// program name, followed by ` …` when arguments were dropped (`curl …`), or
+/// `…` alone when no plain program name can be told. An argument is never
+/// served. A webhook URL is cut to its scheme and host. The config loads the
+/// way the rest of `rocky serve` loads it: an unset adapter credential stays
+/// literal text. With no config the list is empty. A config that does not
+/// parse is `500 config_invalid`, without the quoted source line.
+async fn hooks_list(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<HooksListOutput>, ApiError> {
+    let config_path = state.config_path.clone();
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<HooksListOutput> {
+        let hooks = rocky_core::config::load_optional_project_config(config_path.as_deref())?
+            .map(|config| config.hooks)
+            .unwrap_or_default();
+        let registry = rocky_core::hooks::HookRegistry::from_config(&hooks);
+        Ok(crate::commands::hooks_list_output_program_only(&registry))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_pure_read_err(&e, &state))?;
+    Ok(PrettyJson(output))
+}
+
+/// Query string of `GET /api/v1/retention`.
+#[derive(Debug, Deserialize)]
+struct RetentionQuery {
+    /// Report one model only (`rocky retention-status --model`).
+    model: Option<String>,
+}
+
+/// `GET /api/v1/retention` — canonical [`RetentionStatusOutput`].
+///
+/// What `rocky retention-status --output json` prints without `--drift`: each
+/// model's declared retention, from the server's compiled project, through
+/// the function the CLI calls. It probes no warehouse. An unknown `model` is
+/// `404 model_not_found`.
+async fn retention(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<RetentionQuery>,
+) -> Result<PrettyJson<RetentionStatusOutput>, ApiError> {
+    if state.compile_result.read().await.is_none() {
+        return Err(ApiError::engine_not_ready());
+    }
+    let shared = Arc::clone(&state);
+    let output = tokio::task::spawn_blocking(move || {
+        let lock = shared.compile_result.blocking_read();
+        let result = lock.as_ref()?;
+        Some(crate::commands::retention_declared_output(
+            &result.project.models,
+            query.model.as_deref(),
+        ))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .ok_or_else(ApiError::engine_not_ready)?
+    .map_err(
+        |e| match e.downcast_ref::<crate::commands::ModelNotFound>() {
+            Some(missing) => ApiError::model_not_found(&missing.0),
+            None => ApiError::internal(scrubbed_message(&format!("{e:#}"), &state)),
+        },
+    )?;
+    Ok(PrettyJson(output))
+}
+
+/// Query string of `GET /api/v1/gc/derivable`.
+#[derive(Debug, Deserialize)]
+struct GcDerivableQuery {
+    /// Minimum written-age in days (`rocky gc --min-age-days`, default 7).
+    #[serde(default = "default_gc_min_age_days")]
+    min_age_days: i64,
+}
+
+fn default_gc_min_age_days() -> i64 {
+    7
+}
+
+/// `GET /api/v1/gc/derivable` — canonical [`GcReportOutput`].
+///
+/// The report `rocky gc --derivable --dry-run --output json` prints. It reads
+/// the artifact ledger and writes nothing: no plan file, no review row, no
+/// eviction. The plan and apply paths are not reachable from this route. The
+/// store permit covers the ledger reads only; the verdicts (IR and SQL
+/// parsing) are computed after it is released.
+async fn gc_derivable(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<GcDerivableQuery>,
+) -> Result<PrettyJson<GcReportOutput>, ApiError> {
+    // The rebuild-cost inputs come from the config. Like the CLI, a project
+    // with no `rocky.toml` just omits the USD estimates; one that does not
+    // parse is `config_invalid`.
+    let config_path = state.config_path.clone();
+    let adapter = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<crate::commands::AdapterCost>> {
+            let Some(config_path) = config_path else {
+                return Ok(None);
+            };
+            match rocky_core::config::load_optional_project_config(Some(&config_path))? {
+                Some(config) => Ok(crate::commands::adapter_cost_from_config(&config)),
+                None => Ok(None),
+            }
+        },
+    )
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_pure_read_err(&e, &state))?;
+    let state_path = state_path_for(&state);
+    let facts = store_read(&state, move || {
+        crate::commands::read_gc_facts_request_scoped(&state_path)
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    let output = tokio::task::spawn_blocking(move || {
+        crate::commands::gc_report_from_facts(
+            facts,
+            adapter.as_ref(),
+            chrono::Utc::now(),
+            query.min_age_days,
+        )
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/lint` — canonical [`LintOutput`].
+///
+/// What `rocky lint --output json` prints without `--fix`: the style findings
+/// for every `.sql` file under every pipeline's models directory (the models
+/// directory itself with no pipeline), with the `[lint]` section of
+/// `rocky.toml` applied. It rewrites nothing. File paths are relative to the
+/// project root.
+async fn lint(State(state): State<Arc<ServerState>>) -> Result<PrettyJson<LintOutput>, ApiError> {
+    let config_path = state.config_path.clone();
+    let models_dir = state.models_dir.clone();
+    let explicit = state.models_dir_is_explicit;
+    let root = served_project_root(&state);
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<LintOutput> {
+        let config = rocky_core::config::load_optional_project_config(config_path.as_deref())?;
+        let roots = crate::commands::served_model_roots(
+            config.as_ref(),
+            config_path.as_deref(),
+            &models_dir,
+            explicit,
+        );
+        let lint_config = config.map(|config| config.lint).unwrap_or_default();
+        // Absolute, so every file maps to a project-relative path.
+        let root = std::path::absolute(&root)?;
+        crate::commands::lint_report(&lint_config, &roots, &root)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_pure_read_err(&e, &state))?;
     Ok(PrettyJson(output))
 }
 
@@ -5273,8 +5600,9 @@ mod tests {
     }
 
     fn test_state() -> Arc<ServerState> {
-        // Skip the spawned initial compile — tests hit the router directly
-        // and `recompile()` explicitly where a warmed graph is needed.
+        // No config. `ServerState::new` still spawns the initial compile, so
+        // a test that needs "no compile yet" must wait for it and clear
+        // `compile_result`; one that needs a warmed graph waits for it.
         ServerState::new(simple_project_models(), None, None)
     }
 
@@ -6782,6 +7110,719 @@ mod tests {
         assert_eq!(resp.status(), 500);
         let err: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(err.code, "config_invalid");
+    }
+
+    // --- /catalog, /packages, /hooks, /retention, /gc/derivable, /lint ---
+
+    const PURE_HOOK_VAR: &str = "ROCKY_UI_PURE_ROUTES_HOOK_TOKEN";
+    const PURE_HOOK_SECRET: &str = "rocky-ui-hook-secret-3d91c7";
+    const PURE_WEBHOOK_URL: &str =
+        "https://hooks.example.com:8443/services/T000/B000/WEBHOOKPATHTOKEN?key=QUERYTOKEN";
+
+    /// A project that compiles: the three `simple_project` models (one with a
+    /// 90-day retention, one with a style finding), a config with a shell
+    /// hook and a webhook, one derivable artifact in the state store.
+    /// Returns the server (pinned to that store), the project root, the
+    /// config path and the state path.
+    fn pure_routes_fixture(dir: &std::path::Path) -> (Arc<ServerState>, PathBuf, PathBuf, PathBuf) {
+        let root = dir.join("project");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for entry in std::fs::read_dir(simple_project_models()).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), models.join(entry.file_name())).unwrap();
+        }
+        let sidecar = models.join("raw_orders.toml");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, format!("retention = \"90d\"\n{text}")).unwrap();
+        let sql = models.join("customer_orders.sql");
+        let text = std::fs::read_to_string(&sql).unwrap();
+        std::fs::write(&sql, format!("{}  \n", text.trim_end())).unwrap();
+
+        // SAFETY: test-only; the variable name is unique to these tests and
+        // is never removed, so no concurrent test sees it change.
+        unsafe { std::env::set_var(PURE_HOOK_VAR, PURE_HOOK_SECRET) };
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+                 [[hook.on_pipeline_start]]\n\
+                 command = \"notify.sh --token ${{{PURE_HOOK_VAR}}}\"\n\n\
+                 [hook.webhooks.on_pipeline_complete]\nurl = \"{PURE_WEBHOOK_URL}\"\n\
+                 [hook.webhooks.on_pipeline_complete.headers]\nAuthorization = \"Bearer WEBHOOKHEADERTOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        let state_path = dir.join("state.redb");
+        crate::commands::seed_one_derivable_for_route_test(&state_path);
+        let state = pinned_server(models, Some(config.clone()), &state_path);
+        (state, root, config, state_path)
+    }
+
+    async fn wait_compiled(state: &ServerState) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while state.compile_result.read().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the project compiles");
+    }
+
+    /// Every file under `dir` with its bytes, so a test can prove a request
+    /// changed nothing.
+    fn tree_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(dir, &mut out);
+        out
+    }
+
+    /// `body` as JSON with the clock-derived catalog fields removed.
+    fn catalog_without_clock(text: &str) -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(text).unwrap();
+        value.as_object_mut().unwrap().remove("generated_at");
+        value["stats"]
+            .as_object_mut()
+            .unwrap()
+            .remove("duration_ms");
+        value
+    }
+
+    /// No hook command argument reaches the `/hooks` body, whatever form the
+    /// secret takes.
+    #[tokio::test]
+    async fn hooks_route_serves_the_program_and_no_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, config, _state_path) = pure_routes_fixture(dir.path());
+        let secrets = [
+            "BearerSECRET1",
+            "PASSWORDSECRET2",
+            "USERSECRET3",
+            "PWSECRET3",
+            "QUOTEDSECRET4",
+            "TOKENSECRET5",
+            "APIKEYSECRET6",
+            "HEADERSECRET7",
+            "QUOTEDASSIGNS8",
+            "ESCAPEDASSIGNS9",
+            "SUBSHELLS10",
+            "BACKTICKS11",
+        ];
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        for command in [
+            "curl -H 'Authorization: Bearer BearerSECRET1' https://api.example.com/x",
+            "deploy.sh --password=PASSWORDSECRET2",
+            "curl -u USERSECRET3:PWSECRET3 https://h.example/x",
+            "echo \u{201c}https://h.example/QUOTEDSECRET4",
+            "notify.sh token=TOKENSECRET5 https://h.example/y",
+            "notify.sh apikey=APIKEYSECRET6",
+            "curl -H 'X-Api-Key: HEADERSECRET7' https://h.example/z",
+            "AUTH='Bearer QUOTEDASSIGNS8' curl x",
+            "FOO=bar\\ ESCAPEDASSIGNS9 cmd",
+            "A=$(echo SUBSHELLS10 x) cmd",
+            "A=`BACKTICKS11` cmd",
+        ] {
+            text.push_str(&format!(
+                "\n[[hook.on_pipeline_error]]\ncommand = {command:?}\n"
+            ));
+        }
+        std::fs::write(&config, &text).unwrap();
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/hooks")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        for secret in secrets {
+            assert!(!body.contains(secret), "{secret} leaked: {body}");
+        }
+        for fragment in [
+            "Bearer",
+            "--password",
+            "-u ",
+            "token=",
+            "apikey=",
+            "X-Api-Key",
+        ] {
+            assert!(!body.contains(fragment), "{fragment} leaked: {body}");
+        }
+        assert!(body.contains("\"command\": \"curl …\""), "{body}");
+    }
+
+    /// A syntax error on a line that holds a literal token reports the line
+    /// and column, never the line's text, on every config-reading route.
+    #[tokio::test]
+    async fn config_invalid_bodies_carry_no_toml_source_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, config, _state_path) = pure_routes_fixture(dir.path());
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\n\n[[hook.on_pipeline_start]]\n\
+             command = \"curl -H 'Bearer ERRSECRET1'\n",
+        )
+        .unwrap();
+        let base = spawn_router(state).await;
+        for path in ["/api/v1/hooks", "/api/v1/compliance"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 500, "{path}");
+            let body = resp.text().await.unwrap();
+            assert!(body.contains("config_invalid"), "{path}: {body}");
+            assert!(body.contains("line 5"), "{path}: {body}");
+            assert!(!body.contains("ERRSECRET1"), "{path}: {body}");
+        }
+    }
+
+    /// Each route answers 200 with the command's payload, names no absolute
+    /// path, leaks no secret, and writes nothing under the project or state.
+    #[tokio::test]
+    async fn pure_read_routes_match_the_command_and_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, root, config, state_path) = pure_routes_fixture(dir.path());
+        wait_compiled(&state).await;
+        let models_dir = state.models_dir.clone();
+        let base = spawn_router(Arc::clone(&state)).await;
+        let before = tree_snapshot(dir.path());
+
+        // /catalog
+        let resp = reqwest::get(format!("{base}/api/v1/catalog"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::compute_catalog_output(&config, &state_path, &models_dir, None)
+                .unwrap()
+        };
+        assert_eq!(
+            catalog_without_clock(&text),
+            catalog_without_clock(&reference_bytes(&expected))
+        );
+        assert_eq!(expected.assets.len(), 3);
+        assert_eq!(expected.last_run_id.as_deref(), Some("r1"));
+        assert!(!text.contains(dir.path().to_str().unwrap()), "{text}");
+
+        // /packages: absent lockfile, then a lockfile naming one missing file.
+        let resp = reqwest::get(format!("{base}/api/v1/packages"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let none: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(none["count"], 0);
+        assert_eq!(none["lockfile"], "rocky-packages.lock");
+        let lock = rocky_compiler::import::dbt_package::PackagesLock {
+            version: 1,
+            packages: vec![rocky_compiler::import::dbt_package::LockedPackage {
+                name: "stripe".into(),
+                hub: "fivetran/stripe".into(),
+                version: "1.0.0".into(),
+                files: [("models/packages/stripe/a.sql".to_string(), "h".to_string())].into(),
+                ..Default::default()
+            }],
+        };
+        std::fs::write(
+            root.join("rocky-packages.lock"),
+            toml::to_string(&lock).unwrap(),
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/packages"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = crate::commands::package::compute_package_list(&root).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+        assert_eq!(expected.count, 1);
+        assert_eq!(
+            expected.packages[0].files_missing,
+            ["models/packages/stripe/a.sql"]
+        );
+        let before = {
+            let mut snapshot = before;
+            snapshot.insert(
+                root.join("rocky-packages.lock"),
+                std::fs::read(root.join("rocky-packages.lock")).unwrap(),
+            );
+            snapshot
+        };
+
+        // /hooks: `${NAME}` for the command, scheme and host for the webhook.
+        let resp = reqwest::get(format!("{base}/api/v1/hooks")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let loaded = rocky_core::config::load_rocky_config(&config).unwrap();
+        let registry = rocky_core::hooks::HookRegistry::from_config(&loaded.hooks);
+        assert_eq!(
+            text,
+            reference_bytes(&crate::commands::hooks_list_output_program_only(&registry))
+        );
+        assert!(text.contains("\"command\": \"notify.sh …\""), "{text}");
+        assert!(!text.contains("--token"), "no argument is served: {text}");
+        assert!(
+            text.contains("\"url\": \"https://hooks.example.com\""),
+            "{text}"
+        );
+        for leaked in [
+            PURE_HOOK_SECRET,
+            "WEBHOOKPATHTOKEN",
+            "QUERYTOKEN",
+            "WEBHOOKHEADERTOKEN",
+            "8443",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
+        assert!(
+            text.contains("\"Authorization\""),
+            "header NAMES are listed"
+        );
+
+        // /retention
+        let resp = reqwest::get(format!("{base}/api/v1/retention"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let compiled = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: models_dir.clone(),
+            contracts_dir: None,
+            source_schemas: std::collections::HashMap::new(),
+            ..Default::default()
+        })
+        .unwrap();
+        let expected =
+            crate::commands::retention_declared_output(&compiled.project.models, None).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+        let resp = reqwest::get(format!("{base}/api/v1/retention?model=raw_orders"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let one: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(one["models"].as_array().unwrap().len(), 1);
+        assert_eq!(one["models"][0]["configured_days"], 90);
+
+        // /gc/derivable
+        let resp = reqwest::get(format!("{base}/api/v1/gc/derivable"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let adapter = crate::commands::adapter_cost_from_config(&loaded);
+        let expected = {
+            let _gate = store_gate(&state).await;
+            // The CLI's own path: the live store, no request budget.
+            let store =
+                rocky_core::state::StateStore::open_read_only_or_empty(&state_path).unwrap();
+            crate::commands::gather_gc_report(&store, adapter.as_ref(), chrono::Utc::now(), 7)
+                .unwrap()
+        };
+        assert_eq!(text, reference_bytes(&expected));
+        assert_eq!(expected.derivable_count, 1);
+        let resp = reqwest::get(format!("{base}/api/v1/gc/derivable?min_age_days=60"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let young: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            young["derivable_count"], 0,
+            "a 30-day-old artifact is too young"
+        );
+        let resp = reqwest::get(format!("{base}/api/v1/gc/derivable?min_age_days=soon"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        // /lint: project-relative paths.
+        let resp = reqwest::get(format!("{base}/api/v1/lint")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = crate::commands::lint_report(
+            &rocky_core::config::LintConfig::default(),
+            std::slice::from_ref(&models_dir),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+        assert!(!expected.findings.is_empty(), "the fixture has a finding");
+        assert!(
+            expected
+                .findings
+                .iter()
+                .all(|f| f.file.starts_with("models/") && !f.file.starts_with('/')),
+            "{:?}",
+            expected
+                .findings
+                .iter()
+                .map(|f| &f.file)
+                .collect::<Vec<_>>()
+        );
+        assert!(!text.contains(dir.path().to_str().unwrap()), "{text}");
+
+        // Nothing under the project or the state store changed.
+        assert_eq!(tree_snapshot(dir.path()), before);
+    }
+
+    /// An unknown model of `/retention` is `404 model_not_found`; a server
+    /// with no bound config or no compile answers `503 engine_not_ready`.
+    #[tokio::test]
+    async fn pure_read_routes_404_and_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, _config, _state_path) = pure_routes_fixture(dir.path());
+        wait_compiled(&state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
+        let resp = reqwest::get(format!("{base}/api/v1/retention?model=no_such_model"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "model_not_found");
+
+        // `ServerState::new` always spawns the initial compile, so a fresh
+        // state can gain a compile while the requests run. Let that compile
+        // land, then clear it, so "no compile yet" holds for every request.
+        let bare_state = test_state();
+        wait_compiled(&bare_state).await;
+        *bare_state.compile_result.write().await = None;
+        let bare = spawn_router(bare_state).await;
+        // Both need the server's compile.
+        for path in ["/api/v1/catalog", "/api/v1/retention"] {
+            let resp = reqwest::get(format!("{bare}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_not_ready", "{path}");
+        }
+        // Neither needs a config, as the CLI does not: no lockfile and no
+        // hooks are an empty answer, not a retryable 503.
+        for (path, empty_key) in [("/api/v1/packages", "packages"), ("/api/v1/hooks", "hooks")] {
+            let resp = reqwest::get(format!("{bare}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body[empty_key], serde_json::json!([]), "{path}");
+        }
+    }
+
+    /// A relative directory under the working directory, removed on drop, so
+    /// a test can serve a project through relative paths without changing the
+    /// process-wide working directory.
+    struct RelativeDir(PathBuf);
+
+    impl RelativeDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = PathBuf::from(format!(".ui-relative-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for RelativeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Two pipelines (`models/` and `other/`), a model in each, the second
+    /// with a documented column and a style finding. `base` may be relative.
+    /// Returns the config path, models dir and state path as given.
+    fn pipelines_project(
+        base: &std::path::Path,
+        with_config: bool,
+    ) -> (Option<PathBuf>, PathBuf, PathBuf) {
+        let project = base.join("project");
+        let models = project.join("models");
+        let other = project.join("other");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        for entry in std::fs::read_dir(simple_project_models()).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), models.join(entry.file_name())).unwrap();
+        }
+        std::fs::write(other.join("extra.sql"), "SELECT 1 AS id  \n").unwrap();
+        std::fs::write(
+            other.join("extra.toml"),
+            "name = \"extra\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"extra\"\n\n\
+             [columns.id]\ndescription = \"the extra id\"\n",
+        )
+        .unwrap();
+        let config = project.join("rocky.toml");
+        if with_config {
+            std::fs::write(
+                &config,
+                "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+                 [pipeline.q]\ntype = \"transformation\"\nmodels = \"other/**\"\n\n\
+                 [pipeline.q.target.governance]\nauto_create_schemas = true\n",
+            )
+            .unwrap();
+        }
+        (
+            with_config.then_some(config),
+            models,
+            base.join("state.redb"),
+        )
+    }
+
+    /// Served through RELATIVE paths, with two pipeline roots: `/lint` and
+    /// `/catalog` cover both roots, no body names the working directory, and
+    /// every file path is project-relative.
+    #[tokio::test]
+    async fn pure_read_routes_serve_relative_paths_and_every_pipeline_root() {
+        let rel = RelativeDir::new();
+        let (config, models, state_path) = pipelines_project(&rel.0, true);
+        let state = pinned_server(models, config, &state_path);
+        wait_compiled(&state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+
+        let resp = reqwest::get(format!("{base}/api/v1/lint")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        assert!(!text.contains(&cwd), "{text}");
+        let lint: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let files: std::collections::BTreeSet<&str> = lint["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["file"].as_str().unwrap())
+            .collect();
+        assert!(files.contains("other/extra.sql"), "{files:?}");
+        assert!(lint["files_checked"].as_u64().unwrap() >= 4, "{text}");
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.starts_with('/') && !f.starts_with('.')),
+            "{files:?}"
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/catalog"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        assert!(!text.contains(&cwd), "{text}");
+        let catalog: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let extra = catalog["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["model_name"] == "extra")
+            .expect("the second pipeline's model is in the catalog");
+        let id = extra["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "id")
+            .unwrap();
+        assert_eq!(id["description"], "the extra id", "{extra}");
+
+        for path in ["/api/v1/packages", "/api/v1/hooks", "/api/v1/retention"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            assert!(!resp.text().await.unwrap().contains(&cwd), "{path}");
+        }
+
+        // An error names no absolute path either.
+        std::fs::write(
+            state.config_path.as_ref().unwrap(),
+            "this is [not valid toml",
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/lint")).await.unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "config_invalid");
+        assert!(!err.message.contains(&cwd), "{}", err.message);
+    }
+
+    /// With no `rocky.toml` the routes answer as the CLI does: the catalog
+    /// has an `unknown` project and config hash, lint reads the models
+    /// directory, hooks and packages are empty.
+    #[tokio::test]
+    async fn pure_read_routes_serve_a_project_with_no_config() {
+        let rel = RelativeDir::new();
+        let (_config, models, state_path) = pipelines_project(&rel.0, false);
+        let state = pinned_server(models, None, &state_path);
+        wait_compiled(&state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/lint")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let lint: serde_json::Value = resp.json().await.unwrap();
+        assert!(lint["files_checked"].as_u64().unwrap() >= 3);
+        assert!(
+            lint["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f["file"].as_str().unwrap().starts_with("models/")),
+            "{lint}"
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/catalog"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let catalog: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(catalog["project_name"], "unknown");
+        assert_eq!(catalog["config_hash"], "unknown");
+
+        let resp = reqwest::get(format!("{base}/api/v1/hooks")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let hooks: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(hooks["total"], 0);
+    }
+
+    /// A models directory with no parent (`models`) has the working directory
+    /// as its project root, and a relative root is never replaced inside a
+    /// message: only absolute forms are scrubbed.
+    #[tokio::test]
+    async fn scrubbing_replaces_absolute_roots_only() {
+        let state = ServerState::new(PathBuf::from("models"), None, None);
+        assert_eq!(served_project_root(&state), PathBuf::from("."));
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let message = format!("reading models/a.sql under {cwd}/. and {cwd}/models failed");
+        assert_eq!(
+            scrubbed_message(&message, &state),
+            "reading models/a.sql under . and . failed"
+        );
+    }
+
+    /// `/catalog` and `/gc/derivable` open the store through the funnel
+    /// (`with_store`), once per request, with the request-scoped cache budget.
+    /// This probes those two routes only. It does not count opens made
+    /// outside the funnel.
+    #[tokio::test]
+    async fn catalog_and_gc_open_the_store_through_the_request_scoped_funnel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, _config, state_path) = pure_routes_fixture(dir.path());
+        wait_compiled(&state).await;
+        let base = spawn_router(state).await;
+        for path in ["/api/v1/catalog", "/api/v1/gc/derivable"] {
+            let before = crate::commands::open_probe::budgets_for(&state_path).len();
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            let opens = crate::commands::open_probe::budgets_for(&state_path);
+            assert_eq!(
+                opens.len(),
+                before + 1,
+                "{path} opened the store off the funnel"
+            );
+            assert_eq!(
+                opens.last(),
+                Some(&crate::commands::StoreBudget::RequestScoped),
+                "{path}"
+            );
+        }
+    }
+
+    /// A store another handle holds is `503 engine_busy` on `/catalog` and
+    /// `/gc/derivable`, never a catalog with unknown run fields or an empty
+    /// report.
+    #[tokio::test]
+    async fn catalog_and_gc_answer_503_on_a_busy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, _config, state_path) = pure_routes_fixture(dir.path());
+        wait_compiled(&state).await;
+        let held = {
+            let _gate = store_gate(&state).await;
+            rocky_core::state::StateStore::open(&state_path).unwrap()
+        };
+        let base = spawn_router(state).await;
+        for path in ["/api/v1/catalog", "/api/v1/gc/derivable"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_busy", "{path}");
+        }
+        drop(held);
+    }
+
+    /// An absent state file is `200` on the two store-backed routes, and the
+    /// request creates no file.
+    #[tokio::test]
+    async fn catalog_and_gc_do_not_create_an_absent_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _root, config, _state_path) = pure_routes_fixture(dir.path());
+        let absent = dir.path().join("absent-state.redb");
+        let other = pinned_server(state.models_dir.clone(), Some(config), &absent);
+        wait_compiled(&other).await;
+        assert!(!absent.exists(), "the compile created the state file");
+        let base = spawn_router(other).await;
+        for path in ["/api/v1/catalog", "/api/v1/gc/derivable"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            assert!(!absent.exists(), "{path} created the state file");
+        }
+    }
+
+    /// A config that does not parse is `config_invalid` on every route that
+    /// reads it, an unknown `[lint]` rule too, and no message names an
+    /// absolute path. A lockfile that does not parse is `internal_error`.
+    #[tokio::test]
+    async fn pure_read_routes_error_wiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, root, config, _state_path) = pure_routes_fixture(dir.path());
+        wait_compiled(&state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        std::fs::write(root.join("rocky-packages.lock"), "this is [not valid toml").unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/packages"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "internal_error");
+        assert!(
+            !err.message.contains(dir.path().to_str().unwrap()),
+            "{}",
+            err.message
+        );
+
+        std::fs::write(&config, "this is [not valid toml").unwrap();
+        for path in [
+            "/api/v1/catalog",
+            "/api/v1/hooks",
+            "/api/v1/gc/derivable",
+            "/api/v1/lint",
+        ] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 500, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "config_invalid", "{path}");
+            assert!(
+                !err.message.contains(dir.path().to_str().unwrap()),
+                "{path}: {}",
+                err.message
+            );
+        }
+
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+             [lint]\ndisable = [\"S999\"]\n",
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/lint")).await.unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "config_invalid");
+        assert!(err.message.contains("S999"), "{}", err.message);
     }
 
     // --- /review ---

@@ -3,6 +3,7 @@ import { navigateTo, pathForLane, useSegments } from "../router";
 import { AgentsScreen } from "./AgentsScreen";
 import { AuditScreen } from "./AuditScreen";
 import { BriefScreen } from "./BriefScreen";
+import { ComplianceScreen } from "./ComplianceScreen";
 import { CustodyScreen } from "./CustodyScreen";
 import { ProductsScreen } from "./ProductsScreen";
 import { ScorecardScreen } from "./ScorecardScreen";
@@ -25,6 +26,7 @@ export function GovernorScreen({
   brief,
   scorecard,
   agents,
+  compliance,
   custody,
   audit,
   products,
@@ -32,6 +34,7 @@ export function GovernorScreen({
   brief?: ReactNode;
   scorecard?: ReactNode;
   agents?: ReactNode;
+  compliance?: ReactNode;
   custody?: (subject: string | null) => ReactNode;
   audit?: (product: string | null) => ReactNode;
   products?: (name: string | null) => ReactNode;
@@ -54,6 +57,9 @@ export function GovernorScreen({
       break;
     case "agents":
       screen = agents ?? <AgentsScreen />;
+      break;
+    case "compliance":
+      screen = compliance ?? <ComplianceScreen />;
       break;
     case "custody":
       screen = custody ? custody(subject) : <CustodyScreen subject={subject} />;

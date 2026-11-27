@@ -1,8 +1,10 @@
 import type { ReactNode } from "react";
 import { XMarkIcon } from "@heroicons/react/20/solid";
+import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import { StatusCard } from "../components";
 import { orNotRecorded } from "../format";
+import { RebuildCheck, type RecipeHistoryLoader, type ReplayCheckLoader } from "./RebuildCheck";
 import { type Resource, useResource } from "./useResource";
 
 /**
@@ -14,12 +16,20 @@ export function ModelDetail({
   load,
   onClose,
   actions,
+  runs,
+  replayCheck,
+  recipeHistory,
 }: {
   name: string;
   load: (name: string) => Promise<ModelDetailOutput>;
   onClose: () => void;
   /** Run and Plan for this one model, drawn under its name. */
   actions?: ReactNode;
+  /** The runs list the screen holds: the rebuild check picks its run from it. */
+  runs: Resource<HistoryOutput>;
+  /** The rebuild check's two reads. Left out, the panel reads the real routes. */
+  replayCheck?: ReplayCheckLoader;
+  recipeHistory?: RecipeHistoryLoader;
 }) {
   const detail = useResource(() => load(name), [name]);
   return (
@@ -44,12 +54,24 @@ export function ModelDetail({
         </button>
       </div>
       {actions !== undefined && <div className="mb-4">{actions}</div>}
-      <DetailBody name={name} detail={detail} />
+      <DetailBody name={name} detail={detail} runs={runs} replayCheck={replayCheck} recipeHistory={recipeHistory} />
     </aside>
   );
 }
 
-function DetailBody({ name, detail }: { name: string; detail: Resource<ModelDetailOutput> }) {
+function DetailBody({
+  name,
+  detail,
+  runs,
+  replayCheck,
+  recipeHistory,
+}: {
+  name: string;
+  detail: Resource<ModelDetailOutput>;
+  runs: Resource<HistoryOutput>;
+  replayCheck?: ReplayCheckLoader;
+  recipeHistory?: RecipeHistoryLoader;
+}) {
   switch (detail.kind) {
     case "loading":
       return <p className="text-xs text-zinc-500">Loading {name}…</p>;
@@ -116,6 +138,7 @@ function DetailBody({ name, detail }: { name: string; detail: Resource<ModelDeta
             {orNotRecorded(model.upstream.length)} upstream, {orNotRecorded(model.downstream.length)}{" "}
             downstream
           </p>
+          <RebuildCheck name={name} runs={runs} load={replayCheck} loadHistory={recipeHistory} />
         </div>
       );
     }

@@ -182,7 +182,35 @@ pub(crate) fn with_store<T>(
     };
     let out = read(&store);
     drop(store);
+    #[cfg(test)]
+    open_probe::record(state_path, budget);
     out
+}
+
+/// Which budget each state path was opened with through [`with_store`], so a
+/// route test can prove its read went through the funnel and not around it.
+#[cfg(test)]
+pub(crate) mod open_probe {
+    use super::StoreBudget;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OPENS: Mutex<Vec<(PathBuf, StoreBudget)>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(path: &Path, budget: StoreBudget) {
+        OPENS.lock().unwrap().push((path.to_path_buf(), budget));
+    }
+
+    /// The budgets `path` was opened with, oldest first.
+    pub(crate) fn budgets_for(path: &Path) -> Vec<StoreBudget> {
+        OPENS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == path)
+            .map(|(_, budget)| *budget)
+            .collect()
+    }
 }
 
 /// [`with_store`] with [`StoreBudget::RequestScoped`].

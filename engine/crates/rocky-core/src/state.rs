@@ -9104,6 +9104,29 @@ impl StateStore {
         Ok(count)
     }
 
+    /// The [`Self::refcount_for_hash`] answer for every hash in the ledger,
+    /// in one pass over the table.
+    ///
+    /// A caller that needs the count for many hashes must use this: calling
+    /// `refcount_for_hash` per hash scans the whole table each time, so the
+    /// work grows with the square of the ledger.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::refcount_for_hash`]; callers in a VACUUM path
+    /// should treat them as "do not delete".
+    pub fn artifact_refcounts(&self) -> Result<std::collections::HashMap<String, u64>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+            *counts.entry(record.blake3_hash).or_default() += 1;
+        }
+        Ok(counts)
+    }
+
     // -----------------------------------------------------------------------
     // Branches (schema-prefix virtual branches)
     // -----------------------------------------------------------------------
@@ -14212,6 +14235,42 @@ mod tests {
             ids(&budgeted_page),
             "a cache budget must not change what a read-only open reads"
         );
+    }
+
+    /// `artifact_refcounts` answers what `refcount_for_hash` answers for every
+    /// hash, in one pass, and has no entry for a hash with no row.
+    #[test]
+    fn artifact_refcounts_match_the_per_hash_count() {
+        let (store, _dir) = temp_store();
+        let row = |run: &str, model: &str, hash: &str| ArtifactRecord {
+            blake3_hash: hash.to_string(),
+            run_id: run.to_string(),
+            model_name: model.to_string(),
+            file_path: format!("s3://b/{run}-{model}.parquet"),
+            commit_version: 0,
+            size_bytes: 1,
+            written_at: Utc::now(),
+        };
+        for r in [
+            row("r1", "a", "h-one"),
+            row("r1", "b", "h-three"),
+            row("r2", "b", "h-three"),
+            row("r3", "b", "h-three"),
+            row("r2", "c", "h-two"),
+            row("r3", "c", "h-two"),
+        ] {
+            store.record_artifact(&r).unwrap();
+        }
+        let counts = store.artifact_refcounts().unwrap();
+        assert_eq!(counts.len(), 3);
+        for (hash, want) in [("h-one", 1), ("h-two", 2), ("h-three", 3)] {
+            assert_eq!(counts[hash], want, "{hash}");
+            assert_eq!(store.refcount_for_hash(hash).unwrap(), want, "{hash}");
+        }
+        assert!(!counts.contains_key("h-none"));
+        assert_eq!(store.refcount_for_hash("h-none").unwrap(), 0);
+        let (empty, _dir) = temp_store();
+        assert!(empty.artifact_refcounts().unwrap().is_empty());
     }
 
     /// The cap must actually BIND, not merely be passed.
