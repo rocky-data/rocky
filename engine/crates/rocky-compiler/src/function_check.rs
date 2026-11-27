@@ -75,7 +75,7 @@ use std::sync::LazyLock;
 use sqlparser::ast::{self, Expr, Spanned, Statement, Visit, Visitor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E057, E068, SourceSpan, W057, W068};
+use crate::diagnostic::{Diagnostic, E057, E068, E073, SourceSpan, W057, W068};
 use crate::operand_check::{OperandDialect, OperandTarget};
 use crate::udf::FunctionRegistry;
 
@@ -314,7 +314,45 @@ pub fn check_unknown_functions(
     target_for: &dyn Fn(&str) -> OperandTarget,
     written_for: Option<OperandDialect>,
 ) -> Vec<Diagnostic> {
-    check_unknown_functions_with(models, registry, &HashSet::new(), target_for, written_for)
+    check_unknown_functions_with(
+        models,
+        registry,
+        &SeedFunctions::default(),
+        target_for,
+        written_for,
+    )
+}
+
+/// What the project's seed files say about the functions and macros they
+/// create (#2691), for [`check_unknown_functions_with`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeedFunctions {
+    /// The names, as [`seed_name_key`], the seeds create.
+    pub names: HashSet<String>,
+    /// The seed files that are there but could not be read. Their names are
+    /// unknown, so a DuckDB call the check would refuse may be one of their
+    /// macros: it is refused with [`E073`] instead, which names the file and
+    /// the read failure (#2753).
+    pub unreadable: Vec<UnreadableSeed>,
+}
+
+impl SeedFunctions {
+    /// The seed names `names`, with no unreadable seed.
+    pub fn from_names(names: HashSet<String>) -> Self {
+        Self {
+            names,
+            unreadable: Vec::new(),
+        }
+    }
+}
+
+/// A seed file that is there but could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableSeed {
+    /// The path of the seed file, as shown to the user.
+    pub path: String,
+    /// Why the read failed.
+    pub error: String,
 }
 
 /// The key a seed name and a call name are compared by: Unicode lower case,
@@ -524,13 +562,19 @@ fn last_name_part(qualified: &str) -> Option<String> {
 }
 
 /// [`check_unknown_functions`], skipping DuckDB's verdict (`E057`, `E068`,
-/// `W068`) on calls to `seed_names`: the names, as [`seed_name_key`], of the
+/// `W068`) on calls to `seeds.names`: the names, as [`seed_name_key`], of the
 /// functions and macros the project's seed file creates. The seed runs only
 /// in DuckDB, so another warehouse still judges the call.
+///
+/// When a seed file could not be read (`seeds.unreadable`), the check fails
+/// closed: a DuckDB call it would refuse with `E057` or `E068` is refused
+/// with `E073`, which names the seed and the read failure, since the call may
+/// be one of that seed's macros (#2753). A call DuckDB has with that argument
+/// count, and a `W068` call, are judged as before.
 pub fn check_unknown_functions_with(
     models: &[rocky_core::models::Model],
     registry: &FunctionRegistry,
-    seed_names: &HashSet<String>,
+    seeds: &SeedFunctions,
     target_for: &dyn Fn(&str) -> OperandTarget,
     written_for: Option<OperandDialect>,
 ) -> Vec<Diagnostic> {
@@ -558,7 +602,7 @@ pub fn check_unknown_functions_with(
         if dialects.is_empty() {
             continue;
         }
-        diagnostics.extend(check_model(model, registry, seed_names, &dialects));
+        diagnostics.extend(check_model(model, registry, seeds, &dialects));
     }
     diagnostics
 }
@@ -566,7 +610,7 @@ pub fn check_unknown_functions_with(
 fn check_model(
     model: &rocky_core::models::Model,
     registry: &FunctionRegistry,
-    seed_names: &HashSet<String>,
+    seeds: &SeedFunctions,
     dialects: &[FunctionDialect],
 ) -> Vec<Diagnostic> {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
@@ -617,7 +661,7 @@ fn check_model(
         for call in &visitor.found {
             let name = &call.name;
             let lower = name.to_ascii_lowercase();
-            if dialect == FunctionDialect::DuckDb && seed_names.contains(&seed_name_key(name)) {
+            if dialect == FunctionDialect::DuckDb && seeds.names.contains(&seed_name_key(name)) {
                 continue;
             }
             if dialect == FunctionDialect::DuckDb
@@ -632,9 +676,17 @@ fn check_model(
                     && crate::duckdb_signatures::refuses_count(&lower, count)
                 {
                     let (line, col) = at(call.line, call.col);
-                    diagnostics.push(count_diagnostic(
-                        model, name, &lower, count, call.bound, &file, line, col,
-                    ));
+                    // A bound call is refused (E068). With an unreadable
+                    // seed, it may be a seed macro: refuse it for that.
+                    let diagnostic = match seeds.unreadable.first() {
+                        Some(seed) if call.bound => {
+                            unreadable_seed_diagnostic(model, name, seed, &file, line, col)
+                        }
+                        _ => count_diagnostic(
+                            model, name, &lower, count, call.bound, &file, line, col,
+                        ),
+                    };
+                    diagnostics.push(diagnostic);
                 }
                 continue;
             }
@@ -642,6 +694,14 @@ fn check_model(
                 continue;
             }
             let (line, col) = at(call.line, call.col);
+            if dialect == FunctionDialect::DuckDb
+                && let Some(seed) = seeds.unreadable.first()
+            {
+                diagnostics.push(unreadable_seed_diagnostic(
+                    model, name, seed, &file, line, col,
+                ));
+                continue;
+            }
             let (code, constructor, phrase): (_, fn(&str, &str, String) -> Diagnostic, _) =
                 match dialect.tier() {
                     Tier::Verified => (E057, Diagnostic::error, "does not exist in"),
@@ -671,6 +731,37 @@ fn check_model(
         }
     }
     diagnostics
+}
+
+/// E073: a DuckDB call the check would refuse (E057, E068), in a project
+/// whose seed file could not be read, so the call may be one of its macros
+/// (#2753). The check fails closed and names the reason.
+fn unreadable_seed_diagnostic(
+    model: &rocky_core::models::Model,
+    name: &str,
+    seed: &UnreadableSeed,
+    file: &str,
+    line: usize,
+    col: usize,
+) -> Diagnostic {
+    Diagnostic::error(
+        E073,
+        &model.config.name,
+        format!(
+            "cannot check the call to `{name}` on DuckDB: the seed file `{}` could not be \
+             read ({}), so Rocky cannot tell whether it creates `{name}`",
+            seed.path, seed.error
+        ),
+    )
+    .with_suggestion(format!(
+        "make `{}` readable (or remove it), then compile again",
+        seed.path
+    ))
+    .with_span(SourceSpan {
+        file: file.to_string(),
+        line,
+        col,
+    })
 }
 
 /// E068 / W068: DuckDB has no overload of `name` that takes `count`
@@ -1222,7 +1313,7 @@ mod tests {
             check_unknown_functions_with(
                 &[model("m", sql)],
                 &registry,
-                &names,
+                &SeedFunctions::from_names(names.clone()),
                 &|_| target.clone(),
                 None,
             )
@@ -1254,6 +1345,57 @@ mod tests {
         assert_eq!(&*diags[0].code, "E057", "{diags:?}");
         // The seed runs only in DuckDB: another warehouse still judges it.
         let diags = judged("select my_fn(a) from t", OperandDialect::Snowflake);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(&*diags[0].code, "W057");
+    }
+
+    /// A seed file that could not be read fails the check closed (#2753):
+    /// each DuckDB call the check would refuse (`E057`, `E068`) may be one of
+    /// its macros, so it is refused with `E073`, which names the seed and the
+    /// read failure. Calls DuckDB has, `W068` calls and other warehouses are
+    /// judged as before.
+    #[test]
+    fn an_unreadable_seed_refuses_the_calls_it_could_create() {
+        let registry = FunctionRegistry::default();
+        let seeds = SeedFunctions {
+            names: ["my_fn"].map(String::from).into(),
+            unreadable: vec![UnreadableSeed {
+                path: "proj/data/seed.sql".to_string(),
+                error: "stream did not contain valid UTF-8".to_string(),
+            }],
+        };
+        let judged = |sql: &str, dialect: OperandDialect| {
+            let target = OperandTarget::from(Some(dialect));
+            check_unknown_functions_with(
+                &[model("m", sql)],
+                &registry,
+                &seeds,
+                &|_| target.clone(),
+                None,
+            )
+        };
+        for sql in ["select other_fn(a) from t", "select upper(a, b) from t"] {
+            let diags = judged(sql, OperandDialect::DuckDb);
+            assert_eq!(diags.len(), 1, "{sql}: {diags:?}");
+            let d = &diags[0];
+            assert_eq!(&*d.code, "E073", "{sql}: {d:?}");
+            assert_eq!(d.severity, crate::diagnostic::Severity::Error, "{sql}");
+            assert!(d.message.contains("proj/data/seed.sql"), "{}", d.message);
+            assert!(d.message.contains("valid UTF-8"), "{}", d.message);
+        }
+        // A name a readable seed creates is still the project's own.
+        assert!(judged("select my_fn(a) from t", OperandDialect::DuckDb).is_empty());
+        // A call DuckDB has, with a count it takes, is not affected.
+        assert!(judged("select upper(a) from t", OperandDialect::DuckDb).is_empty());
+        // A call in a place DuckDB may skip stays the warning W068.
+        let diags = judged(
+            "with c as (select upper(a, b) as x from t) select 1 from t",
+            OperandDialect::DuckDb,
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(&*diags[0].code, "W068", "{diags:?}");
+        // The seed runs only in DuckDB: another warehouse judges as before.
+        let diags = judged("select other_fn(a) from t", OperandDialect::Snowflake);
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(&*diags[0].code, "W057");
     }

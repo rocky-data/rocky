@@ -274,7 +274,11 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
     let seed_file = seed_path(project_root);
     let seeded = seed_file.exists();
     let seed_error: Option<String> = if seeded {
-        let seed_sql = std::fs::read_to_string(&seed_file)?;
+        // A seed that is there but does not read refuses the run, naming the
+        // file: its tables and macros are unknown (#2753).
+        let seed_sql = std::fs::read_to_string(&seed_file).map_err(|e| {
+            anyhow::anyhow!("failed to read the seed file {}: {e}", seed_file.display())
+        })?;
         match db.execute_statement(&seed_sql) {
             Ok(()) => {
                 info!(path = %seed_file.display(), "loaded seed data");
