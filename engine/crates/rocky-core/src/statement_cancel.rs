@@ -31,6 +31,18 @@ use std::time::Duration;
 /// cancel and wait at most this long, so giving up stays prompt.
 pub const ABANDON_CANCEL_BUDGET: Duration = Duration::from_secs(3);
 
+/// A fresh idempotency key for one statement's submit: a UUID v4, 36 ASCII
+/// characters.
+///
+/// A connector mints one per statement and sends the same key on every
+/// resend of that submit. The warehouse then knows a resend from a new
+/// statement. Snowflake reads it as the `requestId` query parameter and
+/// BigQuery as the `requestId` field of `jobs.query`.
+#[must_use]
+pub fn new_submit_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// The warehouse's own id for one running statement.
 ///
 /// Opaque to everyone but the adapter that made it: a Databricks
@@ -169,6 +181,16 @@ fn lock(registry: &Mutex<Registry>) -> MutexGuard<'_, Registry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each call is a new key, within BigQuery's 36-character limit.
+    #[test]
+    fn each_submit_request_id_is_new_and_fits_the_warehouse_limits() {
+        let a = new_submit_request_id();
+        let b = new_submit_request_id();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert!(a.is_ascii());
+    }
 
     #[test]
     fn a_registered_handle_is_listed_until_its_guard_drops() {
