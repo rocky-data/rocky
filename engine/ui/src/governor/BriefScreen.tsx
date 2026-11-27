@@ -1,10 +1,10 @@
-import { useCallback, useState } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 import type { BriefDecisionEntry, BriefOutput, BriefRunEntry, BriefSinceMode } from "@rocky-types/brief";
 import { apiGet } from "../api";
 import { ArrowPathIcon, ArrowRightIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
-import { Clip, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, runStatusTone } from "../components";
+import { Clip, Missing, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, runStatusTone } from "../components";
 import { useResource } from "../estate/useResource";
-import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded, verdictLabel } from "../format";
+import { NOT_RECORDED, capabilityLabel, formatDuration, formatInstant, verdictLabel } from "../format";
 import { reviewPath } from "../review/paths";
 import { navigateTo } from "../router";
 import { defaultJobClient, type JobClient } from "../operator";
@@ -27,19 +27,36 @@ const WINDOWS: { id: BriefSinceMode; label: string; hint: string }[] = [
   },
 ];
 
-function usd(value: number | null | undefined): string {
-  return value === null || value === undefined ? orNotRecorded(null) : `$${value.toFixed(2)}`;
+/** The one reading of a missing value in the Inbox: a grey "-", the reason in `title`. */
+const NO_VALUE = "the engine did not record it";
+
+function usd(value: number | null | undefined): ReactNode {
+  return value === null || value === undefined ? (
+    <Missing reason="no cost was recorded; some warehouses, DuckDB among them, have no billing" />
+  ) : (
+    `$${value.toFixed(2)}`
+  );
 }
 
-function bytes(value: number | null | undefined): string {
-  if (value === null || value === undefined) return orNotRecorded(null);
+function bytes(value: number | null | undefined): ReactNode {
+  if (value === null || value === undefined) return <Missing reason="no bytes-scanned figure was recorded" />;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
   if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
   return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
 
-function percent(value: number | null | undefined): string {
-  return value === null || value === undefined ? orNotRecorded(null) : `${(value * 100).toFixed(1)}%`;
+function percent(value: number | null | undefined): ReactNode {
+  return value === null || value === undefined ? <Missing reason={NO_VALUE} /> : `${(value * 100).toFixed(1)}%`;
+}
+
+function duration(ms: number): ReactNode {
+  const text = formatDuration(ms);
+  return text === NOT_RECORDED ? <Missing reason="the duration was not recorded" /> : text;
+}
+
+function instant(iso: string | null | undefined, now?: number): ReactNode {
+  const text = formatInstant(iso, now);
+  return text === NOT_RECORDED ? <Missing reason="no timestamp was recorded" /> : text;
 }
 
 /**
@@ -132,18 +149,18 @@ function BriefBody({
     <div className="space-y-5">
       <StatusLine brief={brief} />
 
+      <WaitingCard brief={brief} now={now} />
+
       <p className="text-xs text-muted">
         Digest generated {formatInstant(brief.generated_at, now)}, window <code>{brief.since_mode}</code>
         {brief.since_timestamp ? ` from ${formatInstant(brief.since_timestamp)}` : ", all of recorded history"}
         . Read from <code>GET /api/v1/brief?since={brief.since_mode}</code>.
       </p>
 
-
-      <WaitingCard brief={brief} now={now} />
-
       <h3 className="pt-2 text-xs font-semibold tracking-wider text-muted uppercase">Details</h3>
 
       <SectionCard
+        greyMissing
         title="Agent activity"
         availability={activity.availability}
         note={activity.note}
@@ -166,7 +183,7 @@ function BriefBody({
             ariaLabel="Decisions"
             columns={["when", "actor", "action", "model", "kind", "outcome", "rule", "decision", "reason"]}
             rows={activity.decisions.map((entry) => [
-              formatInstant(entry.timestamp, now),
+              instant(entry.timestamp, now),
               entry.principal,
               entry.capability,
               entry.model,
@@ -184,6 +201,7 @@ function BriefBody({
       </SectionCard>
 
       <SectionCard
+        greyMissing
         title="Runs"
         availability={runs.availability}
         note={runs.note}
@@ -203,6 +221,7 @@ function BriefBody({
       </SectionCard>
 
       <SectionCard
+        greyMissing
         title="Agent limits"
         availability={autonomy.availability}
         note={autonomy.note}
@@ -226,7 +245,7 @@ function BriefBody({
             rows={autonomy.active_freezes.map((freeze) => [
               freeze.scope,
               freeze.principal,
-              formatInstant(freeze.frozen_at, now),
+              instant(freeze.frozen_at, now),
               <CustodyLink key={freeze.plan_id} subject={freeze.plan_id} />,
             ])}
           />
@@ -240,6 +259,7 @@ function BriefBody({
       />
 
       <SectionCard
+        greyMissing
         title="Cost"
         availability={cost.availability}
         note={cost.note}
@@ -247,14 +267,14 @@ function BriefBody({
       >
         <div className="space-y-3">
           <div className="grid gap-3 sm:grid-cols-3">
-            <StatusCard label="total cost" value={usd(cost.total_cost_usd)} sub={orNotRecorded(cost.adapter_type)} />
+            <StatusCard label="total cost" value={usd(cost.total_cost_usd)} sub={cost.adapter_type ? cost.adapter_type : <Missing reason="no warehouse adapter was recorded for these runs" />} />
             <StatusCard label="bytes scanned" value={bytes(cost.total_bytes_scanned)} />
             <StatusCard
               label="budget"
               value={
                 cost.budget
                   ? `${cost.budget.runs_over_budget} over $${cost.budget.max_usd_per_run.toFixed(2)}/run`
-                  : orNotRecorded(null)
+                  : <Missing reason="no cost budget is configured" />
               }
               tone={cost.budget && cost.budget.runs_over_budget > 0 ? "warn" : "muted"}
               sub={
@@ -269,7 +289,7 @@ function BriefBody({
             columns={["run", "duration", "bytes scanned", "cost"]}
             rows={cost.per_run.map((run) => [
               <CustodyLink key={run.run_id} subject={run.run_id} />,
-              formatDuration(run.duration_ms),
+              duration(run.duration_ms),
               bytes(run.bytes_scanned),
               usd(run.cost_usd),
             ])}
@@ -278,28 +298,28 @@ function BriefBody({
       </SectionCard>
 
       <div className="grid gap-5 lg:grid-cols-2">
-      <SectionCard title="Drift" availability={drift.availability} note={drift.note} summary={`${drift.events.length} event(s)`}>
+      <SectionCard greyMissing title="Drift" availability={drift.availability} note={drift.note} summary={`${drift.events.length} event(s)`}>
         <Rows
           ariaLabel="Drift events"
           columns={["when", "change", "graph"]}
-          rows={drift.events.map((event) => [formatInstant(event.timestamp, now), event.change, event.graph_hash])}
+          rows={drift.events.map((event) => [instant(event.timestamp, now), event.change, event.graph_hash])}
         />
       </SectionCard>
 
-      <SectionCard title="Freshness" availability={freshness.availability} note={freshness.note} summary={`${freshness.models.length} model(s)`}>
+      <SectionCard greyMissing title="Freshness" availability={freshness.availability} note={freshness.note} summary={`${freshness.models.length} model(s)`}>
         <Rows
           ariaLabel="Freshness"
           columns={["model", "lag", "observed", "run"]}
           rows={freshness.models.map((entry) => [
             entry.model_name,
-            formatDuration(entry.freshness_lag_seconds * 1000),
-            formatInstant(entry.observed_at, now),
+            duration(entry.freshness_lag_seconds * 1000),
+            instant(entry.observed_at, now),
             entry.run_id,
           ])}
         />
       </SectionCard>
 
-      <SectionCard title="Quality" availability={quality.availability} note={quality.note} summary={`${quality.models.length} model(s)`}>
+      <SectionCard greyMissing title="Quality" availability={quality.availability} note={quality.note} summary={`${quality.models.length} model(s)`}>
         <Rows
           ariaLabel="Quality"
           columns={["model", "rows", "max null rate", "observed", "run"]}
@@ -307,7 +327,7 @@ function BriefBody({
             entry.model_name,
             entry.row_count,
             percent(entry.max_null_rate),
-            formatInstant(entry.observed_at, now),
+            instant(entry.observed_at, now),
             entry.run_id,
           ])}
         />
@@ -316,6 +336,7 @@ function BriefBody({
       </div>
 
       <SectionCard
+        greyMissing
         title="Scheduler"
         availability={scheduler.availability}
         note={scheduler.note}
@@ -339,6 +360,11 @@ function BriefBody({
   );
 }
 
+/** Why a section is a grey "-": the engine's own note when it gave one. */
+function unreadReason(note: string | null | undefined): string {
+  return note ? `${NOT_RECORDED}: ${note}` : `${NOT_RECORDED}: the engine could not read this section`;
+}
+
 function plural(count: number, one: string, many = `${one}s`): string {
   return `${count} ${count === 1 ? one : many}`;
 }
@@ -357,7 +383,7 @@ function StatusLine({ brief }: { brief: BriefOutput }) {
   const { escalations, runs, autonomy } = brief;
   const act: string[] = [];
   const fine: string[] = [];
-  const unread: string[] = [];
+  const unread: { label: string; reason: string }[] = [];
 
   if (escalations.availability === "available" && escalations.pending.length > 0) {
     const plans = new Set(escalations.pending.map((entry) => entry.plan_id)).size;
@@ -365,7 +391,7 @@ function StatusLine({ brief }: { brief: BriefOutput }) {
       `${plural(plans, "change")} ${plans === 1 ? "waits" : "wait"} on you (${plural(escalations.total, "decision")})`,
     );
   } else if (escalations.availability === "unavailable") {
-    unread.push("approval requests");
+    unread.push({ label: "approval requests", reason: unreadReason(escalations.note) });
   }
 
   if (runs.availability === "available") {
@@ -377,7 +403,7 @@ function StatusLine({ brief }: { brief: BriefOutput }) {
   } else if (runs.availability === "no_data") {
     fine.push("no runs in the window");
   } else {
-    unread.push("runs");
+    unread.push({ label: "runs", reason: unreadReason(runs.note) });
   }
 
   if (autonomy.availability === "available") {
@@ -398,7 +424,7 @@ function StatusLine({ brief }: { brief: BriefOutput }) {
   } else if (autonomy.availability === "no_data") {
     fine.push("no change freeze, no degraded rule");
   } else {
-    unread.push("agent limits");
+    unread.push({ label: "agent limits", reason: unreadReason(autonomy.note) });
   }
 
   const lead =
@@ -411,11 +437,11 @@ function StatusLine({ brief }: { brief: BriefOutput }) {
         )}
         {fine.length > 0 && <span className="text-muted"> {capitalize(fine.join(", "))}.</span>}
       </p>
-      {unread.length > 0 && (
-        <p className="text-sm text-warn-ink">
-          {capitalize(unread.join(", "))}: {NOT_RECORDED}.
+      {unread.map((entry) => (
+        <p key={entry.label} className="text-sm text-muted">
+          {capitalize(entry.label)}: <Missing reason={entry.reason} />
         </p>
-      )}
+      ))}
     </section>
   );
 }
@@ -456,13 +482,22 @@ function runStatusWord(status: string): string {
  * so a reader sees one problem and not three.
  */
 function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
-  const { escalations, runs } = brief;
+  const { escalations, runs, autonomy } = brief;
   const pending = escalations.availability === "available" ? escalations.pending : [];
   const attention: BriefRunEntry[] = runs.availability === "available" ? runs.attention : [];
   const groups = groupByPlan(pending);
   const reasons = unique(pending.map((entry) => entry.reason));
   const shared = pending.length > 1 && reasons.length === 1 ? reasons[0] : null;
   const items = groups.length + attention.length;
+  // The summary line puts a change freeze and a degraded rule under what needs
+  // a person; the card must not say "caught up" while either holds.
+  const freezes = autonomy.availability === "available" ? autonomy.active_freezes.length : 0;
+  const degraded = autonomy.availability === "available" ? autonomy.degraded_rules.length : 0;
+  const unread = [
+    escalations.availability === "unavailable" && { label: "Approval requests", note: escalations.note },
+    runs.availability === "unavailable" && { label: "Runs", note: runs.note },
+    autonomy.availability === "unavailable" && { label: "Agent limits", note: autonomy.note },
+  ].filter((entry) => entry !== false);
 
   return (
     <section aria-label="Waiting on you" className="r-card overflow-hidden">
@@ -476,12 +511,11 @@ function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
         )}
       </div>
 
-      {escalations.availability === "unavailable" && (
-        <p className="r-row text-sm text-warn-ink">
-          Approval requests: {NOT_RECORDED}
-          {escalations.note ? `: ${escalations.note}` : ""}
+      {unread.map((entry) => (
+        <p key={entry.label} className="r-row text-sm text-muted">
+          {entry.label}: <Missing reason={unreadReason(entry.note)} />
         </p>
-      )}
+      ))}
 
       {shared !== null && (
         <p className="flex items-start gap-3 border-t border-warn/40 bg-warn-soft px-5 py-3 text-sm text-warn-ink">
@@ -501,27 +535,29 @@ function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
               <li key={group.plan} className="r-row">
                 <span aria-hidden="true" className="size-2.5 shrink-0 rounded-full bg-warn" />
                 <div className="min-w-0 flex-[1_1_22rem] space-y-1">
-                  <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[15px] text-ink">
-                    {unique(group.entries.map((entry) => entry.principal)).map((principal) => (
-                      <span key={principal} className={principal === "agent" ? "r-tag-agent" : "r-tag-human"}>
-                        {principal}
-                      </span>
+                  <ul aria-label="Decisions in this change" className="space-y-1">
+                    {group.entries.map((entry) => (
+                      <li
+                        key={entry.decision_ref}
+                        className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[15px] text-ink"
+                      >
+                        {/* The raw capability stays in the title for anyone who needs the CLI's word. */}
+                        <span className="font-semibold" title={entry.capability}>
+                          {capabilityLabel(entry.capability)}
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono break-all">{entry.model}</span>
+                        <span aria-hidden="true">·</span>
+                        <span className={entry.principal === "agent" ? "r-tag-agent" : "r-tag-human"}>
+                          {entry.principal}
+                        </span>
+                      </li>
                     ))}
-                    <span>wants to</span>
-                    <span className="font-semibold">
-                      {unique(group.entries.map((entry) => entry.capability)).join(", ")}
-                    </span>
-                    {unique(group.entries.map((entry) => entry.model)).map((model, index, all) => (
-                      <span key={model} className="font-mono break-all">
-                        {model}
-                        {index < all.length - 1 ? "," : ""}
-                      </span>
-                    ))}
-                  </p>
+                  </ul>
                   {shared === null && <p className="text-sm text-ink-2">{own.join(" · ")}</p>}
                   <p className="text-xs text-muted">
                     change <CustodyLink subject={group.plan} clip /> · {plural(group.entries.length, "decision")} ·{" "}
-                    {formatInstant(latest, now)} ·{" "}
+                    {instant(latest, now)} ·{" "}
                     {group.entries.map((entry, index) => (
                       <span key={entry.decision_ref}>
                         {index > 0 ? ", " : ""}
@@ -571,7 +607,21 @@ function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
         </ul>
       )}
 
-      {items === 0 && escalations.availability !== "unavailable" && (
+      {items === 0 && unread.length === 0 && freezes + degraded > 0 && (
+        <p className="r-row text-sm text-ink-2">
+          <ToneDot tone="warn" />
+          Nothing to approve, but{" "}
+          {[
+            freezes > 0 ? `${plural(freezes, "change freeze")} in force` : null,
+            degraded > 0 ? plural(degraded, "degraded rule") : null,
+          ]
+            .filter((part) => part !== null)
+            .join(", ")}
+          . See Agent limits.
+        </p>
+      )}
+
+      {items === 0 && unread.length === 0 && freezes + degraded === 0 && (
         <p className="r-row text-sm text-muted">
           <ToneDot tone="ok" />
           You're all caught up

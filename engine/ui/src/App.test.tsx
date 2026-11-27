@@ -10,6 +10,7 @@ import {
   WIDE_ENOUGH_FOR_THE_SIDEBAR,
   WAITING_REFRESH_MS,
   waitingLine,
+  type Waiting,
 } from "./App";
 import { NOT_YET_HEADING } from "./areas";
 import { GovernorScreen } from "./governor/GovernorScreen";
@@ -157,10 +158,13 @@ describe("EnginePanel", () => {
   });
 });
 
+/** A fake brief read: `decisions` waiting decisions, `runs` runs needing attention. */
+const w = (decisions: number | null, runs: number | null = 0): Waiting => ({ decisions, runs });
+
 describe("App", () => {
   const slots = {
     // Every App test gets a fake count, so none reaches jsdom's fetch.
-    fetchWaiting: async () => 0,
+    fetchWaiting: async () => w(0),
     engine: <span>engine slot</span>,
     estate: <span>estate slot</span>,
     review: <span>review slot</span>,
@@ -242,10 +246,10 @@ describe("App", () => {
 
   it("badges Inbox and Changes with what waits, keeping each link's name", async () => {
     window.history.pushState(null, "", "/ui/estate");
-    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => 2} />);
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(2)} />);
     const needs = await waitFor(() => {
       const link = areas().getByRole("link", { name: "Inbox" });
-      expect(link).toHaveAccessibleDescription(waitingLine(2));
+      expect(link).toHaveAccessibleDescription(waitingLine(2, "item"));
       return link;
     });
     // The digit is beside the link, never in its text or its name.
@@ -259,12 +263,34 @@ describe("App", () => {
     expect(waitingLine(1)).toBe("1 decision waits on you");
   });
 
+  it("counts attention runs in the Inbox badge but not in Changes", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(1, 2)} />);
+    await waitFor(() => expect(badgeOf("Inbox")).toBe("3"));
+    expect(areas().getByRole("link", { name: "Inbox" })).toHaveAccessibleDescription("3 items wait on you");
+    expect(badgeOf("Changes")).toBe("1");
+  });
+
+  it("shows no Inbox badge when runs were not read, even with decisions waiting", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(2, null)} />);
+    await waitFor(() => expect(badgeOf("Changes")).toBe("2"));
+    expect(badgeOf("Inbox")).toBeNull();
+  });
+
+  it("shows an Inbox badge for attention runs alone", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(0, 1)} />);
+    await waitFor(() => expect(badgeOf("Inbox")).toBe("1"));
+    expect(badgeOf("Changes")).toBeNull();
+  });
+
   it.each([
-    ["zero", async () => 0],
-    ["a section the engine could not read", async () => null],
+    ["zero", async () => w(0)],
+    ["a section the engine could not read", async () => w(null, null)],
     [
       "a refused read",
-      async (): Promise<number> => {
+      async (): Promise<Waiting> => {
         throw new Error("refused");
       },
     ],
@@ -279,7 +305,7 @@ describe("App", () => {
   });
 
   it("reads nothing before the engine answers", async () => {
-    const read = vi.fn(async () => 1);
+    const read = vi.fn(async () => w(1));
     render(
       <App fetchMeta={() => new Promise<MetaOutput>(() => {})} {...slots} fetchWaiting={read} />,
     );
@@ -296,14 +322,14 @@ describe("App", () => {
     it("reads again on its interval, and clears a count it can no longer vouch for", async () => {
       vi.useFakeTimers();
       window.history.pushState(null, "", "/ui/estate");
-      const answers: (() => Promise<number>)[] = [
-        async () => 3,
+      const answers: (() => Promise<Waiting>)[] = [
+        async () => w(3),
         async () => {
           throw new Error("engine_busy");
         },
-        async () => 1,
+        async () => w(1),
       ];
-      const read = vi.fn(() => (answers.shift() ?? (async () => 1))());
+      const read = vi.fn(() => (answers.shift() ?? (async () => w(1)))());
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await settle();
       expect(badgeOf("Changes")).toBe("3");
@@ -319,7 +345,7 @@ describe("App", () => {
     it("never stacks a read on one still running", async () => {
       vi.useFakeTimers();
       window.history.pushState(null, "", "/ui/estate");
-      const read = vi.fn(() => new Promise<number>(() => {}));
+      const read = vi.fn(() => new Promise<Waiting>(() => {}));
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await settle();
       await act(async () => vi.advanceTimersByTime(WAITING_REFRESH_MS * 3));
@@ -329,7 +355,7 @@ describe("App", () => {
     it("pauses while the tab is hidden, and reads at once when it comes back", async () => {
       vi.useFakeTimers();
       window.history.pushState(null, "", "/ui/estate");
-      const read = vi.fn(async () => 2);
+      const read = vi.fn(async () => w(2));
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await settle();
       expect(read).toHaveBeenCalledTimes(1);
@@ -347,7 +373,7 @@ describe("App", () => {
 
     it("reads again on navigation", async () => {
       window.history.pushState(null, "", "/ui/estate");
-      const read = vi.fn(async () => 2);
+      const read = vi.fn(async () => w(2));
       render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={read} />);
       await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
       await settle();
