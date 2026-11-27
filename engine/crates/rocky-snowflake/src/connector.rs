@@ -387,8 +387,10 @@ impl SnowflakeConnector {
         }
 
         // One idempotency key per statement, kept across every resend of a
-        // submit whose outcome is unknown. Snowflake then returns the
-        // statement it already accepted instead of running a second copy.
+        // submit whose outcome is unknown. Snowflake documents that such a
+        // resend does not run the statement again when the first copy
+        // already succeeded. A resend while the first copy still runs is
+        // not documented and not verified (#2774).
         let mut submit = SubmitAttempt::first();
         for attempt in 0..=retry.max_retries {
             match self.submit_and_wait_once(sql, &submit).await {
@@ -577,7 +579,8 @@ impl SnowflakeConnector {
         // the statement, so this deadline is not retried. A transport
         // timeout of the same POST (`Http`) still is: see `is_transient`.
         // That resend carries the same `requestId` with `retry=true`
-        // (`SubmitAttempt`), so it does not run a second copy (#2774).
+        // (`SubmitAttempt`): safe when the first copy already succeeded, not
+        // verified while the first copy still runs (#2774).
         .map_err(|_| ConnectorError::Timeout {
             handle: "<not yet assigned>".to_string(),
             seconds: self.config.timeout.as_secs(),
@@ -767,8 +770,9 @@ impl SnowflakeConnector {
 ///
 /// ```text
 ///   attempt 1: requestId=K                ──▶ 503 / lost answer (accepted?)
-///   attempt 2: requestId=K & retry=true   ──▶ Snowflake returns the statement
-///                                             it already ran, or runs it once
+///   attempt 2: requestId=K & retry=true   ──▶ first copy succeeded: not run
+///                                             again (documented); first copy
+///                                             still running: not verified
 ///   statement failed (known outcome)      ──▶ next attempt: new key, no retry
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,8 +794,10 @@ impl SubmitAttempt {
     ///
     /// When the failure leaves the submit's outcome unknown (a 429, a 5xx,
     /// a lost connection), Snowflake may have accepted the statement. The
-    /// next submit then carries the same key with `retry=true`, so Snowflake
-    /// does not run a second copy. When the statement is known to have
+    /// next submit then carries the same key with `retry=true`. Snowflake
+    /// documents that this does not run the statement again when the first
+    /// copy already succeeded; a resend while the first copy still runs is
+    /// not verified. When the statement is known to have
     /// failed, its outcome is known and it wrote nothing, so the next submit
     /// is a new request with a new key.
     fn next(self, err: &ConnectorError) -> Self {
