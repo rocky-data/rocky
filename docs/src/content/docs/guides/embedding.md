@@ -93,6 +93,7 @@ Read routes return the same payloads as the matching CLI command, byte for byte.
 | `GET /api/v1/retention` (`?model=`) | `rocky retention-status --output json` | Declared retention only, never `--drift`. An unknown `model` is `404 model_not_found`. |
 | `GET /api/v1/gc/derivable` (`?min_age_days=`) | `rocky gc --derivable --dry-run --output json` | Never writes a plan. |
 | `GET /api/v1/lint` | `rocky lint --output json` | Never `--fix`. It lints every pipeline's models directory. File paths are relative to the project root. |
+| `GET /api/v1/doctor` | `rocky doctor --check-set local --output json` | It runs the local checks only (`config`, `state`, `state_schema`, `adapters`, `pipelines`, `state_sync`, `scheduler`, `spool`). It skips `state_rw`, `state_concurrency` and `auth`, so it makes no network or warehouse call. A store another process holds is a `warning` check, never a `503`. An invalid `rocky.toml` is a `critical` check in a `200` answer, with no quoted TOML source line and paths relative to the project root. It creates no file. When a pipeline has a `[schedule]`, the `scheduler` check tries `.rocky/tick.lock` for an instant, so a `rocky tick` at that moment skips once. |
 | `GET /api/v1/policy` | `rocky policy show --output json` | See below |
 
 To approve a plan, use `POST /api/v1/jobs/approve` or `rocky review <plan-id> --approve`.
@@ -155,19 +156,22 @@ A mutating route does not block. You submit the work, get an id back, and poll f
 
 The polled result is the same payload the CLI would have produced. A submitted job becomes `running` right away. The schema also declares `queued`, but this server never uses it. Poll until the state is `succeeded`, `failed` or `cancelled`.
 
-The routes `/jobs/promote` and `/jobs/compact` are not in the diagram. They plan and mutate nothing. Every route validates its body first and answers `400 bad_request` before the job starts, or before it takes the lock. All sit behind the same write gate as `run`: a read-only token gets `403`.
+The routes `/jobs/promote`, `/jobs/compact` and `/jobs/diff` are not in the diagram. They plan or read, and mutate nothing. Every route validates its body first and answers `400 bad_request` before the job starts, or before it takes the lock. A field no job takes answers `400` on every route; it is never ignored. All sit behind the same write gate as `run`: a read-only token gets `403`.
 
 | Route | Runs | Body | Lock |
 |---|---|---|---|
 | `/jobs/test` | `rocky test` in local DuckDB | optional `{"model": "<name>"}` | none |
-| `/jobs/ci` | `rocky ci` (compile and test, no warehouse credentials) | ignored | none |
+| `/jobs/ci` | `rocky ci` (compile and test, no warehouse credentials) | none: any field answers `400` | none |
 | `/jobs/freeze`, `/jobs/unfreeze` | `rocky policy freeze`, `rocky policy unfreeze` | optional `{"principal": "agent" \| "human", "scope": "<selector>", "reason": "<text>"}` | mutation |
 | `/jobs/preview` | `rocky preview create` | optional `{"name": "<branch>", "base": "<ref>"}` | mutation |
 | `/jobs/promote` | `rocky plan promote <name>` | `{"name": "<branch>", "base": "<ref>", "pipeline": "<name>"}`, `name` required | none |
 | `/jobs/compact` | `rocky compact <table>` or `rocky compact --catalog <name>` | exactly one of `{"table": "<catalog.schema.table>"}` or `{"catalog": "<name>"}` | none |
+| `/jobs/diff` | `rocky ci-diff [<base>]` | optional `{"base": "<ref>", "semantic": true}` | one diff at a time |
 | `/jobs/product_approve` | `rocky product approve <name>` | `{"name": "<product>", "expect_spec_digest": "<digest>"}`, both required | mutation |
 | `/jobs/approve` | `rocky review <plan_id> --approve` | `{"plan_id": "<64 lowercase hex>"}` | mutation |
 | `/jobs/apply` | `rocky apply <plan_id>` | `plan_id`, optional `expect_spec_digest` | mutation |
+
+A `diff` job is read-only. The job writes nothing itself, except its job record. The server stores that record in its state store, which by default is `models/.rocky-state.redb`, inside the project. A seed committed at `HEAD` runs as it does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still writes where it says. It reads `data/seed.sql` from the `HEAD` commit, never from the working tree, so an uncommitted seed does not run. Its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`: in a partial clone a missing object fails the job with a message that names the partial clone, and nothing is fetched. Git older than 2.45 ignores `GIT_NO_LAZY_FETCH`, so the job refuses a partial clone on such a git. It does not take the mutation lock, so it never blocks a run. A second `diff` submitted while one runs answers `409 mutation_in_progress` with the running job's `running_job_id`. It diffs the `HEAD` commit, so uncommitted edits are not compared. Any other body field is `400 bad_request`, naming the field. The result is the `rocky ci-diff` output, including its lineage fields.
 
 Jobs that take the mutation lock answer `409 mutation_in_progress` while another one holds it. A run holds the local state store for its whole run, even on a remote `[state]` backend, so retry a refused freeze when that run ends. To stop a running job, cancel it.
 

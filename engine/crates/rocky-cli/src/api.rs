@@ -35,6 +35,7 @@
 //! GET  /api/v1/branches                         → the branch list (= rocky branch list)
 //! POST /api/v1/jobs/product_approve             → approve a product spec (= rocky product approve) → 202 {job_id}
 //! POST /api/v1/jobs/compact                     → plan a compaction (= rocky compact) → 202 {job_id}
+//! POST /api/v1/jobs/diff                        → structural model diff (= rocky ci-diff) → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -213,6 +214,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/promote", post(submit_promote))
         .route("/api/v1/jobs/product_approve", post(submit_product_approve))
         .route("/api/v1/jobs/compact", post(submit_compact))
+        .route("/api/v1/jobs/diff", post(submit_diff))
         .route("/api/v1/branches", get(list_branches))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
@@ -241,6 +243,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/retention", get(retention))
         .route("/api/v1/gc/derivable", get(gc_derivable))
         .route("/api/v1/lint", get(lint))
+        .route("/api/v1/doctor", get(doctor_local))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -505,7 +508,7 @@ impl ApiError {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_invalid",
-            without_toml_source_snippet(message),
+            without_config_values(message),
             Some("fix the config and retry; `rocky validate` reports the specific error"),
         )
     }
@@ -667,6 +670,19 @@ impl ApiError {
             StatusCode::CONFLICT,
             "mutation_in_progress",
             "another run, apply, approve, freeze, unfreeze, preview or product approval job is already in progress on this project",
+            Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
+        );
+        err.envelope.running_job_id = Some(running_job_id.to_string());
+        err
+    }
+
+    /// `409` — a `diff` job is already running. Same code and `running_job_id`
+    /// as [`Self::mutation_in_progress`], so an embedder handles one refusal.
+    fn diff_in_progress(running_job_id: &str) -> Self {
+        let mut err = Self::new(
+            StatusCode::CONFLICT,
+            "mutation_in_progress",
+            "another diff job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
@@ -1014,6 +1030,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/promote",
         "POST /api/v1/jobs/product_approve",
         "POST /api/v1/jobs/compact",
+        "POST /api/v1/jobs/diff",
         "GET /api/v1/branches",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
@@ -1041,6 +1058,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/retention",
         "GET /api/v1/gc/derivable",
         "GET /api/v1/lint",
+        "GET /api/v1/doctor",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -2468,6 +2486,46 @@ struct ComplianceQuery {
 /// (`  |`), the source line (`L | text`), a caret line (`  |   ^`) and the
 /// reason. Only the source line can carry a literal secret, but the whole
 /// snippet goes: the header already gives the line and column.
+/// What an HTTP route may say about a config error: the line and column, the
+/// key path and a reason with no value in it.
+///
+/// `serde` and the config loader quote the offending value in the reason
+/// (``invalid type: integer `99887766` ``, ``unknown variant `X` ``,
+/// `unsupported pipeline type: 'X'`). A literal token placed in a typed field
+/// shows up there. This drops the TOML source snippet, then replaces every
+/// quoted span with `<value>`, except a span that names a key, field or table
+/// (``for key `adapter.default.token` ``). The CLI's own report is unchanged.
+fn without_config_values(message: &str) -> String {
+    let message = without_toml_source_snippet(message);
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let starts_span = matches!(c, '`' | '\'' | '"')
+            && (i == 0 || chars[i - 1].is_whitespace() || matches!(chars[i - 1], ':' | '(' | '['));
+        let close = starts_span
+            .then(|| (i + 1..chars.len()).find(|&k| chars[k] == c))
+            .flatten();
+        let Some(close) = close else {
+            out.push(c);
+            i += 1;
+            continue;
+        };
+        let before = out.trim_end().to_ascii_lowercase();
+        let names_a_key = ["key", "field", "table", "section"]
+            .iter()
+            .any(|word| before.ends_with(word));
+        if names_a_key {
+            out.extend(&chars[i..=close]);
+        } else {
+            out.push_str("`<value>`");
+        }
+        i = close + 1;
+    }
+    out
+}
+
 fn without_toml_source_snippet(message: &str) -> String {
     let is_snippet = |line: &str| {
         let rest = line
@@ -2881,6 +2939,98 @@ async fn lint(State(state): State<Arc<ServerState>>) -> Result<PrettyJson<LintOu
     .map_err(|e| map_join_err(&e))?
     .map_err(|e| map_pure_read_err(&e, &state))?;
     Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/doctor` — canonical [`DoctorOutput`], the local checks only.
+///
+/// What `rocky doctor --check-set local --output json` prints: config, state
+/// store, state schema, adapter and pipeline configuration, state backend type,
+/// scheduler and webhook spool. It skips `state_rw`, `state_concurrency` and
+/// `auth`, so it makes no network call, no warehouse call and no write to a
+/// remote state backend.
+///
+/// A plain route, not a job: every check reads a local file, so it answers in
+/// well under a second. Kept read-only, so a read-scoped token can call it.
+///
+/// A store another process holds is a `warning` check in the report, never an
+/// error response. A critical check (an invalid `rocky.toml`) is still `200`:
+/// the report carries it in `overall`. The route never exits the process.
+async fn doctor_local(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<crate::commands::DoctorOutput>, ApiError> {
+    let config_path = state
+        .config_path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
+    let state_path = state_path_for(&state);
+    let config_path_for_scrub = config_path.clone();
+    let state_path_for_scrub = state_path.clone();
+    // The local checks await nothing that blocks, so the report is built on the
+    // store's blocking thread, behind the same gate every store read takes.
+    let output = store_read(&state, move || {
+        tokio::runtime::Handle::current().block_on(crate::commands::doctor_output(
+            &config_path,
+            &state_path,
+            None,
+            crate::commands::DoctorCheckSet::Local,
+            false,
+        ))
+    })
+    .await?;
+    Ok(PrettyJson(scrub_doctor_output(
+        output,
+        &config_path_for_scrub,
+        &state_path_for_scrub,
+    )))
+}
+
+/// Make a doctor report safe to serve: the quoted TOML source lines go (the
+/// same scrub `config_invalid` applies), and the config path and the project
+/// root it sits in become relative to the project root.
+fn scrub_doctor_output(
+    mut output: crate::commands::DoctorOutput,
+    config_path: &std::path::Path,
+    state_path: &std::path::Path,
+) -> crate::commands::DoctorOutput {
+    let config = absolute_path(config_path);
+    let root = config
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let config_name = config.file_name().map_or_else(
+        || "rocky.toml".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    // The state store path: relative to the project root when inside it, else
+    // only the file name.
+    let state = absolute_path(state_path);
+    let state_shown = match state.strip_prefix(&root) {
+        Ok(relative) => relative.to_string_lossy().into_owned(),
+        Err(_) => state
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+    };
+    let scrub = |text: &str| -> String {
+        let text = without_config_values(text);
+        let text = text.replace(&state.to_string_lossy().into_owned(), &state_shown);
+        let text = text.replace(&state_path.to_string_lossy().into_owned(), &state_shown);
+        let text = text.replace(&config.to_string_lossy().into_owned(), &config_name);
+        let text = text.replace(&config_path.to_string_lossy().into_owned(), &config_name);
+        let prefix = format!("{}/", root.to_string_lossy());
+        text.replace(&prefix, "")
+            .replace(root.to_string_lossy().as_ref(), ".")
+    };
+    for check in &mut output.checks {
+        check.message = scrub(&check.message);
+        for (key, value) in &mut check.details {
+            *key = scrub(key);
+            *value = scrub(value);
+        }
+    }
+    for suggestion in &mut output.suggestions {
+        *suggestion = scrub(suggestion);
+    }
+    output
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -3318,8 +3468,10 @@ fn too_many_requests_response(retry_after: std::time::Duration) -> Response {
 // --- Job model (POST /api/v1/jobs/{run|plan|apply}, GET /api/v1/jobs/{id}) ---
 
 /// Optional JSON body for a job submission. Every field is optional; an empty
-/// body runs the verb with its defaults (all pipelines, no filter). Unknown
-/// fields are ignored so an embedder on a newer client stays forward-compatible.
+/// body runs the verb with its defaults (all pipelines, no filter). A field the
+/// body does not name here is refused `400 bad_request` for every job kind, so
+/// a typo never runs the job with its defaults. A `diff` job takes only `base`
+/// and `semantic`; any other field is `400` too.
 ///
 /// Derives `JsonSchema` (crate-visible) so the OpenAPI generator can emit the
 /// `POST /api/v1/jobs/{run|plan|apply}` request-body schema from this single
@@ -3327,7 +3479,7 @@ fn too_many_requests_response(retry_after: std::time::Duration) -> Response {
 /// registered in [`super::commands::export_schemas`], so it stays out of the
 /// Pydantic/TypeScript codegen cascade.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct JobRequest {
     /// `--filter <component=value>` for `run`/`plan`.
     filter: Option<String>,
@@ -3371,9 +3523,13 @@ pub(crate) struct JobRequest {
     /// the catalog. Exactly one of `table` and `catalog`. Ignored by every
     /// other kind.
     catalog: Option<String>,
-    /// `--base <git ref>` for `preview` and `promote`: the ref the change set
-    /// is computed against. Absent means `main`. Ignored by every other kind.
+    /// `--base <git ref>` for `preview` and `promote`, and the positional ref
+    /// for `diff`: the ref the change set is computed against. Absent means
+    /// `main`. Ignored by every other kind.
     base: Option<String>,
+    /// `--semantic` for `diff`: also run the breaking-change classifier.
+    /// Ignored by every other kind.
+    semantic: Option<bool>,
 }
 
 /// Mint an opaque, collision-resistant job id for this sidecar.
@@ -3917,6 +4073,24 @@ async fn submit_compact(
     submit_job(JobKind::Compact, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/diff` — the structural model diff: `rocky ci-diff`
+/// (read-only; no mutation permit). Body `{"base": "<git ref>",
+/// "semantic": <bool>}`, both optional: `base` defaults to `main` and
+/// `semantic` to `false`. Any other field is `400 bad_request`. It diffs the
+/// `HEAD` commit; uncommitted edits are not compared. The result is the command's `CiDiffOutput`. At most one diff
+/// runs at a time: a second submission is refused `409 mutation_in_progress`
+/// with the running job's id. The job writes nothing itself, except its job
+/// record (in the server's state store). It reads the seed from `HEAD`, and its
+/// git commands never take the index lock or fetch from a partial clone's
+/// remote (a missing object fails the job and names the partial clone).
+async fn submit_diff(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Diff, state, &headers, &body).await
+}
+
 /// `GET /api/v1/branches` — canonical [`BranchListOutput`].
 ///
 /// The same bytes as `rocky branch list --output json` against the state
@@ -3960,6 +4134,7 @@ async fn submit_job(
     validate_promote_fields(kind, &request)?;
     validate_product_approve_fields(kind, &request)?;
     validate_compact_fields(kind, &request)?;
+    validate_diff_fields(kind, &request)?;
     // Project-state gates that need a read of the config or the plan: they run
     // before the permit, so a refused job never holds it.
     gate_job_against_project(kind, &state, &request).await?;
@@ -3969,7 +4144,14 @@ async fn submit_job(
     // Layer 1: the app-level single-mutating-job guard. `plan` never takes it.
     // A second `run`/`apply` while one is held returns the holder's id as a
     // `409 mutation_in_progress` rather than colliding on the redb flock.
-    let permit = if kind.mutates() {
+    // `diff` is read-only but single-flight: it takes its own slot, never the
+    // mutation permit, so it cannot block a run.
+    let permit = if kind == JobKind::Diff {
+        match state.diff_permit.try_acquire(&job_id) {
+            Ok(guard) => Some(guard),
+            Err(running_job_id) => return Err(ApiError::diff_in_progress(&running_job_id)),
+        }
+    } else if kind.mutates() {
         match state.mutation_permit.try_acquire(&job_id) {
             Ok(guard) => Some(guard),
             Err(running_job_id) => return Err(ApiError::mutation_in_progress(&running_job_id)),
@@ -4075,7 +4257,8 @@ fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiEr
         | JobKind::Preview
         | JobKind::Promote
         | JobKind::ProductApprove
-        | JobKind::Compact => Ok(()),
+        | JobKind::Compact
+        | JobKind::Diff => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
@@ -4162,6 +4345,11 @@ fn validate_preview_fields(kind: JobKind, request: &JobRequest) -> Result<(), Ap
             "invalid name: use 1 to 64 letters, digits or underscores (for example pr_preview_x), or omit it",
         ));
     }
+    validate_base_field(request)
+}
+
+/// Refuse a `base` that is not a plain git ref (see [`validate_preview_fields`]).
+fn validate_base_field(request: &JobRequest) -> Result<(), ApiError> {
     if let Some(base) = request.base.as_deref() {
         if base.is_empty()
             || base.starts_with('-')
@@ -4178,6 +4366,53 @@ fn validate_preview_fields(kind: JobKind, request: &JobRequest) -> Result<(), Ap
         }
     }
     Ok(())
+}
+
+/// Refuse a `diff` body the CLI would not take, before the permit is taken or
+/// an argv is built. `base` is passed to `git` as a revision, so it is held to
+/// the same rule as the `preview` and `promote` base. Other kinds ignore the
+/// diff fields.
+fn validate_diff_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::Diff {
+        return Ok(());
+    }
+    // Destructured without `..`, so a field added to `JobRequest` cannot pass
+    // here until someone decides whether the diff takes it.
+    let JobRequest {
+        filter,
+        pipeline,
+        model,
+        plan_id,
+        expect_spec_digest,
+        principal,
+        scope,
+        reason,
+        name,
+        table,
+        catalog,
+        base: _,
+        semantic: _,
+    } = request;
+    for (field, given) in [
+        ("filter", filter.is_some()),
+        ("pipeline", pipeline.is_some()),
+        ("model", model.is_some()),
+        ("plan_id", plan_id.is_some()),
+        ("expect_spec_digest", expect_spec_digest.is_some()),
+        ("principal", principal.is_some()),
+        ("scope", scope.is_some()),
+        ("reason", reason.is_some()),
+        ("name", name.is_some()),
+        ("table", table.is_some()),
+        ("catalog", catalog.is_some()),
+    ] {
+        if given {
+            return Err(ApiError::bad_request(format!(
+                "a diff job does not take `{field}`: it takes only `base` and `semantic`"
+            )));
+        }
+    }
+    validate_base_field(request)
 }
 
 /// The most characters a compact `table` or `catalog` may carry.
@@ -4506,7 +4741,8 @@ async fn gate_job_against_project(
         | JobKind::Unfreeze
         | JobKind::Preview
         | JobKind::ProductApprove
-        | JobKind::Compact => Ok(()),
+        | JobKind::Compact
+        | JobKind::Diff => Ok(()),
     }
 }
 
@@ -4760,6 +4996,24 @@ fn job_subprocess_args(
             } else if let Some(catalog) = &request.catalog {
                 args.push("--catalog".into());
                 args.push(catalog.into());
+            }
+        }
+        JobKind::Diff => {
+            // `rocky ci-diff [<base>]`. The job reads the seed from `HEAD`,
+            // never from the working tree, so an uncommitted seed cannot run.
+            // The ref is positional and its own entry, after `--` so git-style
+            // flag parsing never sees it.
+            if let Some(models) = &dirs.models {
+                args.push("--models".into());
+                args.push(models.into());
+            }
+            if request.semantic == Some(true) {
+                args.push("--semantic".into());
+            }
+            args.push("--seed-from-head".into());
+            if let Some(base) = &request.base {
+                args.push("--".into());
+                args.push(base.into());
             }
         }
         JobKind::Test | JobKind::Ci => {
@@ -5430,6 +5684,9 @@ const HTTP_API_SESSION_SOURCE_ENV: &str = "ROCKY_SESSION_SOURCE";
 /// The value `run_audit::detect_session_source` maps to `SessionSource::HttpApi`.
 const HTTP_API_SESSION_SOURCE: &str = "http_api";
 
+/// Git's switch that stops it fetching a missing object from a promisor remote.
+const DIFF_NO_LAZY_FETCH_ENV: &str = "GIT_NO_LAZY_FETCH";
+
 fn job_subprocess_command(
     exe: std::path::PathBuf,
     kind: JobKind,
@@ -5450,6 +5707,20 @@ fn job_subprocess_command(
     // takes it, whatever the server was started with.
     if kind == JobKind::Promote {
         cmd.env_remove(crate::commands::APPROVAL_SKIP_ENV);
+    }
+    // A diff only reads. `ci-diff` sets `GIT_OPTIONAL_LOCKS` on each git
+    // command it starts; setting it on the child as well covers any git call
+    // added later. `GIT_NO_LAZY_FETCH` stops git fetching a missing object
+    // from a partial clone's remote, which would write into the repository.
+    // `ROCKY_TRACE_DISABLE` stops the child writing `.rocky/traces`. None of
+    // these is ever set on this server process.
+    if kind == JobKind::Diff {
+        cmd.env(
+            crate::commands::GIT_OPTIONAL_LOCKS_ENV,
+            crate::commands::GIT_OPTIONAL_LOCKS_VALUE,
+        );
+        cmd.env(DIFF_NO_LAZY_FETCH_ENV, "1");
+        cmd.env(rocky_observe::traces::TRACE_DISABLE_ENV, "1");
     }
     // An approval records the approver in the shared policy-decision ledger.
     // The server's own `ROCKY_PRINCIPAL_ID` / `ROCKY_PRINCIPAL` name the
@@ -7835,7 +8106,9 @@ mod tests {
         assert_eq!(resp.status(), 500);
         let err: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(err.code, "config_invalid");
-        assert!(err.message.contains("S999"), "{}", err.message);
+        // The value the config wrote is not echoed; the section still is.
+        assert!(!err.message.contains("S999"), "{}", err.message);
+        assert!(err.message.contains("lint"), "{}", err.message);
     }
 
     // --- /review ---
@@ -16543,6 +16816,462 @@ adapter = "db"
     #[tokio::test]
     async fn compact_route_is_behind_the_write_gate() {
         assert_routes_behind_the_write_gate(&["compact"]).await;
+    }
+
+    /// `diff` is a read-only kind: it takes no mutation permit, so it never
+    /// blocks a run. Its own single-flight slot is what refuses a second diff.
+    #[test]
+    fn diff_kind_is_read_only_and_named_ci_diff() {
+        assert!(!JobKind::Diff.mutates());
+        assert_eq!(JobKind::Diff.verb(), "diff");
+        assert_eq!(JobKind::Diff.subcommand(), "ci-diff");
+        assert_eq!(JobKind::parse("diff"), Some(JobKind::Diff));
+        assert_eq!(
+            serde_json::to_value(JobKind::Diff).unwrap(),
+            serde_json::json!("diff")
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_route_is_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["diff"]).await;
+    }
+
+    /// A second diff submitted while one runs is refused with the same
+    /// `409 mutation_in_progress` the mutating kinds answer, carrying the
+    /// running job's id. The refusal comes before any argv is built, so no
+    /// child is started. The mutation permit stays free: a diff never holds it.
+    #[tokio::test]
+    async fn a_second_diff_job_is_refused_while_one_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let held = state
+            .diff_permit
+            .try_acquire("job_incumbent")
+            .expect("the diff slot is free");
+        let base = spawn_router(state.clone()).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/jobs/diff"))
+            .json(&serde_json::json!({ "base": "main" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let envelope: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(envelope.code, "mutation_in_progress");
+        assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
+        assert_eq!(
+            state.mutation_permit.running_job(),
+            None,
+            "a diff must not hold the mutation permit"
+        );
+        drop(held);
+    }
+
+    /// `base` becomes an argv entry for `git`, so a value git would read as an
+    /// option is refused before the slot is taken.
+    #[tokio::test]
+    async fn diff_route_refuses_a_base_git_would_read_as_an_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state.clone()).await;
+        for bad in ["-x", "", "a b", "--output=json"] {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/api/v1/jobs/diff"))
+                .json(&serde_json::json!({ "base": bad }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "base {bad:?}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "base {bad:?}");
+        }
+        assert_eq!(state.diff_permit.running_job(), None);
+    }
+
+    /// The argv a diff job runs: the verb, then the ref as its own entry, then
+    /// the server's `--models` and the opt-in `--semantic`. Without a body it is
+    /// `ci-diff` and `--models`, and the CLI's own defaults apply.
+    #[test]
+    fn diff_job_argv_carries_the_ref_models_and_flags() {
+        let dirs = JobProjectDirs {
+            models: Some("/p/models".into()),
+            contracts: None,
+        };
+        let argv = |request: &JobRequest| -> Vec<String> {
+            job_subprocess_args(
+                JobKind::Diff,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &dirs,
+                std::path::Path::new("/p/state.redb"),
+                request,
+            )
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let head = [
+            "--output",
+            "json",
+            "--config",
+            "/p/rocky.toml",
+            "--state-path",
+            "/p/state.redb",
+            "ci-diff",
+        ];
+        let full: JobRequest = serde_json::from_value(serde_json::json!({
+            "base": "origin/main", "semantic": true
+        }))
+        .unwrap();
+        assert_eq!(
+            argv(&full),
+            [
+                &head[..],
+                &[
+                    "--models",
+                    "/p/models",
+                    "--semantic",
+                    "--seed-from-head",
+                    "--",
+                    "origin/main"
+                ]
+            ]
+            .concat()
+        );
+        let plain = JobRequest::default();
+        assert_eq!(
+            argv(&plain),
+            [&head[..], &["--models", "/p/models", "--seed-from-head"]].concat()
+        );
+        let off: JobRequest =
+            serde_json::from_value(serde_json::json!({ "semantic": false })).unwrap();
+        assert_eq!(argv(&off), argv(&plain));
+    }
+
+    /// The diff child carries `GIT_OPTIONAL_LOCKS=0` on its own `Command`, so
+    /// every git it starts inherits it. No other kind gets it, and this
+    /// process does not.
+    #[test]
+    fn diff_job_child_carries_git_optional_locks_zero() {
+        let env_named = |kind: JobKind, name: &'static str| {
+            let cmd = job_subprocess_command(
+                std::path::PathBuf::from("/bin/rocky"),
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &JobProjectDirs::default(),
+                std::path::Path::new("/p/state.redb"),
+                &JobRequest::default(),
+            );
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        for name in ["GIT_NO_LAZY_FETCH", "ROCKY_TRACE_DISABLE"] {
+            assert_eq!(
+                env_named(JobKind::Diff, name).as_deref(),
+                Some("1"),
+                "{name}"
+            );
+            assert_eq!(env_named(JobKind::Ci, name), None, "{name}");
+            assert!(std::env::var_os(name).is_none(), "{name} set process-wide");
+        }
+        let env_of = |kind: JobKind| {
+            let cmd = job_subprocess_command(
+                std::path::PathBuf::from("/bin/rocky"),
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &JobProjectDirs::default(),
+                std::path::Path::new("/p/state.redb"),
+                &JobRequest::default(),
+            );
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == "GIT_OPTIONAL_LOCKS")
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(env_of(JobKind::Diff).as_deref(), Some("0"));
+        assert_eq!(env_of(JobKind::Ci), None);
+        assert_eq!(env_of(JobKind::Run), None);
+        assert!(std::env::var_os("GIT_OPTIONAL_LOCKS").is_none());
+    }
+
+    /// A field the diff job does not take is refused, not ignored: a
+    /// `working_tree` that answered `202` would run a `HEAD` diff in silence.
+    #[tokio::test]
+    async fn diff_route_refuses_a_field_it_does_not_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state.clone()).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/jobs/diff"))
+            .json(&serde_json::json!({ "working_tree": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let envelope: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(envelope.code, "bad_request");
+        assert!(
+            envelope.message.contains("working_tree"),
+            "{}",
+            envelope.message
+        );
+        assert_eq!(state.diff_permit.running_job(), None);
+    }
+
+    /// An invalid `rocky.toml` reports its line and column, never the quoted
+    /// source line, and names no absolute path, in every check that repeats it.
+    #[tokio::test]
+    async fn doctor_route_drops_the_source_line_and_the_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\n\n[[hook.on_pipeline_start]]\n\
+             command = \"curl -H 'Bearer ERRSECRET1'\n",
+        )
+        .unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/doctor")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("line 5"), "{body}");
+        assert!(!body.contains("ERRSECRET1"), "{body}");
+        let root_text = root.to_string_lossy();
+        assert!(!body.contains(root_text.as_ref()), "{body}");
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        assert!(
+            !body.contains(canonical.to_string_lossy().as_ref()),
+            "{body}"
+        );
+    }
+
+    /// The local doctor writes nothing: not the spool's sentinel, which
+    /// `count_corrupt` would create, and not any other file.
+    #[tokio::test]
+    async fn doctor_route_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let spool = root.join(".rocky").join("pending-demands");
+        std::fs::create_dir_all(&spool).unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        wait_compiled(&state).await;
+        let base = spawn_router(state).await;
+        let before = tree_snapshot(dir.path());
+        let resp = reqwest::get(format!("{base}/api/v1/doctor")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "spool"),
+            "the spool check must have run: {body}"
+        );
+        assert!(!spool.join(".spool-sentinel").exists());
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            tree_snapshot(dir.path()).keys().collect::<Vec<_>>(),
+            "the doctor route created a file"
+        );
+    }
+
+    /// The diff job takes `base` and `semantic` only. Every other `JobRequest`
+    /// field is `400`, and the message names it, so a body meant for another
+    /// job never runs a whole-project diff.
+    #[tokio::test]
+    async fn diff_route_refuses_every_field_but_base_and_semantic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state.clone()).await;
+        for field in [
+            "filter",
+            "pipeline",
+            "model",
+            "plan_id",
+            "expect_spec_digest",
+            "principal",
+            "scope",
+            "reason",
+            "name",
+            "table",
+            "catalog",
+        ] {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/api/v1/jobs/diff"))
+                .json(&serde_json::json!({ field: "x" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{field}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                envelope.message.contains(field),
+                "{field}: {}",
+                envelope.message
+            );
+        }
+        assert_eq!(state.diff_permit.running_job(), None);
+    }
+
+    /// A state store outside the project, held by another handle, is reported
+    /// by file name only: the absolute path is not served.
+    #[tokio::test]
+    async fn doctor_route_hides_a_state_path_outside_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, _inside) = promote_gate_project(dir.path(), "");
+        let outside_dir = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("outside-state.redb");
+        let state = pinned_server(root.join("models"), Some(config), &outside);
+        let base = spawn_router(state).await;
+        let holder = rocky_core::state::StateStore::open(&outside).expect("hold the store");
+        let body = reqwest::get(format!("{base}/api/v1/doctor"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("Cannot open state store"), "{body}");
+        assert!(body.contains("outside-state.redb"), "{body}");
+        assert!(!body.contains("elsewhere"), "{body}");
+        let canonical = std::fs::canonicalize(&outside_dir).unwrap();
+        assert!(
+            !body.contains(canonical.to_string_lossy().as_ref()),
+            "{body}"
+        );
+        drop(holder);
+    }
+
+    /// `without_config_values` keeps a key path and drops a quoted value.
+    #[test]
+    fn config_values_are_dropped_and_key_paths_kept() {
+        let cleaned = without_config_values(
+            "invalid type: integer `99887766`, expected a string for key `adapter.default.token`\n\
+             unknown variant `SECRETV`, expected one of `a`, `b`\n\
+             unsupported pipeline type: 'SECRETT'\n\
+             it doesn't leak",
+        );
+        assert!(!cleaned.contains("99887766"), "{cleaned}");
+        assert!(!cleaned.contains("SECRETV"), "{cleaned}");
+        assert!(!cleaned.contains("SECRETT"), "{cleaned}");
+        assert!(cleaned.contains("`adapter.default.token`"), "{cleaned}");
+        assert!(cleaned.contains("doesn't leak"), "{cleaned}");
+    }
+
+    /// Three error shapes that echo a config value (a wrong type, an unknown
+    /// variant, an unsupported pipeline type) reach neither the doctor route
+    /// nor the `config_invalid` body with the planted value in it.
+    #[tokio::test]
+    async fn config_value_echoes_never_reach_an_http_body() {
+        for (shape, text, token) in [
+            (
+                "invalid type",
+                "[adapter]\ntype = \"databricks\"\nhost = \"h\"\ntoken = 99887766\n",
+                "99887766",
+            ),
+            (
+                "unknown variant",
+                "[adapter]\ntype = \"duckdb\"\n\n[state]\nbackend = \"SECRETVARIANT7\"\n",
+                "SECRETVARIANT7",
+            ),
+            (
+                "unsupported type",
+                "[adapter]\ntype = \"duckdb\"\n\n[pipeline.p]\ntype = \"SECRETTYPE7\"\n",
+                "SECRETTYPE7",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (root, config, state_path) = promote_gate_project(dir.path(), "");
+            std::fs::write(&config, text).unwrap();
+            let state = pinned_server(root.join("models"), Some(config), &state_path);
+            let base = spawn_router(state).await;
+            for path in ["/api/v1/doctor", "/api/v1/hooks"] {
+                let body = reqwest::get(format!("{base}{path}"))
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                assert!(!body.contains(token), "{shape} {path}: {body}");
+            }
+        }
+    }
+
+    /// `GET /api/v1/doctor` runs the local set only: no `state_rw`,
+    /// `state_concurrency` or `auth` check, and the ones it does run are there.
+    #[tokio::test]
+    async fn doctor_route_runs_only_the_local_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/doctor")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["command"], "doctor");
+        let names: Vec<&str> = body["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        for expected in ["config", "state", "state_schema", "adapters", "pipelines"] {
+            assert!(names.contains(&expected), "{expected} missing: {names:?}");
+        }
+        for skipped in ["state_rw", "state_concurrency"] {
+            assert!(!names.contains(&skipped), "{skipped} ran: {names:?}");
+        }
+        assert!(
+            names.iter().all(|name| !name.starts_with("auth")),
+            "an auth check ran: {names:?}"
+        );
+    }
+
+    /// A state store another handle holds is a `warning` check in a `200`
+    /// answer: never a `503`, never an error envelope.
+    #[tokio::test]
+    async fn doctor_route_reports_a_busy_state_store_as_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state).await;
+        let holder = rocky_core::state::StateStore::open(&state_path).expect("hold the store");
+        let resp = reqwest::get(format!("{base}/api/v1/doctor")).await.unwrap();
+        assert_eq!(resp.status(), 200, "a busy store must not be a 503");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let check = body["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "state")
+            .expect("the state check")
+            .clone();
+        assert_eq!(check["status"], "warning", "{body}");
+        assert_ne!(body["overall"], "critical", "{body}");
+        drop(holder);
+    }
+
+    /// A critical check is still a `200` report: the route returns the output
+    /// struct and never exits the process, as `rocky doctor` does on exit `3`.
+    #[tokio::test]
+    async fn doctor_route_answers_200_with_a_critical_report_and_does_not_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        std::fs::write(&config, "this is = not [valid toml").unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/doctor")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["overall"], "critical", "{body}");
     }
 }
 

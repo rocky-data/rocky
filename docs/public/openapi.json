@@ -11775,15 +11775,23 @@
               "compact"
             ],
             "type": "string"
+          },
+          {
+            "description": "`rocky ci-diff` — the structural model diff between a git ref and the `HEAD` commit, with the column lineage it moves. Uncommitted edits are not compared. Read-only: the job writes nothing itself, except its job record, which the server keeps in its state store (by default `models/.rocky-state.redb`, inside the project). It reads `data/seed.sql` from `HEAD`; a seed committed there runs as it does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still writes where it says. Its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job and nothing is fetched. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.",
+            "enum": [
+              "diff"
+            ],
+            "type": "string"
           }
         ]
       },
       "JobRequest": {
-        "description": "Optional JSON body for a job submission. Every field is optional; an empty body runs the verb with its defaults (all pipelines, no filter). Unknown fields are ignored so an embedder on a newer client stays forward-compatible.\n\nDerives `JsonSchema` (crate-visible) so the OpenAPI generator can emit the `POST /api/v1/jobs/{run|plan|apply}` request-body schema from this single source of truth rather than a hand-copied duplicate. It is deliberately not registered in [`super::commands::export_schemas`], so it stays out of the Pydantic/TypeScript codegen cascade.",
+        "additionalProperties": false,
+        "description": "Optional JSON body for a job submission. Every field is optional; an empty body runs the verb with its defaults (all pipelines, no filter). A field the body does not name here is refused `400 bad_request` for every job kind, so a typo never runs the job with its defaults. A `diff` job takes only `base` and `semantic`; any other field is `400` too.\n\nDerives `JsonSchema` (crate-visible) so the OpenAPI generator can emit the `POST /api/v1/jobs/{run|plan|apply}` request-body schema from this single source of truth rather than a hand-copied duplicate. It is deliberately not registered in [`super::commands::export_schemas`], so it stays out of the Pydantic/TypeScript codegen cascade.",
         "properties": {
           "base": {
             "default": null,
-            "description": "`--base <git ref>` for `preview` and `promote`: the ref the change set is computed against. Absent means `main`. Ignored by every other kind.",
+            "description": "`--base <git ref>` for `preview` and `promote`, and the positional ref for `diff`: the ref the change set is computed against. Absent means `main`. Ignored by every other kind.",
             "type": [
               "string",
               "null"
@@ -11866,6 +11874,14 @@
             "description": "`--scope <selector>` for `freeze` and `unfreeze`: `any` (the default), `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`. Ignored by every other kind.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "semantic": {
+            "default": null,
+            "description": "`--semantic` for `diff`: also run the breaking-change classifier. Ignored by every other kind.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -29895,6 +29911,28 @@
         ]
       }
     },
+    "/api/v1/doctor": {
+      "get": {
+        "description": "The local health checks: the same report as `rocky doctor --check-set local --output json`. It covers `config`, `state`, `state_schema`, `adapters`, `pipelines`, `state_sync`, `scheduler` and `spool`. It skips `state_rw`, `state_concurrency` and `auth`, so it makes no network call, no warehouse call and no write to a remote state backend. A state store another process holds is a `warning` check, not an error response. A critical check, such as an invalid `rocky.toml`, still answers `200`: read `overall`. Read-only.",
+        "operationId": "getDoctor",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DoctorOutput"
+                }
+              }
+            },
+            "description": "The health report."
+          }
+        },
+        "summary": "Local health checks",
+        "tags": [
+          "project"
+        ]
+      }
+    },
     "/api/v1/gc/derivable": {
       "get": {
         "description": "The derivability inventory: which content-addressed artifacts a recorded recipe could rebuild. The same bytes as `rocky gc --derivable --dry-run --output json`. Reads the artifact ledger and writes nothing: no plan file, no review row, no eviction.",
@@ -30380,6 +30418,78 @@
           }
         },
         "summary": "Submit a compact plan job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/v1/jobs/diff": {
+      "post": {
+        "description": "Submit a `diff` job: `rocky ci-diff`, the structural model diff between a git ref and `HEAD`, with the column lineage it moves. The result is the `ci-diff` output. It is read-only: the job writes nothing itself, except its job record, which the server keeps in its state store (by default `models/.rocky-state.redb`, inside the project). It reads `data/seed.sql` from `HEAD`, never from the working tree; a seed committed there runs as it does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still writes where it says. Its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job with a message that names the partial clone, and nothing is fetched. It takes no mutation permit, so it never blocks a run. At most one diff runs at a time: a second submission answers `409 mutation_in_progress` with the running job's id. Body fields, both optional: `base` (a git ref, default `main`, validated before the job starts) and `semantic` (also run the breaking-change classifier). Any other field is `400 bad_request`. It diffs the `HEAD` commit: uncommitted edits are not compared.",
+        "operationId": "submitDiffJob",
+        "parameters": [
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Principal",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          },
+          "description": "Optional job parameters. An empty body runs the verb with its defaults.",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "job_id"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Job accepted. Poll `GET /api/v1/jobs/{id}` for status."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The request body or a header could not be parsed."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another diff job is already running (`mutation_in_progress`). Its id is carried in `running_job_id`."
+          }
+        },
+        "summary": "Submit a model diff job",
         "tags": [
           "jobs"
         ]

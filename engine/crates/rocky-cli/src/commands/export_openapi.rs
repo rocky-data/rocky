@@ -396,6 +396,12 @@ fn route_table() -> Vec<Route> {
              The holder's id is carried in `running_job_id`.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const DIFF_IN_PROGRESS: Resp = Resp {
+        status: "409",
+        description: "Another diff job is already running (`mutation_in_progress`). Its id is \
+             carried in `running_job_id`.",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const APPLY_REFUSED: Resp = Resp {
         status: "409",
         description: "Another run/apply job already holds the single-mutating-job permit \
@@ -998,6 +1004,36 @@ fn route_table() -> Vec<Route> {
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
             responses: &[JOB_ACCEPTED, BAD_REQUEST],
+            auth_exempt: false,
+        },
+        Route {
+            method: "post",
+            path: "/api/v1/jobs/diff",
+            operation_id: "submitDiffJob",
+            tag: "jobs",
+            summary: "Submit a model diff job",
+            description: "Submit a `diff` job: `rocky ci-diff`, the structural model diff \
+                 between a git ref and `HEAD`, with the column lineage it moves. The result \
+                 is the `ci-diff` output. It is read-only: the job writes nothing itself, except \
+                 its job record, which the server keeps in its state store (by default \
+                 `models/.rocky-state.redb`, inside the project). It reads `data/seed.sql` \
+                 from `HEAD`, never from the working tree; a seed committed there runs as it \
+                 does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still \
+                 writes where it says. Its git commands set `GIT_OPTIONAL_LOCKS=0` and \
+                 `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job \
+                 with a message that names the partial clone, and nothing is fetched. It \
+                 takes no mutation \
+                 permit, so it never blocks a run. At most one diff runs at a time: \
+                 a second submission answers `409 mutation_in_progress` with the running \
+                 job's id. Body fields, both optional: `base` (a git ref, default `main`, \
+                 validated before the job starts) and `semantic` (also run the \
+                 breaking-change classifier). Any other field is `400 bad_request`. It diffs the \
+                 `HEAD` commit: uncommitted edits are not compared.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST, DIFF_IN_PROGRESS],
             auth_exempt: false,
         },
         Route {
@@ -1730,6 +1766,31 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/doctor",
+            operation_id: "getDoctor",
+            tag: "project",
+            summary: "Local health checks",
+            description: "The local health checks: the same report as `rocky doctor \
+                 --check-set local --output json`. It covers `config`, `state`, \
+                 `state_schema`, `adapters`, `pipelines`, `state_sync`, `scheduler` and \
+                 `spool`. It skips `state_rw`, `state_concurrency` and `auth`, so it makes \
+                 no network call, no warehouse call and no write to a remote state \
+                 backend. A state store another process holds is a `warning` check, not an \
+                 error response. A critical check, such as an invalid `rocky.toml`, still \
+                 answers `200`: read `overall`. Read-only.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[Resp {
+                status: "200",
+                description: "The health report.",
+                body: Body::Component("DoctorOutput"),
+            }],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/brief",
             operation_id: "getBrief",
             tag: "governor",
@@ -2330,6 +2391,7 @@ mod tests {
             "RetentionStatusOutput",
             "GcReportOutput",
             "LintOutput",
+            "DoctorOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -2411,6 +2473,7 @@ mod tests {
             ("/api/v1/retention", "RetentionStatusOutput"),
             ("/api/v1/gc/derivable", "GcReportOutput"),
             ("/api/v1/lint", "LintOutput"),
+            ("/api/v1/doctor", "DoctorOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

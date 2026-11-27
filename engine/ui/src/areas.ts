@@ -135,6 +135,21 @@ export const AREAS: readonly Area[] = [
   },
 ];
 
+/**
+ * The sidebar's sections, in order. Each lists only areas that open a screen
+ * today: a group never holds a disabled area, so no entry is a dead link.
+ * Settings has no screen, so it has no group; it stays under "No page yet".
+ */
+export const AREA_GROUPS: readonly {
+  readonly id: string;
+  readonly label: string;
+  readonly areas: readonly AreaId[];
+}[] = [
+  { id: "work", label: "Work", areas: ["needs-you", "review"] },
+  { id: "data", label: "Data", areas: ["estate", "products"] },
+  { id: "govern", label: "Govern", areas: ["governance"] },
+];
+
 /** The disclosure that folds the areas that open nothing yet. */
 export const NOT_YET_HEADING = "No page yet";
 
