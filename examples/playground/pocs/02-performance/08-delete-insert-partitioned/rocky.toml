@@ -1,4 +1,4 @@
-# Delete+Insert partitioned strategy — atomic partition replacement
+# Delete+Insert partitioned strategy — partition replacement (DELETE then INSERT; not one transaction on DuckDB)
 
 [adapter]
 type = "duckdb"
