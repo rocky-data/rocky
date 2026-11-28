@@ -1266,6 +1266,103 @@ pub fn statement_may_still_run(err: &anyhow::Error) -> bool {
     false
 }
 
+/// One chain link's answer to [`statement_outcome_unknown`]: `Some` when the
+/// link is a Databricks, Snowflake, BigQuery or Trino connector error, `None`
+/// otherwise.
+///
+/// A transport error (`Http`) that failed to connect never reached the
+/// warehouse. Any other one (a read timeout, a reset, a body that did not
+/// decode) may follow a submit the warehouse accepted.
+fn cause_outcome_unknown(cause: &(dyn std::error::Error + 'static)) -> Option<bool> {
+    if let Some(e) = cause.downcast_ref::<rocky_databricks::connector::ConnectorError>() {
+        use rocky_databricks::connector::ConnectorError as E;
+        return Some(match e {
+            E::Http(e) => !e.is_connect(),
+            E::ApiError { status, .. } => (500..=599).contains(status),
+            // Follows a transient error the warehouse may have accepted.
+            E::RetryBudgetExhausted { .. } => true,
+            // The statement ran (or is in a state Rocky does not know), and
+            // its result could not be read.
+            E::UnexpectedState { .. } | E::NoArrowChunks { .. } | E::Arrow(_) => true,
+            E::Timeout { .. } | E::Abandoned { .. } => true,
+            E::Auth(_)
+            | E::StatementFailed { .. }
+            | E::Canceled { .. }
+            | E::CircuitBreakerOpen { .. } => false,
+        });
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
+        use rocky_snowflake::connector::ConnectorError as E;
+        return Some(match e {
+            E::Http(e) => !e.is_connect(),
+            E::ApiError { status, .. } => (500..=599).contains(status),
+            E::RetryBudgetExhausted { .. } => true,
+            E::Timeout { .. } | E::Abandoned { .. } => true,
+            E::Auth(_) | E::StatementFailed { .. } | E::CircuitBreakerOpen { .. } => false,
+        });
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        use rocky_bigquery::connector::BigQueryError as E;
+        return Some(match e {
+            E::Http(e) => !e.is_connect(),
+            E::ApiError { status, .. } => !matches!(
+                status
+                    .split_whitespace()
+                    .next()
+                    .and_then(|code| code.parse::<u16>().ok()),
+                Some(0..=499)
+            ),
+            E::RetryBudgetExhausted { .. } => true,
+            E::StorageRead(_) => true,
+            E::Timeout { .. } | E::Abandoned { .. } | E::NoJobReference | E::ResultLost { .. } => {
+                true
+            }
+            E::Auth(_) | E::TableNotFound { .. } | E::JobError { .. } | E::LoadJobError { .. } => {
+                false
+            }
+        });
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        use rocky_trino::connector::TrinoError as E;
+        return Some(match e {
+            E::Http(e) => !e.is_connect(),
+            E::HttpStatus { status, .. } => (500..=599).contains(status),
+            E::MalformedResponse(_)
+            | E::UntrustedNextUri { .. }
+            | E::ArrowEncodingUnavailable
+            | E::ArrowDecode(_) => true,
+            E::Timeout { .. } | E::Abandoned { .. } => true,
+            E::Auth(_) | E::QueryFailed { .. } => false,
+        });
+    }
+    None
+}
+
+/// Whether `err`, returned by a statement that writes, leaves unknown whether
+/// the warehouse applied the write (#2800).
+///
+/// `true` for a connector error that may follow a submit the warehouse
+/// accepted: a 5xx after the connector's own resends, a transport error other
+/// than a failed connect, a run-level retry budget spent on such an error, a
+/// result Rocky could not read, and every error [`statement_may_still_run`]
+/// accepts. `false` for an answer that the write did not apply (the warehouse
+/// rejected or failed the statement, a 4xx, a failed connect, an open breaker,
+/// an auth failure), and when the chain holds no connector error of those four
+/// adapters.
+///
+/// Walks the chain the way [`statement_may_still_run`] does.
+pub fn statement_outcome_unknown(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(answer) = cause_outcome_unknown(cause) {
+            return answer;
+        }
+        if let Some(answer) = probe_wrapped_adapter_cause(cause, cause_outcome_unknown) {
+            return answer;
+        }
+    }
+    false
+}
+
 /// [`classify_anyhow_error_with_cooldown`] for a bare
 /// [`rocky_core::traits::AdapterError`], as `WarehouseAdapter` methods return.
 ///
