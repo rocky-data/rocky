@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **ui:** the Inbox now has a Recent runs card from `GET /api/v1/runs`, between the Waiting on you card and the details. Tiles count the runs that succeeded, partly failed and failed, and each tile names its window ("of the last 50 runs"). There is one lane per pipeline, with one cell per run that links to its custody. A tile per pipeline shows its newest run model by model. The page reads the route once and does not poll it. A read that fails shows a grey `-`, never zero.
+
 ### Fixed
 
 - `rocky fulfill`: a failing or refused unit test (`[[test]]`) now turns the verify bundle red, and the bundle's detail names each failing test (#2778). Before, the gate read only model execution failures, so a fixture test whose `expect` rows did not match passed and fulfill went on to propose. The post-apply observation reads the same tests, so its journal line now says `RED` for a failing unit test too; that changes no state.

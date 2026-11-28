@@ -11,6 +11,7 @@ import { defaultJobClient, type JobClient } from "../operator";
 import { FreezeControls } from "./FreezeControls";
 import { CustodyLink } from "./links";
 import { Rows, SectionCard } from "./SectionCard";
+import { RunLanes, defaultRunsLoader, type RunsLoader } from "./RunLanes";
 
 export type BriefLoader = (since: BriefSinceMode) => Promise<BriefOutput>;
 
@@ -66,16 +67,27 @@ function instant(iso: string | null | undefined, now?: number): ReactNode {
  */
 export function BriefScreen({
   load = defaultBriefLoader,
+  loadRuns = defaultRunsLoader,
   now,
   jobs = defaultJobClient,
 }: {
   load?: BriefLoader;
+  /** `GET /api/v1/runs`, read once: no interval, and the window does not re-read it. */
+  loadRuns?: RunsLoader;
   now?: number;
   jobs?: JobClient;
 }) {
   const [since, setSince] = useState<BriefSinceMode>("7d");
   const loader = useCallback(() => load(since), [load, since]);
   const brief = useResource(loader, [loader]);
+  // No interval: the route takes the state file's lock briefly, so the Inbox
+  // reads it once, and again only when a person presses Refresh.
+  const runs = useResource(loadRuns, [loadRuns]);
+  const refresh = () => {
+    brief.reload();
+    runs.reload();
+  };
+  const lanes = <RunLanes runs={runs} now={now} />;
 
   return (
     <div className="space-y-6">
@@ -102,7 +114,7 @@ export function BriefScreen({
             {WINDOWS.find((w) => w.id === since)?.hint}
           </span>
         </div>
-        <button type="button" onClick={brief.reload} className={READ_BUTTON}>
+        <button type="button" onClick={refresh} className={READ_BUTTON}>
           <ArrowPathIcon aria-hidden="true" className="size-4" />
           Refresh
         </button>
@@ -119,7 +131,11 @@ export function BriefScreen({
       {brief.kind === "unreachable" && (
         <StatusCard label="engine" value="unreachable" tone="risk" sub={brief.message} />
       )}
-      {brief.kind === "ready" && <BriefBody brief={brief.value} now={now} jobs={jobs} onChanged={brief.reload} />}
+      {/* The runs read stands on its own: a digest that did not land does not hide it. */}
+      {brief.kind !== "ready" && lanes}
+      {brief.kind === "ready" && (
+        <BriefBody brief={brief.value} now={now} jobs={jobs} onChanged={brief.reload} lanes={lanes} />
+      )}
     </div>
   );
 }
@@ -129,11 +145,14 @@ function BriefBody({
   now,
   jobs,
   onChanged,
+  lanes,
 }: {
   brief: BriefOutput;
   now?: number;
   jobs: JobClient;
   onChanged: () => void;
+  /** Recent runs: the status block, after what to act on and before the context. */
+  lanes: ReactNode;
 }) {
   const {
     agent_activity: activity,
@@ -150,6 +169,8 @@ function BriefBody({
       <StatusLine brief={brief} />
 
       <WaitingCard brief={brief} now={now} />
+
+      {lanes}
 
       <p className="text-xs text-muted">
         Digest generated {formatInstant(brief.generated_at, now)}, window <code>{brief.since_mode}</code>
