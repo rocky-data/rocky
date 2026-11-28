@@ -389,6 +389,14 @@ impl<'a> SkipGate<'a> {
         prior: &ModelExecution,
         current_sigs: &[UpstreamSig],
     ) -> bool {
+        // A filtered `incremental` model without a `lookback` (#2795): its
+        // target's watermark can sit below its input's `MAX(ts)`, and a late
+        // row in that gap is loaded by a build while `MAX(ts)` and
+        // `COUNT(*)` both hold. No signal proves it unchanged: always build.
+        if max_ts_never_proves(model) {
+            return false;
+        }
+
         // A declared dependency on something that is not a model of this
         // project — a seed or load pipeline the `--dag` graph resolved
         // (#2138) — carries no signature the gate can compare, and the
@@ -424,14 +432,6 @@ impl<'a> SkipGate<'a> {
             .iter()
             .map(|s| (s.upstream_key.as_str(), s))
             .collect();
-
-        // A filtered `incremental` model without a `lookback` (#2795): its
-        // target's watermark can sit below the source `MAX(ts)`, and a late
-        // row in that gap is loaded by a build while `MAX(ts)` and
-        // `COUNT(*)` both hold. No raw-source signal proves it unchanged.
-        if !current_sigs.is_empty() && max_ts_never_proves(model) {
-            return false;
-        }
 
         let max_ts_sufficient = max_ts_is_sufficient(&model.config.strategy);
         for cur in current_sigs {
@@ -639,24 +639,55 @@ fn max_ts_is_sufficient(strategy: &rocky_core::models::StrategyConfig) -> bool {
 /// Its build reads only the rows above the target's own `MAX(ts)`. When the
 /// SQL drops rows, that watermark can sit below the source `MAX(ts)`, so a
 /// late row between the two changes the output while the source `MAX(ts)`
-/// and `COUNT(*)` stay put. Such a model always builds. A lookback model
-/// keeps its own rule ([`max_ts_is_sufficient`]).
+/// and `COUNT(*)` stay put. Such a model always builds. A `lookback` of `0`
+/// is no lookback (the build re-reads nothing), so it counts here too. A
+/// model with a real lookback keeps its own rule ([`max_ts_is_sufficient`]).
 fn max_ts_never_proves(model: &rocky_core::models::Model) -> bool {
-    matches!(
-        model.config.strategy,
-        rocky_core::models::StrategyConfig::Incremental { lookback: None, .. }
-    ) && !keeps_every_source_row(&model.sql)
+    let rocky_core::models::StrategyConfig::Incremental {
+        timestamp_column,
+        filter_column,
+        lookback,
+        ..
+    } = &model.config.strategy
+    else {
+        return false;
+    };
+    if lookback.is_some_and(|lb| lb.amount > 0) {
+        return false;
+    }
+    let Some(ts) = timestamp_column.as_deref() else {
+        return true;
+    };
+    // The placeholder compares `filter_column` when set. A different column
+    // from the probed `timestamp_column` breaks the proof.
+    let filter_is_ts = filter_column.as_deref().is_none_or(|f| {
+        f.rsplit('.')
+            .next()
+            .is_some_and(|c| c.eq_ignore_ascii_case(ts))
+    });
+    !(filter_is_ts && keeps_every_source_row(&model.sql, ts))
 }
 
-/// Whether `sql` provably passes every row of its one source table through.
+/// Whether `sql` provably copies every row of its one source table, with
+/// the watermark column `ts` unchanged.
 ///
-/// A whitelist, so anything not matched counts as filtered: one `SELECT`
-/// over one bare table, no `JOIN`, no `WHERE` other than a lone
-/// `@incremental_filter` placeholder (the watermark filter itself), and no
-/// `PREWHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, `DISTINCT`, `TOP`, `LIMIT`,
-/// `OFFSET` or `FETCH`. An unparseable body counts as filtered.
-fn keeps_every_source_row(sql: &str) -> bool {
-    use sqlparser::ast::{Expr, GroupByExpr, SetExpr, Statement, TableFactor, Value};
+/// A whitelist, so anything not matched counts as filtered:
+/// - one `SELECT` over one bare table (no table function, sample,
+///   partition or time-travel clause), with no `JOIN`;
+/// - no `WHERE` other than a lone `@incremental_filter` placeholder (the
+///   watermark filter itself);
+/// - no `PREWHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, `DISTINCT`, `TOP`,
+///   `LIMIT`, `OFFSET` or `FETCH`;
+/// - a projection of plain column references or `*` only, so no expression
+///   can change `ts`, aggregate rows or expand them, and no other column is
+///   renamed to `ts`.
+///
+/// An unparseable body counts as filtered.
+fn keeps_every_source_row(sql: &str, ts: &str) -> bool {
+    use sqlparser::ast::{
+        Expr, GroupByExpr, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+        TableFactor, Value, WildcardAdditionalOptions,
+    };
 
     let Ok(Statement::Query(query)) = rocky_sql::parser::parse_single_statement(sql) else {
         return false;
@@ -682,7 +713,41 @@ fn keeps_every_source_row(sql: &str) -> bool {
         GroupByExpr::Expressions(exprs, modifiers) => exprs.is_empty() && modifiers.is_empty(),
         GroupByExpr::All(_) => false,
     };
-    matches!(from.relation, TableFactor::Table { args: None, .. })
+    let bare_table = matches!(
+        &from.relation,
+        TableFactor::Table {
+            args: None,
+            sample: None,
+            version: None,
+            json_path: None,
+            partitions,
+            with_hints,
+            ..
+        } if partitions.is_empty() && with_hints.is_empty()
+    );
+    let column_name = |expr: &Expr| match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.clone()),
+        _ => None,
+    };
+    let plain_wildcard = |opts: &WildcardAdditionalOptions| {
+        opts.opt_replace.is_none() && opts.opt_rename.is_none() && opts.opt_alias.is_none()
+    };
+    let plain_projection = select.projection.iter().all(|item| match item {
+        SelectItem::UnnamedExpr(expr) => column_name(expr).is_some(),
+        SelectItem::ExprWithAlias { expr, alias } => column_name(expr).is_some_and(|col| {
+            !alias.value.eq_ignore_ascii_case(ts) || col.eq_ignore_ascii_case(ts)
+        }),
+        SelectItem::ExprWithAliases { .. } => false,
+        SelectItem::Wildcard(opts) => plain_wildcard(opts),
+        SelectItem::QualifiedWildcard(kind, opts) => {
+            matches!(kind, SelectItemQualifiedWildcardKind::ObjectName(_)) && plain_wildcard(opts)
+        }
+    });
+    bare_table
+        && plain_projection
+        && select.exclude.is_none()
+        && select.into.is_none()
         && from.joins.is_empty()
         && select.selection.as_ref().is_none_or(lone_placeholder)
         && select.prewhere.is_none()
@@ -1005,10 +1070,26 @@ mod tests {
             "SELECT * FROM raw.events",
             "SELECT id, ts FROM raw.events WHERE @incremental_filter",
             "SELECT id, ts FROM raw.events ORDER BY ts",
+            "SELECT e.id, e.ts FROM raw.events e",
+            "SELECT e.* FROM raw.events AS e",
+            "SELECT id AS order_id, ts FROM raw.events",
+            "SELECT id, ts AS ts FROM raw.events",
         ] {
-            assert!(keeps_every_source_row(sql), "{sql}");
+            assert!(keeps_every_source_row(sql, "ts"), "{sql}");
         }
         for sql in [
+            // The projection changes, aggregates, expands or renames rows.
+            "SELECT id, CAST(ts AS DATE) AS ts FROM raw.events WHERE @incremental_filter",
+            "SELECT id, DATE_TRUNC('day', ts) AS ts FROM raw.events",
+            "SELECT MIN(ts) AS ts FROM raw.events",
+            "SELECT id, ts, UNNEST(items) AS item FROM raw.events",
+            "SELECT id, synced_at AS ts FROM raw.events",
+            "SELECT * REPLACE (CAST(ts AS DATE) AS ts) FROM raw.events",
+            // The table factor samples or calls a function.
+            "SELECT id, ts FROM raw.events TABLESAMPLE (10 PERCENT)",
+            "SELECT * FROM read_parquet('x.parquet')",
+            "SELECT TOP 5 id, ts FROM raw.events",
+            "SELECT id, ts FROM raw.events FETCH FIRST 5 ROWS ONLY",
             "SELECT id, ts FROM raw.events WHERE id <> 10",
             "SELECT id, ts FROM raw.events WHERE @incremental_filter AND id <> 10",
             "SELECT e.id, e.ts FROM raw.events e JOIN raw.users u ON e.uid = u.id",
@@ -1026,7 +1107,7 @@ mod tests {
             "SELECT id, ts FROM (SELECT * FROM raw.events WHERE id > 1) t",
             "not sql at all",
         ] {
-            assert!(!keeps_every_source_row(sql), "{sql}");
+            assert!(!keeps_every_source_row(sql, "ts"), "{sql}");
         }
     }
 

@@ -46280,6 +46280,30 @@ auto_create_schemas = true
         );
     }
 
+    /// #2795: `lookback = "0 days"` is no lookback, so the filtered model
+    /// gets the same rule. With the rowcount fallback on, an `UPDATE` into
+    /// the gap keeps `COUNT(*)` and `MAX(ts)`, and the model still builds.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_filtered_incremental_with_zero_lookback_builds_when_count_and_max_hold() {
+        let (out2, rows, _) = incremental_gate_after_sql(
+            FILTERED,
+            9,
+            "lookback = \"0 days\"\n",
+            active_gate(true, 0),
+            "UPDATE main.events SET occurred_at = TIMESTAMP '2026-04-01 00:09:30' WHERE id = 3",
+        )
+        .await;
+        assert!(
+            built(&out2, "inc"),
+            "a zero lookback must not let COUNT(*) skip a filtered model"
+        );
+        assert_eq!(
+            rows, 10,
+            "the moved row above the target watermark must land"
+        );
+    }
+
     /// Control for #2795: the `@incremental_filter` placeholder alone is the
     /// watermark filter, not a row filter. The model copies every source row
     /// above its watermark, so it still skips on an unchanged `MAX(ts)`.
