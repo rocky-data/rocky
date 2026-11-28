@@ -390,10 +390,12 @@ impl<'a> SkipGate<'a> {
         current_sigs: &[UpstreamSig],
     ) -> bool {
         // A filtered `incremental` model without a `lookback` (#2795): its
-        // target's watermark can sit below its input's `MAX(ts)`, and a late
-        // row in that gap is loaded by a build while `MAX(ts)` and
-        // `COUNT(*)` both hold. No signal proves it unchanged: always build.
-        if max_ts_never_proves(model) {
+        // target's watermark can sit below a raw source's `MAX(ts)`, and a
+        // late row in that gap is loaded by a build while `MAX(ts)` and
+        // `COUNT(*)` both hold. No raw-source signal proves it unchanged:
+        // always build. A model that reads only skipped project models gets
+        // no late row, so the recursion below still decides it.
+        if !current_sigs.is_empty() && max_ts_never_proves(model) {
             return false;
         }
 
@@ -621,14 +623,15 @@ fn watermark_within_tolerance(
 /// rows below the watermark, so a late row or an update inside the lookback
 /// window changes its output while the source `MAX(ts)` stays put. For it a
 /// moved `MAX(ts)` still means build, but an unchanged one only lets the
-/// rowcount fallback decide.
+/// rowcount fallback decide. A `lookback` of `0` re-reads nothing, so it is
+/// no lookback here.
 fn max_ts_is_sufficient(strategy: &rocky_core::models::StrategyConfig) -> bool {
     !matches!(
         strategy,
         rocky_core::models::StrategyConfig::Incremental {
-            lookback: Some(_),
+            lookback: Some(lb),
             ..
-        }
+        } if lb.amount > 0
     )
 }
 
@@ -658,14 +661,18 @@ fn max_ts_never_proves(model: &rocky_core::models::Model) -> bool {
     let Some(ts) = timestamp_column.as_deref() else {
         return true;
     };
-    // The placeholder compares `filter_column` when set. A different column
-    // from the probed `timestamp_column` breaks the proof.
-    let filter_is_ts = filter_column.as_deref().is_none_or(|f| {
+    !(filter_compares_ts(filter_column.as_deref(), ts) && keeps_every_source_row(&model.sql, ts))
+}
+
+/// Whether the placeholder compares the probed `ts` column. It compares
+/// `filter_column` when set (`<alias>.<column>` or `<column>`); a different
+/// column from the probed `timestamp_column` breaks the proof.
+fn filter_compares_ts(filter_column: Option<&str>, ts: &str) -> bool {
+    filter_column.is_none_or(|f| {
         f.rsplit('.')
             .next()
             .is_some_and(|c| c.eq_ignore_ascii_case(ts))
-    });
-    !(filter_is_ts && keeps_every_source_row(&model.sql, ts))
+    })
 }
 
 /// Whether `sql` provably copies every row of its one source table, with
@@ -1058,6 +1065,24 @@ mod tests {
             toml::from_str("type = \"incremental\"\ntimestamp_column = \"ts\"\n").unwrap();
         assert!(!max_ts_is_sufficient(&lookback));
         assert!(max_ts_is_sufficient(&plain));
+        let zero: rocky_core::models::StrategyConfig = toml::from_str(
+            "type = \"incremental\"\ntimestamp_column = \"ts\"\nlookback = \"0 days\"\n",
+        )
+        .unwrap();
+        assert!(
+            max_ts_is_sufficient(&zero),
+            "a zero lookback is no lookback"
+        );
+    }
+
+    /// #2795: the placeholder must compare the probed timestamp column.
+    #[test]
+    fn filter_column_must_name_the_timestamp_column() {
+        assert!(filter_compares_ts(None, "ts"));
+        assert!(filter_compares_ts(Some("ts"), "ts"));
+        assert!(filter_compares_ts(Some("e.TS"), "ts"));
+        assert!(!filter_compares_ts(Some("_synced_at"), "ts"));
+        assert!(!filter_compares_ts(Some("e._synced_at"), "ts"));
     }
 
     /// #2795: only SQL that provably passes every source row through counts
