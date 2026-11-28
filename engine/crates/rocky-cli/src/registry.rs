@@ -1203,8 +1203,10 @@ impl AdapterRegistry {
 
     /// Build a BigQuery `LoaderAdapter` wrapping the registered warehouse adapter.
     ///
-    /// Returns an INSERT-fallback loader (CSV-only, small datasets). Production-
-    /// scale loading will require the Storage Write API (deferred).
+    /// A `gs://` URI loads through a native load job; a local CSV falls back
+    /// to batched `INSERT`s. The loader shares the registered adapter, so its
+    /// jobs are listed with the adapter's other statements, and a forced exit
+    /// cancels them (#2787).
     pub fn bigquery_loader(&self, name: &str) -> Result<Box<dyn LoaderAdapter>> {
         let adapter_cfg = self
             .adapter_config(name)
@@ -1215,22 +1217,11 @@ impl AdapterRegistry {
                 adapter_cfg.adapter_type
             );
         }
-
-        let project_id = adapter_cfg
-            .project_id
-            .expose_opt()
-            .context(format!("adapters.{name}: project_id required for bigquery"))?;
-        let location = adapter_cfg.location.expose_opt().unwrap_or("US");
-
-        let bq_auth = rocky_bigquery::auth::BigQueryAuth::from_env()
-            .context(format!("adapters.{name}: auth configuration error"))?;
-
-        let adapter =
-            rocky_bigquery::connector::BigQueryAdapter::new(project_id, location, bq_auth)
-                .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300))
-                .with_retry(adapter_cfg.retry.clone());
+        let adapter = self.bigquery_adapters.get(name).cloned().context(format!(
+            "adapters.{name}: no BigQuery adapter is registered"
+        ))?;
         Ok(Box::new(rocky_bigquery::BigQueryLoaderAdapter::new(
-            Arc::new(adapter),
+            adapter,
         )))
     }
 
@@ -1630,5 +1621,117 @@ password = "p"
         let tracked = crate::statement_cancel::tracked_statements();
         assert!(tracked.contains(&(dbx, StatementHandle::new("dbx-1"))));
         assert!(tracked.contains(&(snow, StatementHandle::new("snow-1"))));
+    }
+
+    /// A forced exit during a long BigQuery load job sends `jobs.cancel` for
+    /// that job (#2787). The loader must wrap the registered adapter: a
+    /// loader that builds its own adapter lists its jobs on a list no forced
+    /// exit reads. The adapter is registered by hand, against a mock server,
+    /// the way `from_config` registers and tracks it.
+    #[tokio::test]
+    async fn a_forced_exit_cancels_a_running_bigquery_load_job() {
+        use rocky_adapter_sdk::{LoadOptions, LoadSource, TableRef};
+        use rocky_core::statement_cancel::StatementHandle;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _serial = crate::testing::FORCED_EXIT_TESTS.lock().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("bq-{suffix}");
+        let job_id = format!("load-{suffix}");
+        let jobs = "/bigquery/v2/projects/test-project/jobs";
+        let running = serde_json::json!({
+            "jobReference": {"projectId": "test-project", "jobId": job_id},
+            "status": {"state": "RUNNING"}
+        });
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(jobs))
+            .respond_with(ResponseTemplate::new(200).set_body_json(running.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{jobs}/{job_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(running))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{jobs}/{job_id}/cancel")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let adapter = Arc::new(
+            BigQueryAdapter::new(
+                "test-project",
+                "US",
+                rocky_bigquery::auth::BigQueryAuth::Bearer(
+                    rocky_core::redacted::RedactedString::new("test".into()),
+                ),
+            )
+            .with_base_url(server.uri())
+            .with_timeout(120),
+        );
+        let cfg: RockyConfig = toml::from_str("").unwrap();
+        let mut registry = AdapterRegistry::from_config(&cfg).expect("an empty registry");
+        registry
+            .adapter_configs
+            .insert(name.clone(), cfg_for("bigquery"));
+        registry
+            .bigquery_adapters
+            .insert(name.clone(), adapter.clone());
+        let as_warehouse: Arc<dyn WarehouseAdapter> = adapter;
+        registry
+            .warehouse
+            .insert(name.clone(), as_warehouse.clone());
+        crate::statement_cancel::track(&name, &as_warehouse);
+
+        let loader = registry
+            .bigquery_loader(&name)
+            .expect("the loader wraps the registered adapter");
+        let load = tokio::spawn(async move {
+            let target = TableRef {
+                catalog: "test-project".into(),
+                schema: "ds".into(),
+                table: "t".into(),
+            };
+            loader
+                .load(
+                    &LoadSource::CloudUri("gs://bucket/data.csv".into()),
+                    &target,
+                    &LoadOptions::default(),
+                )
+                .await
+        });
+
+        let handle = StatementHandle::new(job_id.clone());
+        let listed = (name.clone(), handle.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !crate::statement_cancel::tracked_statements().contains(&listed) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the running load job was never listed for a forced exit"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let results = crate::statement_cancel::cancel_before_exit("test").await;
+        load.abort();
+
+        assert!(
+            results.iter().any(|c| c.adapter == name
+                && c.handle == handle
+                && c.result == crate::statement_cancel::CancelResult::Requested),
+            "the forced exit must cancel the load job: {results:?}"
+        );
+        let cancel_path = format!("{jobs}/{job_id}/cancel");
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.method.as_str() == "POST" && r.url.path() == cancel_path),
+            "jobs.cancel was not sent for {job_id}"
+        );
     }
 }

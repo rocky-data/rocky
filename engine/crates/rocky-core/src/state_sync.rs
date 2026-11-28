@@ -2321,6 +2321,15 @@ impl RemoteStateSession {
         self.suppress_reason.get_or_insert(reason);
     }
 
+    /// Make the terminal upload [`FinalizeDurability::Durable`], whatever
+    /// the session was opened with: a failed [`Self::finalize`] upload is
+    /// then an error under every `on_upload_failure` mode. For a run that
+    /// wrote a row remote state must hold even though the run failed, such
+    /// as a policy refusal's decision rows (#2622).
+    pub fn require_durable(&mut self) {
+        self.durability = FinalizeDurability::Durable;
+    }
+
     /// The recorded upload suppression, if any: why this run's local state is
     /// not reconciled with the remote (an indeterminate download, a
     /// forward-incompat recreate).

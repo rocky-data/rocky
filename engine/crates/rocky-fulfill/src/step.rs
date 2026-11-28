@@ -1684,16 +1684,13 @@ impl Runner {
                             Some(false)
                         }
                         Some(max) => {
-                            // Rounded up, so a lag half a second past
-                            // the budget is over it (#2621).
-                            let lag = rocky_core::source_freshness::whole_seconds_rounded_up(
-                                Utc::now() - max,
+                            let (ok, note) = grade_staleness(
+                                &freshness.time_column,
+                                max,
+                                Utc::now(),
+                                budget_seconds,
                             );
-                            let ok = lag <= i64::try_from(budget_seconds).unwrap_or(i64::MAX);
-                            detail.push(format!(
-                                "MAX({}) = {max}, lag {lag}s, budget {budget_seconds}s",
-                                freshness.time_column,
-                            ));
+                            detail.push(note);
                             Some(ok)
                         }
                     },
@@ -2393,6 +2390,76 @@ mod candidate_write_containment {
             source.contains(&required),
             "expected the candidate tmp write to call write_new_no_follow"
         );
+    }
+}
+
+/// Grade the newest `time_column` value against the freshness budget.
+///
+/// Returns whether the output counts as fresh, and the observation note.
+/// The lag is rounded up, so a lag half a second past the budget is over
+/// it (#2621). A newest value more than
+/// [`rocky_core::source_freshness::FUTURE_SKEW_TOLERANCE_SECONDS`] in the
+/// future has no lag to measure, so it is not fresh (#2806). This matches
+/// `rocky freshness`, which grades the same reading `warn`. A smaller skew
+/// is ordinary clock drift and counts as a zero lag.
+fn grade_staleness(
+    time_column: &str,
+    max: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    budget_seconds: u64,
+) -> (bool, String) {
+    let gap = now - max;
+    let skew =
+        chrono::TimeDelta::seconds(rocky_core::source_freshness::FUTURE_SKEW_TOLERANCE_SECONDS);
+    if gap < -skew {
+        return (
+            false,
+            format!(
+                "MAX({time_column}) = {max} is more than {}s in the future (clock skew, a \
+                 future-dated row, or a local-time column read as UTC), so there is no lag to \
+                 measure; not counted as fresh",
+                skew.num_seconds()
+            ),
+        );
+    }
+    let lag = rocky_core::source_freshness::whole_seconds_rounded_up(gap).max(0);
+    let ok = lag <= i64::try_from(budget_seconds).unwrap_or(i64::MAX);
+    (
+        ok,
+        format!("MAX({time_column}) = {max}, lag {lag}s, budget {budget_seconds}s"),
+    )
+}
+
+#[cfg(test)]
+mod staleness_grading {
+    use super::grade_staleness;
+    use chrono::{TimeDelta, TimeZone, Utc};
+
+    #[test]
+    fn a_future_timestamp_past_the_skew_is_not_fresh() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 28, 12, 0, 0).unwrap();
+        let (ok, note) = grade_staleness("ts", now + TimeDelta::seconds(61), now, 3600);
+        assert!(!ok, "a timestamp 61 s ahead must not read as fresh");
+        assert!(note.contains("in the future"), "{note}");
+        assert!(note.contains("not counted as fresh"), "{note}");
+    }
+
+    #[test]
+    fn a_future_timestamp_within_the_skew_is_fresh_with_zero_lag() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 28, 12, 0, 0).unwrap();
+        let (ok, note) = grade_staleness("ts", now + TimeDelta::seconds(60), now, 3600);
+        assert!(ok, "60 s ahead is within the clock-skew tolerance");
+        assert!(note.contains("lag 0s"), "{note}");
+    }
+
+    #[test]
+    fn the_lag_is_compared_with_the_budget() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 28, 12, 0, 0).unwrap();
+        let (ok, _) = grade_staleness("ts", now - TimeDelta::seconds(3600), now, 3600);
+        assert!(ok, "a lag equal to the budget is within it");
+        let (ok, note) = grade_staleness("ts", now - TimeDelta::milliseconds(3_600_500), now, 3600);
+        assert!(!ok, "half a second past the budget is over it");
+        assert!(note.contains("lag 3601s"), "{note}");
     }
 }
 

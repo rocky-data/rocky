@@ -969,6 +969,7 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
             // `QuotaExceeded` (budget cap), not `Transient`.
             E::CircuitBreakerOpen { .. } => FailureKind::QuotaExceeded,
             E::RetryBudgetExhausted { .. } => FailureKind::QuotaExceeded,
+            E::IncompleteResult { .. } => FailureKind::Unknown,
         }
     }
 }

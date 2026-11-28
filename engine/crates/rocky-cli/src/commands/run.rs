@@ -4195,6 +4195,13 @@ pub(crate) async fn run_with_direct_gate(
     // post-body sweep hook can read it.
     let mut skip_end_of_run_sweep = false;
 
+    // Set when an in-run replication policy gate refused the run (#2622). The
+    // gate recorded its decision rows in the local file before it refused, so
+    // the error path below uploads that file durably instead of abandoning
+    // the session. Otherwise the next run's download replaces the local
+    // ledger and the refusal leaves no row in remote state.
+    let mut replication_gate_refused = false;
+
     // FR-004 F1: wrap the entire run body so that any `?` / `bail!` /
     // early error return *after the claim* still releases the idempotency
     // stamp. Without this wrapper, a run that errored before the existing
@@ -5990,12 +5997,15 @@ pub(crate) async fn run_with_direct_gate(
         // `entry_marker_freezes` is the run-entry durable freeze-marker
         // projection (ONE LIST, taken above) — a marker-only freeze must deny
         // here too; mid-run freezes are the fence's job.
-        ctx.gate_replication_targets(
+        if let Err(refusal) = ctx.gate_replication_targets(
             &replication_targets,
             &state_store,
             rocky_cfg,
             &entry_marker_freezes,
-        )?;
+        ) {
+            replication_gate_refused = true;
+            return Err(refusal);
+        }
     }
     // The direct-run counterpart (#2610): the same post-discovery target set,
     // gated under `run` before any warehouse statement. Covers `--resume`
@@ -6016,7 +6026,7 @@ pub(crate) async fn run_with_direct_gate(
                     .flat_map(|t| shadow_gate_target_names(&t.name, shadow_config))
             })
             .collect();
-        super::run_policy_gate::enforce_replication_targets(
+        if let Err(refusal) = super::run_policy_gate::enforce_replication_targets(
             direct_gate,
             rocky_cfg,
             config_path,
@@ -6025,7 +6035,10 @@ pub(crate) async fn run_with_direct_gate(
             &replication_targets,
             &entry_marker_freezes,
             shadow_config.is_some_and(|c| c.branch.is_some()),
-        )?;
+        ) {
+            replication_gate_refused = true;
+            return Err(refusal);
+        }
     }
 
     // ONE source-table read per connector, taken here and reused by BOTH the
@@ -9293,10 +9306,26 @@ pub(crate) async fn run_with_direct_gate(
         // `Ok` result the happy path already finalized (took the session), so
         // there is nothing here to consume — and a hypothetical Ok-path leak
         // should trip the tripwire, not be silently abandoned.
-        if let Some(session) = session_opt.take() {
-            session
-                .abandon("run exited before terminal state writes")
-                .await;
+        if let Some(mut session) = session_opt.take() {
+            if replication_gate_refused {
+                // #2622: the refusal's decision rows are the one write this
+                // run owes remote state. Upload them durably, after the
+                // idempotency release above so the claim does not ride the
+                // upload as still in flight. The run is refused either way;
+                // a failed upload is reported, never turned into a success.
+                session.require_durable();
+                if let Err(upload) = session.finalize().await {
+                    tracing::error!(
+                        error = %upload,
+                        "the replication policy refusal's decision rows were not uploaded; \
+                         remote state does not hold them"
+                    );
+                }
+            } else {
+                session
+                    .abandon("run exited before terminal state writes")
+                    .await;
+            }
         }
     }
 
@@ -57563,6 +57592,117 @@ timestamp_column = "ts"
         )
         .await
         .map(|_| ())
+    }
+
+    /// #2622: a replication run that an in-run policy gate refuses leaves its
+    /// deny row in remote state. Before, the refusal abandoned the session,
+    /// so nothing was uploaded and the next run's download dropped the row.
+    ///
+    /// Both in-run gates: the governed one (`rocky apply` of a replication
+    /// plan) and the direct one (#2610, an agent's `rocky run`). The direct
+    /// case uses an `allow` default beside a `deny` rule scoped to the one
+    /// table, so the pre-run gate defers to the in-run gate.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_refused_replication_run_leaves_its_deny_row_in_remote_state() {
+        use rocky_core::config::PolicyEffect;
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let rt = remote_state_test_runtime();
+        for governed in [true, false] {
+            let harness = CrossPodHarness::new_s3_like();
+            let dir = tempfile::tempdir().unwrap();
+            let config = rt.block_on(write_many_table_project(dir.path(), 1, Some(1)));
+            let policy = if governed {
+                "[policy]\nversion = 1\n\n[[policy.rules]]\nprincipal = \"agent\"\n\
+                 capability = \"apply\"\nscope = { any = true }\neffect = \"deny\"\n"
+            } else {
+                "[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n\n\
+                 [[policy.rules]]\nprincipal = \"agent\"\ncapability = \"run\"\n\
+                 scope = { models = [\"t00\"] }\neffect = \"deny\"\n"
+            };
+            let raw = std::fs::read_to_string(&config).unwrap().replace(
+                "backend = \"local\"",
+                "backend = \"s3\"\ns3_bucket = \"test\"\non_upload_failure = \"skip\"\n\n\
+                 [state.retry]\nmax_retries = 0",
+            );
+            std::fs::write(&config, format!("{raw}\n{policy}")).unwrap();
+            let state_path = harness.pod_a.state_path.clone();
+            let run_id = format!("refused-replication-{governed}");
+
+            let result = if governed {
+                rt.block_on(checkpoint_ordering_run(&config, &state_path, &run_id, true))
+            } else {
+                let gate = super::super::run_policy_gate::DirectRunGate::new(
+                    rocky_core::config::PolicyPrincipal::Agent,
+                    rocky_core::config::PrincipalRef::unnamed(),
+                );
+                rt.block_on(super::run_with_direct_gate(
+                    &config,
+                    std::sync::Arc::new(
+                        rocky_core::config::load_rocky_config_fingerprinted(&config).unwrap(),
+                    ),
+                    None,
+                    Some("rep"),
+                    &state_path,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    &PartitionRunOptions::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &DeferOptions::default(),
+                    &SkipRunOptions::default(),
+                    &rocky_core::run_vars::RunVars::new(),
+                    Some(&run_id),
+                    None,
+                    false,
+                    None,
+                    None,
+                    &rocky_core::config::PrincipalRef::unnamed(),
+                    None,
+                    Some(&gate),
+                ))
+                .map(|_| ())
+            };
+            let err = result.expect_err("the policy gate refuses the replication run");
+            assert!(
+                format!("{err:#}").contains("DENIES"),
+                "governed={governed}: {err:#}"
+            );
+
+            // Another pod downloads the shared state and must find the row.
+            let authority = rt
+                .block_on(harness.download(&harness.pod_b))
+                .expect("pod B downloads the shared state");
+            assert!(
+                matches!(
+                    authority,
+                    rocky_core::state_sync::StateAuthority::Authoritative
+                ),
+                "governed={governed}: the refused run uploaded its state: {authority:?}"
+            );
+            let remote = harness.open_store(&harness.pod_b);
+            let rows = remote.list_policy_decisions().unwrap();
+            let plan_id = if governed {
+                "checkpoint-ordering-legacy-plan".to_string()
+            } else {
+                super::super::run_policy_gate::ledger_id(&run_id)
+            };
+            assert!(
+                rows.iter().any(|r| r.plan_id == plan_id
+                    && r.model == "t00"
+                    && r.effect == PolicyEffect::Deny),
+                "governed={governed}: the deny row must reach remote state: {rows:?}"
+            );
+        }
     }
 
     #[cfg(feature = "duckdb")]
