@@ -425,6 +425,14 @@ impl<'a> SkipGate<'a> {
             .map(|s| (s.upstream_key.as_str(), s))
             .collect();
 
+        // A filtered `incremental` model without a `lookback` (#2795): its
+        // target's watermark can sit below the source `MAX(ts)`, and a late
+        // row in that gap is loaded by a build while `MAX(ts)` and
+        // `COUNT(*)` both hold. No raw-source signal proves it unchanged.
+        if !current_sigs.is_empty() && max_ts_never_proves(model) {
+            return false;
+        }
+
         let max_ts_sufficient = max_ts_is_sufficient(&model.config.strategy);
         for cur in current_sigs {
             let Some(prev) = prior_by_key.get(cur.upstream_key.as_str()) else {
@@ -622,6 +630,69 @@ fn max_ts_is_sufficient(strategy: &rocky_core::models::StrategyConfig) -> bool {
             ..
         }
     )
+}
+
+/// Whether no raw-source signal can prove this model unchanged: an
+/// `incremental` model without a `lookback` whose SQL may drop source rows
+/// (#2795).
+///
+/// Its build reads only the rows above the target's own `MAX(ts)`. When the
+/// SQL drops rows, that watermark can sit below the source `MAX(ts)`, so a
+/// late row between the two changes the output while the source `MAX(ts)`
+/// and `COUNT(*)` stay put. Such a model always builds. A lookback model
+/// keeps its own rule ([`max_ts_is_sufficient`]).
+fn max_ts_never_proves(model: &rocky_core::models::Model) -> bool {
+    matches!(
+        model.config.strategy,
+        rocky_core::models::StrategyConfig::Incremental { lookback: None, .. }
+    ) && !keeps_every_source_row(&model.sql)
+}
+
+/// Whether `sql` provably passes every row of its one source table through.
+///
+/// A whitelist, so anything not matched counts as filtered: one `SELECT`
+/// over one bare table, no `JOIN`, no `WHERE` other than a lone
+/// `@incremental_filter` placeholder (the watermark filter itself), and no
+/// `PREWHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, `DISTINCT`, `TOP`, `LIMIT`,
+/// `OFFSET` or `FETCH`. An unparseable body counts as filtered.
+fn keeps_every_source_row(sql: &str) -> bool {
+    use sqlparser::ast::{Expr, GroupByExpr, SetExpr, Statement, TableFactor, Value};
+
+    let Ok(Statement::Query(query)) = rocky_sql::parser::parse_single_statement(sql) else {
+        return false;
+    };
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return false;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let [from] = select.from.as_slice() else {
+        return false;
+    };
+    let lone_placeholder = |expr: &Expr| {
+        matches!(expr, Expr::Value(v) if matches!(&v.value, Value::Placeholder(p)
+            if p == rocky_core::incremental_filter::PLACEHOLDER))
+    };
+    let no_group_by = match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => exprs.is_empty() && modifiers.is_empty(),
+        GroupByExpr::All(_) => false,
+    };
+    matches!(from.relation, TableFactor::Table { args: None, .. })
+        && from.joins.is_empty()
+        && select.selection.as_ref().is_none_or(lone_placeholder)
+        && select.prewhere.is_none()
+        && select.having.is_none()
+        && select.qualify.is_none()
+        && select.distinct.is_none()
+        && select.top.is_none()
+        && select.lateral_views.is_empty()
+        && select.connect_by.is_empty()
+        && no_group_by
 }
 
 /// The timestamp column a strategy tracks, if any. Used to issue the B3
@@ -922,6 +993,41 @@ mod tests {
             toml::from_str("type = \"incremental\"\ntimestamp_column = \"ts\"\n").unwrap();
         assert!(!max_ts_is_sufficient(&lookback));
         assert!(max_ts_is_sufficient(&plain));
+    }
+
+    /// #2795: only SQL that provably passes every source row through counts
+    /// as unfiltered. Every row-dropping clause, and anything unparseable,
+    /// counts as filtered, so the model builds.
+    #[test]
+    fn keeps_every_source_row_is_a_whitelist() {
+        for sql in [
+            "SELECT id, ts FROM raw.events",
+            "SELECT * FROM raw.events",
+            "SELECT id, ts FROM raw.events WHERE @incremental_filter",
+            "SELECT id, ts FROM raw.events ORDER BY ts",
+        ] {
+            assert!(keeps_every_source_row(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT id, ts FROM raw.events WHERE id <> 10",
+            "SELECT id, ts FROM raw.events WHERE @incremental_filter AND id <> 10",
+            "SELECT e.id, e.ts FROM raw.events e JOIN raw.users u ON e.uid = u.id",
+            "SELECT e.id, e.ts FROM raw.events e LEFT JOIN raw.users u ON e.uid = u.id",
+            "SELECT id, ts FROM raw.events, raw.users",
+            "SELECT id, MAX(ts) AS ts FROM raw.events GROUP BY id",
+            "SELECT id, ts FROM raw.events GROUP BY ALL",
+            "SELECT id, COUNT(*) AS n FROM raw.events GROUP BY id HAVING COUNT(*) > 1",
+            "SELECT id, ts FROM raw.events QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY ts) = 1",
+            "SELECT DISTINCT id, ts FROM raw.events",
+            "SELECT id, ts FROM raw.events LIMIT 5",
+            "SELECT id, ts FROM raw.events OFFSET 5",
+            "SELECT id, ts FROM raw.events UNION ALL SELECT id, ts FROM raw.more",
+            "WITH e AS (SELECT * FROM raw.events) SELECT * FROM e",
+            "SELECT id, ts FROM (SELECT * FROM raw.events WHERE id > 1) t",
+            "not sql at all",
+        ] {
+            assert!(!keeps_every_source_row(sql), "{sql}");
+        }
     }
 
     #[test]
