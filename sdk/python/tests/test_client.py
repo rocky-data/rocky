@@ -705,6 +705,26 @@ def test_http_fallback_used_for_compile_when_server_url_set():
     assert result.command == "compile"
 
 
+def test_compile_raises_on_a_refused_model():
+    """A model the engine refused as unparseable (E074) is left out of the
+    compile result, so the client refuses instead of returning it."""
+    from rocky_sdk.exceptions import RockyCommandError
+
+    client = _client()
+    body = (
+        '{"version": "1", "command": "compile", "models": 1, '
+        '"execution_layers": 1, "has_errors": true, "diagnostics": ['
+        '{"code": "E074", "severity": "Error", "model": "bad", '
+        '"message": "SQL does not parse"}]}'
+    )
+    with (
+        patch.object(client, "run_cli", return_value=body),
+        pytest.raises(RockyCommandError) as excinfo,
+    ):
+        client.compile()
+    assert "[E074] bad" in excinfo.value.stderr_tail
+
+
 def test_http_error_raises_server_error():
     import urllib.error
 

@@ -562,10 +562,17 @@ impl RockyLsp {
                 // model the edit does not reach, so it needs the targets the
                 // previous compile used. A changed `rocky.toml` can change
                 // them: compile in full then.
+                // A previous result that refused a model (`E074`) is not a
+                // whole project, so the incremental path cannot build on it
+                // (#2618): compile in full then.
                 let kept_targets = if changed_files
                     .as_ref()
                     .is_some_and(|files| !files.is_empty())
-                    && compile_result.read().await.is_some()
+                    && compile_result
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|previous| !refused_a_model(previous))
                 {
                     cast_targets.kept(&config.models_dir)
                 } else {
@@ -573,16 +580,27 @@ impl RockyLsp {
                 };
                 // A full compile also returns the targets it resolved, kept
                 // only once its result is the stored one.
-                let new_result = if let Some(targets) = kept_targets {
+                let incremental = if let Some(targets) = kept_targets {
                     config.target_dialects = targets;
                     let prev = compile_result.read().await;
                     let prev_ref = prev.as_ref().expect("checked use_incremental above");
                     let files = changed_files
                         .as_deref()
                         .expect("checked use_incremental above");
-                    compile_incremental(files, prev_ref, &config)
-                        .ok()
-                        .map(|result| (result, None))
+                    Some(compile_incremental(files, prev_ref, &config))
+                } else {
+                    None
+                };
+                // An edit that leaves a model unparseable fails the strict
+                // incremental path; the full compile below refuses only that
+                // model, off the async runtime (#2618).
+                let new_result = if let Some(Ok(result)) = incremental {
+                    Some((result, None))
+                } else if incremental
+                    .as_ref()
+                    .is_some_and(|outcome| !outcome.as_ref().is_err_and(is_parse_failure))
+                {
+                    None
                 } else {
                     let mut config_for_blocking = config.clone();
                     tokio::task::spawn_blocking(move || {
@@ -5713,18 +5731,31 @@ pub fn compile_incremental(
     previous: &CompileResult,
     config: &CompilerConfig,
 ) -> std::result::Result<CompileResult, rocky_compiler::compile::CompileError> {
+    rocky_compiler::compile::compile_incremental(config, changed_files, previous)
+}
+
+/// Whether `error` is the strict compile's refusal of a model whose SQL does
+/// not parse, which the LSP's full compile reports per model instead
+/// (#2618).
+fn is_parse_failure(error: &rocky_compiler::compile::CompileError) -> bool {
     use rocky_compiler::compile::CompileError;
     use rocky_compiler::project::ProjectError;
     use rocky_compiler::resolve::ResolveError;
-    match rocky_compiler::compile::compile_incremental(config, changed_files, previous) {
-        // The incremental path refuses the project when a model does not
-        // parse. Compile in full then, refusing only that model and its
-        // readers, as the full LSP compile does (#2618).
-        Err(CompileError::Project(ProjectError::Resolve(
-            ResolveError::LineageExtractionMany { .. },
-        ))) => rocky_compiler::compile::compile_refusing_unparseable_models(config),
-        other => other,
-    }
+    matches!(
+        error,
+        CompileError::Project(ProjectError::Resolve(
+            ResolveError::LineageExtractionMany { .. }
+        ))
+    )
+}
+
+/// Whether `result` refused a model (`E074`), so it does not hold the whole
+/// project.
+fn refused_a_model(result: &CompileResult) -> bool {
+    result
+        .diagnostics
+        .iter()
+        .any(|d| &*d.code == rocky_compiler::diagnostic::E074)
 }
 
 // ── Server entry point ──────────────────────────────────────────────────────
@@ -5800,12 +5831,13 @@ pub async fn run_lsp() {
 
 #[cfg(test)]
 mod tests {
-    /// #2618: an edit that breaks a model's SQL gives the incremental LSP
-    /// compile the same result as a full one: `E074` on the model and its
-    /// reader, placed on their files, and the rest compiled. Fixing the file
-    /// again matches the full compile too.
+    /// #2618: an edit that breaks a model's SQL fails the strict incremental
+    /// path with a parse failure, which sends the LSP to its full compile.
+    /// That compile places `E074` on the model and its reader and compiles
+    /// the rest. A result that refused a model is never the base of an
+    /// incremental compile, so the fix compiles in full too.
     #[test]
-    fn an_unparseable_model_compiles_the_same_incrementally_and_in_full() {
+    fn an_unparseable_model_sends_the_lsp_to_a_full_compile() {
         use rocky_compiler::compile::{CompilerConfig, compile_refusing_unparseable_models};
         let tmp = tempfile::tempdir().expect("tempdir");
         let models = tmp.path().join("models");
@@ -5825,34 +5857,35 @@ mod tests {
         };
         write("up", "SELECT 1 AS id");
         write("reader", "SELECT id FROM up");
-        write("other", "SELECT 2 AS id");
+        // Enough models that `compile_incremental` does not fall back to a
+        // full compile on its own.
+        for i in 0..12 {
+            write(&format!("other_{i:02}"), "SELECT 2 AS id");
+        }
         let config = CompilerConfig {
             models_dir: models.clone(),
             ..Default::default()
         };
-        let rendered = |result: &CompileResult| {
-            let mut out: Vec<String> = result
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}:{}:{}", d.code, d.model, d.message))
-                .collect();
-            out.sort();
-            out
-        };
         let healthy = compile_refusing_unparseable_models(&config).expect("compile");
+        assert!(!refused_a_model(&healthy));
 
         write("up", "SELECT FROM WHERE (");
         let changed = [models.join("up.sql")];
-        let broken = compile_incremental(&changed, &healthy, &config).expect("incremental");
-        let full = compile_refusing_unparseable_models(&config).expect("full");
-        assert_eq!(rendered(&broken), rendered(&full));
-        let refused: Vec<&str> = broken
+        let error = compile_incremental(&changed, &healthy, &config)
+            .err()
+            .expect("the strict incremental path refuses");
+        assert!(is_parse_failure(&error), "{error}");
+
+        let broken = compile_refusing_unparseable_models(&config).expect("full");
+        assert!(refused_a_model(&broken));
+        let mut refused: Vec<&str> = broken
             .diagnostics
             .iter()
             .filter(|d| &*d.code == "E074")
             .map(|d| d.model.as_str())
             .collect();
-        assert_eq!(refused.len(), 2, "{refused:?}");
+        refused.sort_unstable();
+        assert_eq!(refused, ["reader", "up"]);
         let by_uri = diagnostics_by_uri(&broken);
         for name in ["up", "reader"] {
             let uri = Url::from_file_path(models.join(format!("{name}.sql"))).unwrap();
@@ -5864,11 +5897,7 @@ mod tests {
             );
         }
 
-        write("up", "SELECT 1 AS id");
-        let fixed = compile_incremental(&changed, &broken, &config).expect("incremental");
-        let full = compile_refusing_unparseable_models(&config).expect("full");
-        assert_eq!(rendered(&fixed), rendered(&full));
-        assert!(!fixed.has_errors, "{:?}", fixed.diagnostics);
+        assert!(broken.project.model("other_00").is_some());
     }
 
     /// #1817 / #1822 round four: a startup compile that fails must reach the

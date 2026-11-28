@@ -326,8 +326,9 @@ pub const W071: &str = "W071";
 /// A column of a `UNION`, `INTERSECT` or `EXCEPT` whose branch types have no
 /// common supertype, such as `INTEGER` with `VARCHAR` (#2661). DuckDB casts
 /// the branches and runs the query; another warehouse may refuse it or fail
-/// on a value. A warning on every dialect. A branch of unknown type, or a
-/// set of numeric types, is not reported. Emitted by `rocky compile` from
+/// on a value. A warning on every dialect. A branch of unknown type, a set
+/// of numeric types, a composite branch, and a string with a date or
+/// timestamp (a quoted literal) are not reported. Emitted by `rocky compile` from
 /// `typecheck.rs` for the model's own query body; a set operation inside a
 /// CTE or a subquery is not checked.
 pub const W072: &str = "W072";

@@ -495,6 +495,10 @@ fn compile_inner(
     if let Some(filter) = model_filter
         && result.project.model(filter).is_none()
         && !result.semantic_graph.functions().declares(filter)
+        && !result
+            .diagnostics
+            .iter()
+            .any(|d| &*d.code == diagnostic::E074 && d.model == filter)
     {
         return Err(anyhow::Error::new(ModelNotFound(filter.to_string())));
     }
@@ -675,7 +679,10 @@ fn compile_inner(
     let diagnostics: Vec<_> = result
         .diagnostics
         .iter()
-        .filter(|d| in_scope(&d.model))
+        // A refused model (`E074`) stops the project from running, so it is
+        // reported whatever `--model` or `--select` names, as a cycle is
+        // (#2618). A scoped compile must not pass over it.
+        .filter(|d| in_scope(&d.model) || &*d.code == diagnostic::E074)
         .map(|d| Diagnostic {
             message: render_placeholders(&d.message).into(),
             suggestion: d.suggestion.as_deref().map(render_placeholders),
@@ -3665,6 +3672,67 @@ schema_template = "s"
         }
         write_seed(dir.path(), seed);
         (dir, models_dir)
+    }
+
+    /// #2618: `rocky compile` refuses an unparseable model alone with
+    /// `E074`; `compile_output` (MCP, ci, dag) keeps the whole-project
+    /// refusal. A `--model` scope that leaves the refused model out still
+    /// reports its `E074` and fails, and `--model` may name it.
+    #[test]
+    fn rocky_compile_refuses_an_unparseable_model_alone_in_every_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("_defaults.toml"),
+            "[target]\ncatalog = \"analytics\"\nschema = \"marts\"\n",
+        )
+        .unwrap();
+        for (name, sql) in [("good", "SELECT 1 AS id"), ("bad", "SELECT FROM WHERE (")] {
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n"),
+            )
+            .unwrap();
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+        }
+        let run = |filter: Option<&str>, parse_failures| {
+            compile_inner(
+                None,
+                &dir.path().join("state.redb"),
+                &models_dir,
+                ModelScope::Dir,
+                None,
+                filter,
+                false,
+                None,
+                SeedUse::Never,
+                None,
+                &rocky_core::run_vars::RunVars::new(),
+                false,
+                false,
+                None,
+                parse_failures,
+            )
+            .map(|(output, _)| output)
+        };
+        assert!(
+            run(None, compile::ParseFailures::RefuseProject).is_err(),
+            "the strict callers still refuse the project"
+        );
+        for filter in [None, Some("good"), Some("bad")] {
+            let output = run(filter, compile::ParseFailures::RefuseModel)
+                .unwrap_or_else(|e| panic!("{filter:?}: {e:#}"));
+            assert!(output.has_errors, "{filter:?}: the compile fails");
+            assert!(
+                output
+                    .diagnostics
+                    .iter()
+                    .any(|d| &*d.code == "E074" && d.model == "bad"),
+                "{filter:?}: {:?}",
+                output.diagnostics
+            );
+        }
     }
 
     fn compile_seeded(

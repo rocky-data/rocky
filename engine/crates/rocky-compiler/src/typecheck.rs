@@ -5324,8 +5324,31 @@ fn check_set_branch_types<'a>(
 
 /// Whether a set-operation column's branch types have no common supertype,
 /// with every branch typed and not all of them numeric.
+///
+/// Also exempt, as likely portable: a composite branch (`ARRAY`, `MAP`,
+/// `STRUCT`, `VARIANT`), whose element types Rocky does not unify, and a
+/// string with a date or timestamp, the shape of a quoted literal
+/// (`'2024-01-01'`) that every warehouse casts.
 fn set_branch_types_conflict(types: &[RockyType]) -> bool {
     if types.contains(&RockyType::Unknown) || types.iter().all(RockyType::is_numeric) {
+        return false;
+    }
+    let composite = |t: &RockyType| {
+        matches!(
+            t,
+            RockyType::Array(_) | RockyType::Map(..) | RockyType::Struct(_) | RockyType::Variant
+        )
+    };
+    if types.iter().any(composite) {
+        return false;
+    }
+    let string_or_temporal = |t: &RockyType| {
+        matches!(
+            t,
+            RockyType::String | RockyType::Date | RockyType::Timestamp | RockyType::TimestampNtz
+        )
+    };
+    if types.contains(&RockyType::String) && types.iter().all(string_or_temporal) {
         return false;
     }
     let inferred = common_supertype_of(types);
@@ -7943,6 +7966,15 @@ mod tests {
                     ("f", RockyType::Float64, false),
                     ("d", RockyType::Date, false),
                     ("ts", RockyType::Timestamp, false),
+                    (
+                        "dc",
+                        RockyType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        },
+                        false,
+                    ),
+                    ("arr", RockyType::Array(Box::new(RockyType::Int32)), false),
                 ])
             };
             let sources = HashMap::from([("t".to_string(), schema()), ("u".to_string(), schema())]);
@@ -7990,6 +8022,12 @@ mod tests {
         for sql in [
             "SELECT x AS c FROM t UNION ALL SELECT x FROM u",
             "SELECT x AS c FROM t UNION ALL SELECT f FROM u",
+            // Rocky has no common type for a float with a decimal, but every
+            // warehouse runs it: numeric sets are exempt.
+            "SELECT f AS c FROM t UNION ALL SELECT dc FROM u",
+            // A composite branch, and a string with a date (a quoted literal).
+            "SELECT arr AS c FROM t UNION ALL SELECT n FROM u",
+            "SELECT d AS c FROM t UNION ALL SELECT '2024-01-01' FROM u",
             "SELECT x AS c FROM t UNION ALL SELECT NULL FROM u",
             "SELECT x AS c FROM t UNION ALL SELECT missing FROM u",
             "SELECT x AS c FROM t",

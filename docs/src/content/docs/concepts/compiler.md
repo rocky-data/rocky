@@ -292,11 +292,12 @@ These are not reported:
 
 - a branch whose type Rocky does not know;
 - a set of numeric types, even one Rocky has no common type for (a float with a decimal): every warehouse has a numeric type for it;
+- a composite branch (`ARRAY`, `MAP`, `STRUCT`, `VARIANT`), and a string with a date or timestamp, the shape of a quoted literal (`'2024-01-01'`) that every warehouse casts;
 - a set operation inside a CTE or a subquery. Only the model's own query is checked, nested set operations included.
 
 #### A model whose SQL does not parse (`E074`)
 
-`rocky compile` and the language server refuse a model whose SQL does not parse with `E074`, and compile the rest of the project. Every model that reads it is refused with `E074` too, through a bare read or a declared `depends_on`, to any depth. A refused model is not type-checked, so its readers get no other errors. `rocky compile` still exits non-zero.
+`rocky compile` and the language server refuse a model whose SQL does not parse with `E074`, and compile the rest of the project. Every model that reads it is refused with `E074` too, through a bare read or a declared `depends_on`, to any depth. A refused model is not type-checked, so its readers get no other errors. `rocky compile` still exits non-zero, and reports every `E074` whatever `--model` or `--select` names.
 
 `rocky run`, `rocky plan` and every other command still refuse the whole project when one model does not parse.
 

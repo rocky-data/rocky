@@ -1745,9 +1745,21 @@ class RockyClient:
             args.extend(["--contracts", self.contracts_dir])
         if model_filter is not None:
             args.extend(["--model", model_filter])
-        return _parse_rocky_json(
+        result = _parse_rocky_json(
             self.run_cli(args, allow_partial=True), CompileResult, command="compile"
         )
+        # `rocky compile` reports a model whose SQL does not parse as E074
+        # and leaves it, and every model that reads it, out of the result.
+        # A caller that builds from the result would silently lose them, so
+        # refuse as the engine did before it reported per model.
+        refused = [d for d in result.diagnostics if d.code == "E074"]
+        if refused:
+            raise RockyCommandError(
+                1,
+                stderr_tail="\n".join(f"[E074] {d.model}: {d.message}" for d in refused),
+                command="compile",
+            )
+        return result
 
     def lineage(
         self, target: str, column: str | None = None

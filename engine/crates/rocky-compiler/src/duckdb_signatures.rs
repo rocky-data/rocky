@@ -299,15 +299,12 @@ mod tests {
     /// `ducklake` and `spatial` extensions loaded (#2752). An extension that
     /// adds an overload to a checked name would turn its refusal false. It
     /// needs the network to install the extensions, so it is ignored by
-    /// default. Run with `ROCKY_REPLAY_DUCKDB_EXTENSIONS=1 cargo test -p
-    /// rocky-compiler --lib extension_functions_keep_every_refusal --
-    /// --ignored` after a DuckDB bump.
+    /// default. Run with `cargo test -p rocky-compiler --lib
+    /// extension_functions_keep_every_refusal -- --ignored` after a DuckDB
+    /// bump. With no network it fails, naming the extension.
     #[test]
     #[ignore = "installs DuckDB extensions from the network"]
     fn extension_functions_keep_every_refusal() {
-        if std::env::var("ROCKY_REPLAY_DUCKDB_EXTENSIONS").as_deref() != Ok("1") {
-            return;
-        }
         let conn = connection();
         for ext in ["icu", "json", "parquet"] {
             conn.execute_batch(&format!("LOAD {ext}"))

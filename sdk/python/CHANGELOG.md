@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `RockyClient.compile()` raises `RockyCommandError` when the output holds an `E074` diagnostic. The engine now reports a model whose SQL does not parse per model, and leaves it and its readers out of the result. The client refuses that result, so a caller (Dagster among them) does not silently build from a project with models missing. The HTTP path still raises on the server's error.
+
 ## [0.34.0] — 2026-11-23
 
 ### Upgrade notes
