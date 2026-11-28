@@ -79,6 +79,16 @@ pub enum ConnectorError {
 
     #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
+
+    /// Statement `handle` reported `expected` result rows, but only
+    /// `received` arrived. Returned instead of a short result, so a caller
+    /// that counts rows never reads a partial count.
+    #[error("statement {handle} returned {received} of its {expected} result rows")]
+    IncompleteResult {
+        handle: String,
+        expected: u64,
+        received: u64,
+    },
 }
 
 impl ConnectorError {
@@ -171,6 +181,19 @@ pub struct ResultSetMetaData {
     pub num_rows: Option<u64>,
     #[serde(default)]
     pub row_type: Vec<ColumnMetaData>,
+    /// One entry per result partition. The statement answer carries
+    /// partition 0; the others are read with `?partition=N`.
+    #[serde(default)]
+    pub partition_info: Vec<PartitionInfo>,
+}
+
+/// Size of one result partition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionInfo {
+    /// Rows in this partition.
+    #[serde(default)]
+    pub row_count: Option<u64>,
 }
 
 /// Column metadata from a Snowflake query result.
@@ -322,7 +345,46 @@ impl SnowflakeConnector {
             .as_ref()
             .and_then(|m| m.num_rows);
 
-        let rows = response.data.unwrap_or_default();
+        let partitions = response
+            .result_set_meta_data
+            .as_ref()
+            .map_or(0, |m| m.partition_info.len());
+        let carried_rows = response.data.is_some() || partitions > 0;
+        let mut rows = response.data.unwrap_or_default();
+
+        // Snowflake splits a large result into partitions. The statement
+        // answer carries partition 0 only; the rest are read one at a time
+        // (#2775).
+        for partition in 1..partitions {
+            // A read deadline here is not a statement still running: the
+            // statement has ended, so `Timeout` (whose `may_still_run` is
+            // true) would be a false signal. Report the short result.
+            let more = self
+                .fetch_partition(&response.statement_handle, partition)
+                .await
+                .map_err(|err| match err {
+                    ConnectorError::Timeout { .. } => ConnectorError::IncompleteResult {
+                        handle: response.statement_handle.clone(),
+                        expected: total_row_count.unwrap_or(rows.len() as u64),
+                        received: rows.len() as u64,
+                    },
+                    other => other,
+                })?;
+            rows.extend(more);
+        }
+
+        // A short result must not pass for the whole one: a test that counts
+        // rows would report too few.
+        if carried_rows
+            && let Some(expected) = total_row_count
+            && (rows.len() as u64) < expected
+        {
+            return Err(ConnectorError::IncompleteResult {
+                handle: response.statement_handle,
+                expected,
+                received: rows.len() as u64,
+            });
+        }
 
         Ok(QueryResult {
             statement_handle: response.statement_handle,
@@ -330,6 +392,78 @@ impl SnowflakeConnector {
             rows,
             total_row_count,
         })
+    }
+
+    /// Read result partition `partition` of the finished statement `handle`
+    /// (`GET .../statements/{handle}?partition=N`).
+    ///
+    /// The statement has ended, so a read that fails transiently is read
+    /// again, at most `retry.max_retries` times; nothing is resubmitted. Each
+    /// read is bounded by the configured timeout.
+    async fn fetch_partition(
+        &self,
+        handle: &str,
+        partition: usize,
+    ) -> Result<Vec<Vec<serde_json::Value>>, ConnectorError> {
+        let url = format!("{}/{}", self.base_url(), handle);
+        let retry = &self.config.retry;
+        let mut failed: u32 = 0;
+        loop {
+            let read = async {
+                let token = self.auth.get_token().await?;
+                let request = self
+                    .client
+                    .get(&url)
+                    .query(&[("partition", partition)])
+                    .header("Accept", "application/json");
+                let resp = self.apply_auth_headers(request, &token).send().await?;
+                if !resp.status().is_success() {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ConnectorError::ApiError { status, body });
+                }
+                let page: StatementResponse = resp.json().await?;
+                Ok(page.data.unwrap_or_default())
+            };
+            let outcome = tokio::time::timeout(self.config.timeout, read)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ConnectorError::Timeout {
+                        handle: handle.to_string(),
+                        seconds: self.config.timeout.as_secs(),
+                    })
+                });
+            match outcome {
+                Ok(rows) => return Ok(rows),
+                // The statement has ended, so this GET is safe to send
+                // again: a broken body or a bad decode is retried too, not
+                // only what `is_transient` names.
+                Err(err)
+                    if failed < retry.max_retries
+                        && (is_transient(&err)
+                            || matches!(
+                                err,
+                                ConnectorError::Http(_) | ConnectorError::Timeout { .. }
+                            )) =>
+                {
+                    if matches!(&err, ConnectorError::ApiError { status: 401, .. }) {
+                        self.auth.invalidate_cache().await;
+                    }
+                    let backoff_ms = compute_backoff(retry, failed);
+                    failed += 1;
+                    warn!(
+                        statement_handle = handle,
+                        partition,
+                        attempt = failed,
+                        backoff_ms,
+                        error = %err,
+                        "result partition read failed, reading it again"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Executes a SQL statement without caring about result data.
@@ -809,7 +943,8 @@ impl SubmitAttempt {
             | ConnectorError::Timeout { .. }
             | ConnectorError::Abandoned { .. }
             | ConnectorError::CircuitBreakerOpen { .. }
-            | ConnectorError::RetryBudgetExhausted { .. } => Self {
+            | ConnectorError::RetryBudgetExhausted { .. }
+            | ConnectorError::IncompleteResult { .. } => Self {
                 request_id: self.request_id,
                 resend: true,
             },
@@ -1083,7 +1218,8 @@ pub(crate) fn is_transient(err: &ConnectorError) -> bool {
         ConnectorError::Timeout { .. } | ConnectorError::Abandoned { .. } => false,
         ConnectorError::Auth(_)
         | ConnectorError::CircuitBreakerOpen { .. }
-        | ConnectorError::RetryBudgetExhausted { .. } => false,
+        | ConnectorError::RetryBudgetExhausted { .. }
+        | ConnectorError::IncompleteResult { .. } => false,
     }
 }
 
@@ -1105,7 +1241,9 @@ pub(crate) fn classify_error(err: &ConnectorError) -> ErrorClass {
         ConnectorError::Abandoned { cause, .. } => classify_error(cause),
         ConnectorError::Auth(_) => ErrorClass::Auth,
         ConnectorError::CircuitBreakerOpen { .. } => ErrorClass::Transient,
-        ConnectorError::RetryBudgetExhausted { .. } => ErrorClass::Permanent,
+        ConnectorError::RetryBudgetExhausted { .. } | ConnectorError::IncompleteResult { .. } => {
+            ErrorClass::Permanent
+        }
         ConnectorError::StatementFailed { .. } => {
             if is_transient(err) {
                 ErrorClass::Transient

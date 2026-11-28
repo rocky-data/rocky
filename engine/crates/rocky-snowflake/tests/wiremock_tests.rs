@@ -116,6 +116,97 @@ async fn test_happy_path_inline_result() {
     assert_eq!(result.total_row_count, Some(2));
 }
 
+/// The statement answer for a large result carries partition 0 only.
+/// `execute_sql` reads partitions 1 and later with `?partition=N` and keeps
+/// every row, in partition order (#2775).
+#[tokio::test]
+async fn execute_sql_reads_every_result_partition() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-big",
+            "code": "00000",
+            "resultSetMetaData": {
+                "numRows": 5,
+                "rowType": [{"name": "ID", "type": "FIXED", "nullable": false}],
+                "partitionInfo": [{"rowCount": 2}, {"rowCount": 2}, {"rowCount": 1}]
+            },
+            "data": [["1"], ["2"]]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (partition, rows) in [
+        ("1", serde_json::json!([["3"], ["4"]])),
+        ("2", serde_json::json!([["5"]])),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/api/v2/statements/sf-big"))
+            .and(query_param("partition", partition))
+            .and(header("Authorization", "Bearer test-sf-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statementHandle": "sf-big",
+                "data": rows
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let result = test_connector(&server)
+        .execute_sql("SELECT id FROM big")
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = result
+        .rows
+        .iter()
+        .map(|row| row[0].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["1", "2", "3", "4", "5"]);
+    assert_eq!(result.total_row_count, Some(5));
+}
+
+/// A result with fewer rows than `numRows` is an error, never a short
+/// result a row-counting test would read as the whole one (#2775).
+#[tokio::test]
+async fn execute_sql_refuses_a_result_shorter_than_num_rows() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-short",
+            "code": "00000",
+            "resultSetMetaData": {
+                "numRows": 3,
+                "rowType": [{"name": "ID", "type": "FIXED", "nullable": false}],
+                "partitionInfo": [{"rowCount": 3}]
+            },
+            "data": [["1"], ["2"]]
+        })))
+        .mount(&server)
+        .await;
+
+    let err = test_connector(&server)
+        .execute_sql("SELECT id FROM t")
+        .await
+        .expect_err("a short result must not pass");
+
+    let ConnectorError::IncompleteResult {
+        handle,
+        expected,
+        received,
+    } = &err
+    else {
+        panic!("expected IncompleteResult, got: {err:?}");
+    };
+    assert_eq!(handle, "sf-short");
+    assert_eq!((*expected, *received), (3, 2));
+}
+
 /// The `MULTI_STATEMENT_COUNT` actually sent on the wire must reflect
 /// protected lexical regions (#1365): strings with backslash escapes,
 /// dollar-quoted bodies, and quoted identifiers are all opaque to the
