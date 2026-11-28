@@ -6540,6 +6540,98 @@ mod tests {
         serde_json::to_string_pretty(output).unwrap() + "\n"
     }
 
+    /// `text` without the lines that start with any of `prefixes`, joined by
+    /// `\n`. For comparing a served body with its reference modulo a
+    /// clock-derived key, as text: no response body goes through a
+    /// deserializer. Give the prefix with its exact pretty-print indent so
+    /// only the intended key matches.
+    fn without_lines(text: &str, prefixes: &[&str]) -> String {
+        text.lines()
+            .filter(|line| !prefixes.iter().any(|prefix| line.starts_with(prefix)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `text` without the top-level object or array `key`: from its opening
+    /// line (`  "key": {`) through the closing line at the same indent
+    /// (`  }` or `  },`), joined by `\n`. For pretty-printed bodies only.
+    fn without_top_level_block(text: &str, key: &str) -> String {
+        let open = format!("  \"{key}\": ");
+        let mut skipping = false;
+        let mut kept = Vec::new();
+        for line in text.lines() {
+            if skipping {
+                if matches!(line, "  }" | "  }," | "  ]" | "  ],") {
+                    skipping = false;
+                }
+                continue;
+            }
+            if line.starts_with(&open) {
+                skipping = line.ends_with('{') || line.ends_with('[');
+                continue;
+            }
+            kept.push(line);
+        }
+        assert!(!skipping, "`{key}` is never closed in {text}");
+        kept.join("\n")
+    }
+
+    /// The model list the `/models` route builds, from the state's own
+    /// compile result. Lets a test compare the served text against typed
+    /// output instead of parsing the body.
+    async fn expected_model_list(state: &ServerState) -> ModelListOutput {
+        let lock = state.compile_result.read().await;
+        let result = lock.as_ref().expect("the state has compiled");
+        let mut models: Vec<ModelListEntry> = result
+            .semantic_graph
+            .models
+            .iter()
+            .map(|(name, schema)| ModelListEntry {
+                name: name.clone(),
+                columns: schema.columns.len(),
+                has_star: schema.has_star,
+                upstream: schema.upstream.clone(),
+                downstream: schema.downstream.clone(),
+            })
+            .collect();
+        models.sort_by(|a, b| a.name.cmp(&b.name));
+        let count = models.len();
+        ModelListOutput { models, count }
+    }
+
+    /// The detail the `/models/:name` route builds, from the state's own
+    /// compile result.
+    async fn expected_model_detail(state: &ServerState, name: &str) -> ModelDetailOutput {
+        let lock = state.compile_result.read().await;
+        let result = lock.as_ref().expect("the state has compiled");
+        let schema = result.semantic_graph.model_schema(name).unwrap();
+        let typed_columns = result.type_check.typed_models.get(name).map(|cols| {
+            cols.iter()
+                .map(TypedColumnOutput::from_typed_column)
+                .collect()
+        });
+        let model = result.project.model(name).unwrap();
+        let (sql, sql_truncated) = cap_model_sql(&model.sql);
+        ModelDetailOutput {
+            name: name.to_string(),
+            sql,
+            sql_truncated,
+            sql_bytes: model.sql.len(),
+            file_path: model.file_path.display().to_string(),
+            columns: schema
+                .columns
+                .iter()
+                .map(|c| ModelColumnOutput {
+                    name: c.name.clone(),
+                })
+                .collect(),
+            typed_columns,
+            has_star: schema.has_star,
+            upstream: schema.upstream.clone(),
+            downstream: schema.downstream.clone(),
+        }
+    }
+
     /// The state path a test should pin, computed **directly**.
     ///
     /// Deliberately not `resolve_state_path`: that resolver prefers a
@@ -6646,12 +6738,13 @@ mod tests {
     async fn test_compile_and_list_models() {
         let state = test_state();
         state.recompile().await;
+        let state_for_list = state.clone();
         let base = spawn_router(state).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let body: ModelListOutput = serde_json::from_str(&text).unwrap();
+        let body = expected_model_list(&state_for_list).await;
         assert_eq!(body.count, 3);
         assert_eq!(
             body.models.len(),
@@ -6681,7 +6774,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let body: ModelDetailOutput = serde_json::from_str(&text).unwrap();
+        let body = expected_model_detail(&state_for_detail, "raw_orders").await;
         assert_eq!(body.name, "raw_orders");
         assert!(body.sql.contains("SELECT"));
         assert!(!body.sql_truncated, "a fixture-sized model is never cut");
@@ -6745,12 +6838,15 @@ mod tests {
 
         let state = ServerState::new(models, None, Some(config));
         state.recompile().await;
+        let state_for_detail = state.clone();
         let base = spawn_router(state).await;
         let resp = reqwest::get(format!("{base}/api/v1/models/b"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: ModelDetailOutput = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let text = resp.text().await.unwrap();
+        let body = expected_model_detail(&state_for_detail, "b").await;
+        assert_eq!(text, reference_bytes(&body));
         let typed = body.typed_columns.expect("b has typed columns");
         let f = typed.iter().find(|c| c.name == "f").expect("column f");
         assert_eq!(f.data_type, rocky_ir::types::RockyType::Float64);
@@ -6928,7 +7024,7 @@ mod tests {
             product_list_in(&root, Some(&state_path)).unwrap()
         };
         assert_eq!(text, reference_bytes(&expected));
-        let list: ProductListOutput = serde_json::from_str(&text).unwrap();
+        let list = expected;
         assert_eq!(list.count, 1);
         assert_eq!(list.products[0].name, "revenue_daily");
         assert_eq!(
@@ -7086,14 +7182,24 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let served: ProductMonthCostOutput = serde_json::from_str(&text).unwrap();
-        let mut expected = {
+        let expected = {
             let _gate = store_gate(&state).await;
             crate::commands::compute_month_cost(&state_path, &config, "2026-10", chrono::Utc::now())
                 .unwrap()
         };
-        expected.as_of.clone_from(&served.as_of);
-        assert_eq!(text, reference_bytes(&expected));
+        // Byte equality modulo `as_of` (the request instant), as text.
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("  \"as_of\":"))
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            without_lines(&text, &["  \"as_of\":"]),
+            without_lines(&reference_bytes(&expected), &["  \"as_of\":"])
+        );
+        let served = expected;
         assert_eq!(served.command, "cost_by_product");
         let product = served
             .products
@@ -8171,20 +8277,20 @@ mod tests {
     /// Strip the two clock-derived fields from every pending entry and return
     /// their `staleness_seconds` values, so two payloads taken a moment apart
     /// can be compared exactly on everything else.
-    fn without_clock(mut queue: serde_json::Value) -> (serde_json::Value, Vec<i64>) {
-        let mut staleness = Vec::new();
-        if let Some(pending) = queue["pending"].as_array_mut() {
-            for entry in pending {
-                let obj = entry.as_object_mut().expect("entry object");
-                staleness.push(
-                    obj.remove("staleness_seconds")
-                        .and_then(|v| v.as_i64())
-                        .expect("staleness_seconds"),
-                );
-                obj.remove("score").expect("score");
-            }
-        }
-        (queue, staleness)
+    ///
+    /// Works on the pretty-printed text, so no response body goes through a
+    /// deserializer. A pending entry's fields sit at six spaces of indent.
+    fn without_clock(text: &str) -> (String, Vec<i64>) {
+        const STALENESS: &str = "      \"staleness_seconds\": ";
+        let staleness = text
+            .lines()
+            .filter_map(|line| line.strip_prefix(STALENESS))
+            .map(|rest| rest.trim_end_matches(',').parse::<i64>().expect("integer"))
+            .collect();
+        (
+            without_lines(text, &[STALENESS, "      \"score\":"]),
+            staleness,
+        )
     }
 
     /// `/review/queue` answers with the CLI's bytes for the same project,
@@ -8202,14 +8308,16 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let served: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(served["total"], 2, "{text}");
-        assert_eq!(served["excluded_non_plan_rows"], 1);
-        let listed: Vec<&str> = served["pending"]
-            .as_array()
-            .unwrap()
+        let expected = {
+            let _gate = store_gate(&state).await;
+            compute_review_queue(&root, &config, &state_path, &root.join("models")).unwrap()
+        };
+        assert_eq!(expected.total, 2, "{text}");
+        assert_eq!(expected.excluded_non_plan_rows, 1);
+        let listed: Vec<&str> = expected
+            .pending
             .iter()
-            .map(|e| e["plan_id"].as_str().unwrap())
+            .map(|e| e.plan_id.as_str())
             .collect();
         assert!(listed.contains(&a.as_str()) && listed.contains(&b.as_str()));
         assert!(
@@ -8219,14 +8327,10 @@ mod tests {
         // Pretty-printed with a trailing newline, like every canonical route.
         assert!(text.ends_with("}\n"), "{text}");
 
-        let expected = {
-            let _gate = store_gate(&state).await;
-            compute_review_queue(&root, &config, &state_path, &root.join("models")).unwrap()
-        };
-        let (served_json, served_stale) = without_clock(served);
-        let (expected_json, expected_stale) =
-            without_clock(serde_json::to_value(&expected).unwrap());
-        assert_eq!(served_json, expected_json);
+        let (served_text, served_stale) = without_clock(&text);
+        let (expected_text, expected_stale) = without_clock(&reference_bytes(&expected));
+        assert_eq!(served_stale.len(), expected.pending.len(), "{text}");
+        assert_eq!(served_text, expected_text);
         for (s, e) in served_stale.iter().zip(&expected_stale) {
             assert!((s - e).abs() <= 5, "staleness drifted: {s} vs {e}");
         }
@@ -8446,8 +8550,7 @@ mod tests {
                 .expect("the core computes the same diff")
         };
         assert_eq!(text, reference_bytes(&expected));
-        let diff: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(diff["approved"], false, "the route must never approve");
+        assert!(!expected.approved, "the route must never approve");
 
         // A kind the review flow does not gate: the CLI refuses it, so the
         // route answers 409 rather than pretending there is a diff.
@@ -8597,8 +8700,7 @@ mod tests {
             let text = resp.text().await.unwrap();
             let expected = compute_review_status(&root, plan_id).unwrap();
             assert_eq!(text, reference_bytes(&expected));
-            let status: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(status["reviewed"], reviewed, "{plan_id}");
+            assert_eq!(expected.reviewed, reviewed, "{plan_id}");
         }
 
         // Not a plan id at all, and a well-formed id with no plan file.
@@ -8749,23 +8851,27 @@ mod tests {
     /// Strip the clock-derived fields of a digest and return its
     /// `generated_at` instant, so two digests a moment apart compare exactly
     /// on everything else.
-    fn brief_without_clock(
-        mut brief: serde_json::Value,
-    ) -> (serde_json::Value, chrono::DateTime<chrono::Utc>) {
-        let obj = brief.as_object_mut().expect("brief object");
-        let generated_at = obj
-            .remove("generated_at")
-            .and_then(|v| v.as_str().map(str::to_string))
-            .expect("generated_at");
-        obj.remove("since_timestamp");
-        let at = chrono::DateTime::parse_from_rfc3339(&generated_at)
-            .expect("rfc3339")
-            .with_timezone(&chrono::Utc);
-        (brief, at)
+    ///
+    /// Works on the pretty-printed text: both keys are top-level.
+    fn brief_without_clock(text: &str) -> (String, chrono::DateTime<chrono::Utc>) {
+        let at = top_level_timestamp(text, "generated_at");
+        (
+            without_lines(text, &["  \"generated_at\":", "  \"since_timestamp\":"]),
+            at,
+        )
     }
 
-    fn rfc3339(value: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339(value.as_str().expect("timestamp string"))
+    /// The instant in the top-level string field `key` of a pretty-printed
+    /// body, read from its line. Panics when the key is absent.
+    fn top_level_timestamp(text: &str, key: &str) -> chrono::DateTime<chrono::Utc> {
+        let prefix = format!("  \"{key}\": \"");
+        let raw = text
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("no top-level `{key}` in {text}"))
+            .trim_end_matches(',')
+            .trim_end_matches('"');
+        chrono::DateTime::parse_from_rfc3339(raw)
             .expect("rfc3339")
             .with_timezone(&chrono::Utc)
     }
@@ -8840,21 +8946,28 @@ mod tests {
             assert_eq!(resp.status(), 200, "{since}");
             let text = resp.text().await.unwrap();
             assert!(text.ends_with("}\n"), "{text}");
-            let served: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(served["since_mode"], since);
-            assert_eq!(served["runs"]["availability"], "available", "{since}");
-            assert_eq!(
-                served["escalations"]["availability"], "available",
-                "{since}"
+            assert!(
+                text.lines()
+                    .any(|l| l == format!("  \"since_mode\": \"{since}\",")),
+                "{since}: {text}"
             );
             let expected = {
                 let _gate = store_gate(&state).await;
                 compute_brief(&root, &state_path, &config, mode, chrono::Utc::now()).unwrap()
             };
-            let (served_json, served_at) = brief_without_clock(served);
-            let (expected_json, expected_at) =
-                brief_without_clock(serde_json::to_value(&expected).unwrap());
-            assert_eq!(served_json, expected_json, "{since}");
+            assert_eq!(
+                expected.runs.availability,
+                crate::output::SectionAvailability::Available,
+                "{since}"
+            );
+            assert_eq!(
+                expected.escalations.availability,
+                crate::output::SectionAvailability::Available,
+                "{since}"
+            );
+            let (served_text, served_at) = brief_without_clock(&text);
+            let (expected_text, expected_at) = brief_without_clock(&reference_bytes(&expected));
+            assert_eq!(served_text, expected_text, "{since}");
             assert!(
                 (expected_at - served_at).num_seconds().abs() <= 5,
                 "{since}: generated_at drifted"
@@ -8862,13 +8975,16 @@ mod tests {
         }
 
         // No query at all is the MCP tool's `7d`, not the CLI's `last`.
-        let served: serde_json::Value = reqwest::get(format!("{base}/api/v1/brief"))
+        let served = reqwest::get(format!("{base}/api/v1/brief"))
             .await
             .unwrap()
-            .json()
+            .text()
             .await
             .unwrap();
-        assert_eq!(served["since_mode"], "7d");
+        assert!(
+            served.lines().any(|l| l == "  \"since_mode\": \"7d\","),
+            "{served}"
+        );
 
         // Three reads, one of them `last`: the cursor is still unset.
         let cursor = {
@@ -8918,9 +9034,15 @@ mod tests {
                 compute_audit_scorecard(&state_path, dimension, Some("all")).unwrap()
             };
             assert_eq!(text, reference_bytes(&expected), "{by}");
-            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(json["by"], by);
-            assert_eq!(json["availability"], "available", "{by}");
+            assert!(
+                text.lines().any(|l| l == format!("  \"by\": \"{by}\",")),
+                "{by}: {text}"
+            );
+            assert_eq!(
+                expected.availability,
+                crate::output::SectionAvailability::Available,
+                "{by}"
+            );
         }
 
         let text = reqwest::get(format!("{base}/api/v1/audit/scorecard"))
@@ -8939,30 +9061,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let mut served: serde_json::Value = resp.json().await.unwrap();
-        let thirty_days = {
+        let served = resp.text().await.unwrap();
+        let expected = {
             let _gate = store_gate(&state).await;
             compute_audit_scorecard(&state_path, ScorecardDimension::Principal, Some("30d"))
                 .unwrap()
         };
-        let mut expected = serde_json::to_value(thirty_days).unwrap();
-        let served_start = served
-            .as_object_mut()
-            .unwrap()
-            .remove("window_start")
-            .expect("window_start");
-        let expected_start = expected
-            .as_object_mut()
-            .unwrap()
-            .remove("window_start")
-            .expect("window_start");
-        assert_eq!(served, expected);
-        assert!(
-            (rfc3339(&expected_start) - rfc3339(&served_start))
-                .num_seconds()
-                .abs()
-                <= 5
+        let expected_text = reference_bytes(&expected);
+        let served_start = top_level_timestamp(&served, "window_start");
+        let expected_start = top_level_timestamp(&expected_text, "window_start");
+        assert_eq!(
+            without_lines(&served, &["  \"window_start\":"]),
+            without_lines(&expected_text, &["  \"window_start\":"])
         );
+        assert!((expected_start - served_start).num_seconds().abs() <= 5);
 
         for query in ["by=team", "window=fortnight"] {
             let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?{query}"))
@@ -9016,9 +9128,12 @@ mod tests {
                 compute_audit_for(&root, &config, &state_path, &models, subject).unwrap()
             };
             assert_eq!(text, reference_bytes(&expected), "{subject}");
-            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(json["subject_kind"], kind, "{subject}");
-            assert_eq!(json["resolved"], resolved, "{subject}");
+            assert!(
+                text.lines()
+                    .any(|l| l == format!("  \"subject_kind\": \"{kind}\",")),
+                "{subject}: {text}"
+            );
+            assert_eq!(expected.resolved, resolved, "{subject}");
         }
 
         // #2003: a spec that exists but does not load is the audit route's
@@ -9095,9 +9210,9 @@ mod tests {
             .unwrap()
         };
         assert_eq!(text, reference_bytes(&expected));
-        let whole: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert!(whole.get("product").is_none(), "{text}");
-        assert!(whole["decisions"].as_array().unwrap().len() >= 6, "{text}");
+        let whole = &expected;
+        assert!(whole.product.is_none(), "{text}");
+        assert!(whole.decisions.len() >= 6, "{text}");
 
         let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))
             .await
@@ -9115,10 +9230,13 @@ mod tests {
             .unwrap()
         };
         assert_eq!(text, reference_bytes(&expected));
-        let scoped: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(scoped["product"]["output_model"], "revenue_daily");
-        assert_eq!(scoped["decisions"].as_array().unwrap().len(), 1, "{text}");
-        assert_eq!(scoped["decisions"][0]["plan_id"], "plan-revenue-daily");
+        let scoped = &expected;
+        assert_eq!(
+            scoped.product.as_ref().unwrap().output_model,
+            "revenue_daily"
+        );
+        assert_eq!(scoped.decisions.len(), 1, "{text}");
+        assert_eq!(scoped.decisions[0].plan_id, "plan-revenue-daily");
 
         // No spec, a traversal shape, and a name with a space: 404 each,
         // the last two before any path is built.
@@ -9205,18 +9323,14 @@ mod tests {
             compute_audit(&state_path, None, &query).unwrap()
         };
         assert_eq!(text, reference_bytes(&expected));
-        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let plans: Vec<&str> = out["decisions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|d| d["plan_id"].as_str().unwrap())
-            .collect();
+        let out = &expected;
+        let plans: Vec<&str> = out.decisions.iter().map(|d| d.plan_id.as_str()).collect();
         assert_eq!(plans, vec!["p-alice"], "{text}");
         // The fixture's own id-less rows are recent too, so at least ours.
-        assert!(out["unattributed_skipped"].as_u64().unwrap() >= 1, "{text}");
-        assert_eq!(out["filter"]["actor"], "alice");
-        assert_eq!(out["filter"]["since"], "2026-10-01T00:00:00Z");
+        assert!(out.unattributed_skipped >= 1, "{text}");
+        let filter = out.filter.as_ref().unwrap();
+        assert_eq!(filter.actor.as_deref(), Some("alice"));
+        assert_eq!(filter.since.as_deref(), Some("2026-10-01T00:00:00Z"));
 
         for bad in ["actor=Bad", "actor=a%40b", "since=garbage", "since=all"] {
             let resp = reqwest::get(format!("{base}/api/v1/audit?{bad}"))
@@ -9251,9 +9365,9 @@ mod tests {
                 .expect("known by its spec")
         };
         assert_eq!(text, reference_bytes(&expected));
-        let empty: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(empty["count"], 0, "{text}");
-        assert_eq!(empty["product_id"], "product:revenue_daily");
+        let empty = &expected;
+        assert_eq!(empty.count, 0, "{text}");
+        assert_eq!(empty.product_id, "product:revenue_daily");
 
         // One approval appends one row, which the route shows byte for byte.
         {
@@ -9273,13 +9387,14 @@ mod tests {
                 .expect("known")
         };
         assert_eq!(text, reference_bytes(&expected));
-        let one: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(one["count"], 1, "{text}");
-        assert_eq!(one["rows"][0]["seq"], 1);
-        assert_eq!(one["rows"][0]["to_state"], "spec_approved");
+        let one = &expected;
+        assert_eq!(one.count, 1, "{text}");
+        assert_eq!(one.rows[0].seq, 1);
+        assert_eq!(one.rows[0].to_state, "spec_approved");
         assert!(
-            one["rows"][0]["spec_digest"]
-                .as_str()
+            one.rows[0]
+                .spec_digest
+                .as_deref()
                 .unwrap()
                 .starts_with("sha256:"),
             "{text}"
@@ -9424,7 +9539,13 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
-        let body: DagStatusOutput = serde_json::from_str(&text).unwrap();
+        let recorded = state
+            .dag_status
+            .get()
+            .await
+            .expect("the executor's record is set");
+        let body = dag_status_output(&recorded);
+        assert_eq!(text, reference_bytes(&body));
         assert_eq!(body.result.total_nodes, 2);
         assert_eq!(body.result.failed, 1);
         assert_eq!(body.result.nodes[0].status, DagNodeStatusOutput::Completed);
@@ -9660,12 +9781,11 @@ mod tests {
             shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
             store.record_run(&shadow).unwrap();
         }
-        let base = spawn_router(pinned_server(
-            root.join("models"),
-            Some(config.clone()),
-            &state_path,
-        ))
-        .await;
+        // Let the initial compile settle first, so the served body and the
+        // handler's own output below see the same compile result.
+        let state = pinned_server(root.join("models"), Some(config.clone()), &state_path);
+        wait_for_compile(&state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/project"))
             .await
@@ -9673,54 +9793,103 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
         assert!(text.ends_with("}\n"), "{text}");
-        let project: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // The served bytes are the route's own output for the same state.
+        let project = served_project(&state).await;
+        assert_eq!(text, reference_bytes(&project));
         assert_eq!(
-            project["name"],
+            project.name,
             root.file_name().unwrap().to_string_lossy().as_ref()
         );
-        assert_eq!(project["config_path"], config.display().to_string());
-        assert!(project.get("config_error").is_none(), "{text}");
+        assert_eq!(
+            project.config_path.as_deref(),
+            Some(config.display().to_string().as_str())
+        );
+        assert!(project.config_error.is_none(), "{text}");
         assert!(
-            !project["pipelines"].as_array().unwrap().is_empty(),
+            !project.pipelines.is_empty(),
             "the fixture config declares a pipeline: {text}"
         );
         assert!(
-            !project["adapters"].as_array().unwrap().is_empty(),
+            !project.adapters.is_empty(),
             "the fixture config declares an adapter: {text}"
         );
-        assert_eq!(project["last_run"]["run_id"], "run-orders-1", "{text}");
-        assert_eq!(project["last_run"]["status"], "Success");
-        assert_eq!(project["last_run"]["models_executed"], 1);
-        assert_eq!(project["last_run"]["run_scope"], "production");
-        assert!(project["diagnostics"]["total"].is_number());
+        let last_run = project.last_run.as_ref().expect("a last run");
+        assert_eq!(last_run.run_id, "run-orders-1", "{text}");
+        assert_eq!(last_run.status, "Success");
+        assert_eq!(last_run.models_executed, 1);
+        assert_eq!(last_run.run_scope, crate::output::RunScopeKind::Production);
+        assert!(
+            text.lines()
+                .any(|l| l == "    \"run_scope\": \"production\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"diagnostics\": {\n    \"total\": "),
+            "{text}"
+        );
 
         // No config bound: still 200, with nothing config-derived.
-        let base = spawn_router(test_state()).await;
-        let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+        let state = test_state();
+        wait_for_compile(&state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
+        let text = reqwest::get(format!("{base}/api/v1/project"))
             .await
             .unwrap()
-            .json()
+            .text()
             .await
             .unwrap();
-        assert_eq!(project["name"], "rocky");
-        assert!(project.get("config_path").is_none());
-        assert_eq!(project["pipelines"], serde_json::json!([]));
-        assert_eq!(project["adapters"], serde_json::json!([]));
+        let project = served_project(&state).await;
+        assert_eq!(text, reference_bytes(&project));
+        assert_eq!(project.name, "rocky");
+        assert!(project.config_path.is_none());
+        assert!(project.pipelines.is_empty());
+        assert!(project.adapters.is_empty());
+        assert!(text.contains("\"pipelines\": [],"), "{text}");
+        assert!(text.contains("\"adapters\": [],"), "{text}");
 
         // A config that does not load: the reason, and empty lists.
         let bad = dir.path().join("broken").join("rocky.toml");
         std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
         std::fs::write(&bad, "this = [is not toml").unwrap();
-        let base = spawn_router(pinned_server(root.join("models"), Some(bad), &state_path)).await;
-        let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+        let state = pinned_server(root.join("models"), Some(bad), &state_path);
+        wait_for_compile(&state).await;
+        let base = spawn_router(Arc::clone(&state)).await;
+        let text = reqwest::get(format!("{base}/api/v1/project"))
             .await
             .unwrap()
-            .json()
+            .text()
             .await
             .unwrap();
-        assert_eq!(project["name"], "broken");
-        assert!(project["config_error"].is_string(), "{project}");
-        assert_eq!(project["pipelines"], serde_json::json!([]));
+        let project = served_project(&state).await;
+        assert_eq!(text, reference_bytes(&project));
+        assert_eq!(project.name, "broken");
+        assert!(project.config_error.is_some(), "{text}");
+        assert!(project.pipelines.is_empty());
+        assert!(text.contains("\"pipelines\": [],"), "{text}");
+    }
+
+    /// Waits for the state's initial background compile to publish a result
+    /// or a failure.
+    async fn wait_for_compile(state: &ServerState) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while state.compile_result.read().await.is_none()
+                && state.compile_failure.read().await.is_none()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the initial compile settles");
+    }
+
+    /// What the `/project` route builds for `state`: the handler's own typed
+    /// output, so a test compares the served text with it.
+    async fn served_project(state: &Arc<ServerState>) -> ProjectOutput {
+        project(State(Arc::clone(state)))
+            .await
+            .ok()
+            .expect("project response")
+            .0
     }
 
     /// The project route must expose a skipped recompile without replacing
@@ -10241,13 +10410,14 @@ mod tests {
         );
 
         // `compile_timings` is wall-clock and inherently non-deterministic;
-        // normalize it away, then require byte-equality on everything else.
-        let normalize = |s: &str| -> serde_json::Value {
-            let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
-            v["compile_timings"] = serde_json::json!(null);
-            v
-        };
-        assert_eq!(normalize(&api), normalize(&reference));
+        // drop that top-level object from both texts, then require
+        // byte-equality on everything else.
+        assert!(api.contains("\n  \"compile_timings\": {\n"), "{api}");
+        assert!(reference.contains("\n  \"compile_timings\": {\n"));
+        assert_eq!(
+            without_top_level_block(&api, "compile_timings"),
+            without_top_level_block(&reference, "compile_timings")
+        );
     }
 
     #[tokio::test]
@@ -10564,39 +10734,51 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let api = resp.text().await.unwrap();
 
-        let parsed: serde_json::Value = serde_json::from_str(&api).unwrap();
-        let stg = parsed["nodes"]
-            .as_array()
-            .unwrap()
+        // The served body is never deserialized. The load-bearing check comes
+        // first: the custom-root model must reach the served DAG at all.
+        assert!(
+            api.contains("\"label\": \"stg\""),
+            "the custom-root model must reach the served DAG: {api}"
+        );
+
+        // The reference is built from the config and the compile, not from
+        // anything the route served.
+        let compile = state.compile_result.read().await;
+        let expected = mark_compiled_nodes(
+            dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
+            compile.as_ref(),
+        );
+        drop(compile);
+        let stg = expected
+            .nodes
             .iter()
-            .find(|n| n["label"] == "stg")
-            .expect("the custom-root model must reach the served DAG");
+            .find(|n| n.label == "stg")
+            .expect("the custom-root model must reach the reference DAG");
 
         // Finding 1: the node existing is not enough. Enrichment reads a flat
         // name-keyed model list, and deriving that from the fallback `models/`
         // while building the graph per pipeline produced a correctly-shaped node
         // whose target and strategy were silently `null`.
+        let target = stg.target.as_ref().expect("node must carry its target");
         assert_eq!(
-            stg["target"]["table"], "stg",
+            target.table, "stg",
             "node must carry its target, not just its name"
         );
-        assert_eq!(stg["target"]["schema"], "s");
+        assert_eq!(target.schema, "s");
         assert!(
-            !stg["strategy"].is_null(),
+            stg.strategy.is_some(),
             "node must carry its materialization strategy"
         );
 
-        let compile = state.compile_result.read().await;
-        let reference = reference_bytes(&mark_compiled_nodes(
-            dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
-            compile.as_ref(),
-        ));
-        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        assert_eq!(
+            api,
+            reference_bytes(&expected),
+            "GET /dag must match `rocky dag`"
+        );
         // #2011: the graph names `stg` from `transforms/`, and the server
         // compiles the pipeline's own root rather than the defaulted
         // `models/`, which does not exist here.
-        assert_eq!(stg["compiled"], true, "{api}");
-        drop(compile);
+        assert_eq!(stg.compiled, Some(true), "{api}");
 
         // A single custom root is still a root the compiler can read, so
         // `--column-lineage` must keep working here. Asserting on the EDGES,
@@ -16462,8 +16644,7 @@ adapter = "db"
             crate::commands::compute_branch_list(&state_path).unwrap()
         };
         assert_eq!(text, reference_bytes(&expected));
-        let served: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(served["total"], 2, "{text}");
+        assert_eq!(expected.total, 2, "{text}");
     }
 
     /// `GET /api/v1/project` reports whether the config requires a branch
