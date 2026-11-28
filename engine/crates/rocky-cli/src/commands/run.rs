@@ -14722,34 +14722,29 @@ async fn execute_models_phase(
             } else {
                 declared_ref_deps
             };
-            // Enumerate physical reads only when the read set is provably
-            // complete; otherwise the model fails closed (`reads_complete =
-            // false`), so it is withheld once a failure has occurred.
+            // Enumerate physical reads only when the whole read set can be
+            // listed, CTE bodies, sub-queries and set-operation branches
+            // included (#2737); otherwise the model fails closed
+            // (`reads_complete = false`), so it is withheld once a failure has
+            // occurred.
             let (reads, reads_complete): (Vec<String>, bool) =
-                if rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
-                    match rocky_sql::lineage::extract_lineage(&model.sql) {
-                        Ok(l) => (
-                            l.source_tables
-                                .iter()
-                                .map(|t| t.name.to_lowercase())
-                                .filter(|read| {
-                                    !externalized.is_some_and(|externalized| {
-                                        matches!(
-                                            producers.resolve(read),
-                                            super::containment::ReadResolution::Edges(ref models)
-                                                if models.iter().all(|model| externalized.contains(model))
-                                        )
-                                    })
+                match rocky_sql::lineage_complete::containment_read_set(&model.sql) {
+                    Some(reads) => (
+                        reads
+                            .into_iter()
+                            .filter(|read| {
+                                !externalized.is_some_and(|externalized| {
+                                    matches!(
+                                        producers.resolve(read),
+                                        super::containment::ReadResolution::Edges(ref models)
+                                            if models.iter().all(|model| externalized.contains(model))
+                                    )
                                 })
-                                .collect(),
-                            true,
-                        ),
-                        // Provably-complete said yes but extraction failed — fail
-                        // closed rather than trust an empty read set.
-                        Err(_) => (Vec::new(), false),
-                    }
-                } else {
-                    (Vec::new(), false)
+                            })
+                            .collect(),
+                        true,
+                    ),
+                    None => (Vec::new(), false),
                 };
             containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
         }
@@ -44678,7 +44673,7 @@ auto_create_schemas = true
     /// `rollup` reads it through a CTE, so its read set is unenumerable
     /// (`lineage_is_provably_complete` is false) and no ordering edge is derived.
     /// FIX (serial fail-closed belt): once a mid-layer failure has poisoned
-    /// the ledger, a LATER same-layer *uncertain* (CTE — unenumerable reads)
+    /// the ledger, a LATER same-layer *uncertain* (a table function — unlistable reads, #2737)
     /// model is re-adjudicated immediately before its serial dispatch and
     /// withheld. Pre-fix, the layer's verdicts were computed only once,
     /// before any model ran, so the uncertain model built on data it could
@@ -44712,7 +44707,7 @@ auto_create_schemas = true
         write_model_with_target(
             &models_dir,
             "z_rollup",
-            "WITH x AS (SELECT id FROM main.orders_current) SELECT COUNT(*) AS n FROM x",
+            "SELECT COUNT(*) AS n FROM main.orders_current CROSS JOIN range(1) AS r(i)",
             "main",
             "z_rollup",
         );
@@ -44907,8 +44902,105 @@ auto_create_schemas = true
         );
     }
 
+    /// #2737: containment lists the reads inside CTE bodies, sub-queries and
+    /// set-operation branches. A model whose nested reads are all external
+    /// builds after an unrelated failure; one that reads the failed model's
+    /// table there is withheld, also through a CTE named after that table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_lists_nested_reads_instead_of_failing_closed() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("nested.duckdb");
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.raw_x AS SELECT 1 AS v")
+                .await
+                .unwrap();
+            // A stale copy of the failing model's table: a reader that wrongly
+            // builds succeeds instead of failing on a missing table.
+            seed.execute_statement("CREATE TABLE main.bad AS SELECT 1 AS v")
+                .await
+                .unwrap();
+        }
+        write_plain_model(&models_dir, "bad", "SELECT * FROM main.does_not_exist_xyz");
+        let cases = [
+            (
+                "cte_ext",
+                "WITH t AS (SELECT v FROM main.raw_x) SELECT v FROM t",
+                true,
+            ),
+            (
+                "cte_bad",
+                "WITH t AS (SELECT v FROM main.bad) SELECT v FROM t",
+                false,
+            ),
+            (
+                "sub_ext",
+                "SELECT v FROM (SELECT v FROM main.raw_x) AS d",
+                true,
+            ),
+            (
+                "sub_bad",
+                "SELECT v FROM main.raw_x WHERE v IN (SELECT v FROM main.bad)",
+                false,
+            ),
+            (
+                "union_ext",
+                "SELECT v FROM main.raw_x UNION ALL SELECT v FROM main.raw_x",
+                true,
+            ),
+            (
+                "union_bad",
+                "SELECT v FROM main.raw_x UNION ALL SELECT v FROM main.bad",
+                false,
+            ),
+            // The CTE shadows `bad`; its body reads the table.
+            (
+                "shadow",
+                "WITH bad AS (SELECT v FROM bad) SELECT v FROM bad",
+                false,
+            ),
+            // The CTE shadows `bad` and reads only external data.
+            (
+                "shadow_ext",
+                "WITH bad AS (SELECT v FROM main.raw_x) SELECT v FROM bad",
+                true,
+            ),
+        ];
+        for (name, sql, _) in &cases {
+            write_plain_model(&models_dir, name, sql);
+        }
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        for (name, _, builds) in &cases {
+            assert_eq!(
+                built.contains(*name),
+                *builds,
+                "{name}: built = {built:?}, contained = {contained:?}"
+            );
+            assert_eq!(
+                contained.contains(name),
+                !*builds,
+                "{name}: contained = {contained:?}"
+            );
+        }
+    }
+
     /// Finding 2 / fail-closed belt: a model whose read set is NOT provably
-    /// complete (a CTE — the completeness gate rejects it) cannot be proven
+    /// complete (a table function, #2737) cannot be proven
     /// disjoint from a failure, so once any failure has occurred it must be
     /// contained, never built.
     ///
@@ -44927,12 +45019,12 @@ auto_create_schemas = true
         write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
         write_plain_model(&models_dir, "bad", "SELECT * FROM main.does_not_exist_xyz");
         // Layer 1 (explicit `depends_on = ["anchor"]`, so `bad`'s layer-0 failure
-        // is known when this is evaluated): `mystery` uses a CTE, so its read set
+        // is known when this is evaluated): `mystery` reads a table function, so its read set
         // is not provably complete — the closure cannot prove it is disjoint from
         // `bad`, so it must fail closed once `bad` has failed.
         std::fs::write(
             models_dir.join("mystery.sql"),
-            "WITH x AS (SELECT v FROM anchor) SELECT v FROM x\n",
+            "SELECT v FROM anchor CROSS JOIN range(1) AS r(i)\n",
         )
         .unwrap();
         std::fs::write(
@@ -47681,7 +47773,7 @@ auto_create_schemas = true
 
     /// Runs the scoped blocked-reader project: `f` fails compile (E056), `g`
     /// has `depends_on = ["f"]`, `r` reads `main.g` and `d` reads `main.r`,
-    /// both by qualified name. `u` reads only its own CTE, so its read set
+    /// both by qualified name. `u` reads only a table function, so its read set
     /// cannot be fully listed and containment withholds it fail-closed.
     /// `main.g`, `main.r` and `main.u` hold two stale rows each, so a model
     /// that wrongly builds succeeds instead of failing on a missing table.
@@ -47737,7 +47829,7 @@ auto_create_schemas = true
         write("d", "SELECT id FROM main.r\n", "", "d", "main");
         write(
             "u",
-            "WITH x AS (SELECT 5 AS id)\nSELECT id FROM x\n",
+            "SELECT i + 5 AS id FROM range(1) AS r(i)\n",
             "",
             "u",
             "main",
@@ -47850,7 +47942,7 @@ auto_create_schemas = true
         }
     }
 
-    /// `rocky run --model u`, where `u` reads only its own CTE and `f` fails
+    /// `rocky run --model u`, where `u` reads only a table function and `f` fails
     /// compile out of scope. Containment withholds `u` fail-closed: its read
     /// set cannot be fully listed, so it cannot be proven independent of
     /// `f`. The run then built nothing it was asked to build, so it must not

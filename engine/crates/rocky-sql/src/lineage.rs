@@ -1561,6 +1561,17 @@ fn extract_set_expr_lineage(
             if let Ok(right) = extract_set_expr_lineage(right, ctes, Vec::new()) {
                 collect_nested(&right, &mut result.nested_sources);
                 result.row_selection.extend(right.row_selection);
+            } else if let SetExpr::Table(table) = right.as_ref() {
+                // `TABLE t` reads `t` (#2771). A one-part name a `WITH`
+                // clause binds is the CTE, as for a `FROM` read.
+                if let Some(name) = &table.table_name {
+                    let read = match &table.schema_name {
+                        Some(schema) => Some(format!("{schema}.{name}")),
+                        None => (!ctes.contains_key(&name.to_string().to_lowercase()))
+                            .then(|| name.to_string()),
+                    };
+                    result.nested_sources.extend(read.map(|r| r.to_lowercase()));
+                }
             }
             result.nested_sources.sort();
             result.nested_sources.dedup();
@@ -1719,6 +1730,18 @@ fn extract_table_factor(
                 cte_columns: Vec::new(),
                 star_modifiers,
             });
+        }
+        // A derived table with no alias, `FROM (SELECT … FROM t)`, which
+        // DuckDB accepts. The outer query cannot name its columns, so it adds
+        // no relation; its reads are still this model's dependencies (#2771).
+        TableFactor::Derived {
+            subquery,
+            alias: None,
+            ..
+        } => {
+            if let Ok(inner) = extract_query_lineage(subquery, ctes) {
+                collect_nested(&inner, nested);
+            }
         }
         // A parenthesised join, `FROM (a JOIN b ON …) JOIN c`. Its relations
         // are dependencies, recorded by name only: they are not added to
@@ -2469,6 +2492,30 @@ fn extract_row_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2771: an unaliased derived table and a `TABLE t` right branch no
+    /// longer drop their reads. A `TABLE` name a `WITH` clause binds stays
+    /// the CTE.
+    #[test]
+    fn referenced_tables_reads_unaliased_derived_tables_and_table_branches() {
+        assert_eq!(
+            referenced_tables("SELECT * FROM (SELECT * FROM raw.t)").unwrap(),
+            vec!["raw.t".to_string()]
+        );
+        assert_eq!(
+            referenced_tables("SELECT id FROM raw.a UNION ALL TABLE raw.b").unwrap(),
+            vec!["raw.a".to_string(), "raw.b".to_string()]
+        );
+        assert_eq!(
+            referenced_tables("SELECT id FROM raw.a UNION ALL TABLE b").unwrap(),
+            vec!["b".to_string(), "raw.a".to_string()]
+        );
+        assert_eq!(
+            referenced_tables("WITH b AS (SELECT 1 AS id) SELECT id FROM raw.a UNION ALL TABLE b")
+                .unwrap(),
+            vec!["raw.a".to_string()]
+        );
+    }
 
     /// #2618: the star modifiers a projection records.
     #[test]
