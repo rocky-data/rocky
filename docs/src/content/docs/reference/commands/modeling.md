@@ -829,6 +829,7 @@ rocky ci-diff [base_ref] [flags]
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
 | `--working-tree` | flag | off | Compare the working tree instead of the HEAD commit. See [snapshot modes](#snapshot-modes). |
 | `--semantic` | flag | off | Also run the typed-IR semantic breaking-change classifier and surface findings under `breaking_findings` in the JSON output. Informational only — even a `Breaking` finding does not change `ci-diff`'s exit code. The hard gate lives on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch). |
+| `--seed-from-head` | flag | off | Read `data/seed.sql` from the HEAD commit, not the working tree, so an uncommitted seed never runs. The `rocky serve` diff job passes it. |
 
 ### Examples
 

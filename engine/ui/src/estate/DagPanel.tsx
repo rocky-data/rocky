@@ -239,7 +239,7 @@ export function DagPanel({
 
   return (
     <div>
-      <ul className="sr-only" aria-label="Models in the DAG">
+      <ul className="sr-only" aria-label="Models in the lineage">
         {flow.nodes.map((node) => (
           <li key={node.id}>
             {node.data.label} (layer {node.data.layer + 1}, {node.data.kind}

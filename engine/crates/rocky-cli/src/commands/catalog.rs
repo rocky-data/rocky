@@ -29,9 +29,9 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use rocky_compiler::compile::{self, CompilerConfig};
+use rocky_compiler::compile::{self, CompileResult, CompilerConfig};
 use rocky_compiler::semantic::{LineageEdge, SemanticGraph};
-use rocky_core::state::{RunStatus, StateStore, UnrecordedScope};
+use rocky_core::state::{RunRecord, RunStatus, StateStore, UnrecordedScope};
 
 use crate::output::{
     AssetKind, CatalogAsset, CatalogColumn, CatalogEdge, CatalogGovernance, CatalogOutput,
@@ -198,12 +198,117 @@ pub fn compute_catalog_output(
     };
     let result = compile::compile(&config).context("compile failed")?;
 
+    // The CLI stamps run history best effort: a missing or unreadable state
+    // store leaves the state-derived fields empty, so the command works
+    // before the first `rocky run`.
+    let facts = silent_run_facts(state_path);
+    build_catalog_output(
+        &result,
+        rocky_cfg.as_ref(),
+        Some(config_path),
+        std::slice::from_ref(&models_dir.to_path_buf()),
+        facts.as_ref(),
+        started,
+    )
+}
+
+/// The catalog for the HTTP route: [`compute_catalog_output`] over a project
+/// the server already compiled, with the run history already read.
+///
+/// Compiles nothing, reads no state store and writes nothing. It reads the
+/// config, the sidecar column docs of every model root and the config bytes
+/// (for the hash). With no `rocky.toml` the catalog still builds, as the CLI
+/// builds it: the project is called `unknown` and the config hash is
+/// `unknown`.
+/// Unlike the CLI, the route needs the run history to be there: a busy store
+/// is the caller's `503`, never a catalog with unknown run fields.
+///
+/// # Errors
+///
+/// An unreadable config. The error downcasts to
+/// [`rocky_core::config::ConfigError`].
+pub(crate) fn catalog_output_from_compiled(
+    result: &CompileResult,
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    models_dir_is_explicit: bool,
+    facts: &CatalogRunFacts,
+) -> Result<CatalogOutput> {
+    let rocky_cfg =
+        rocky_core::config::load_optional_project_config(config_path).with_context(|| {
+            format!(
+                "failed to load config from {}",
+                config_path.unwrap_or(Path::new("rocky.toml")).display()
+            )
+        })?;
+    let roots = super::lint::served_model_roots(
+        rocky_cfg.as_ref(),
+        config_path,
+        models_dir,
+        models_dir_is_explicit,
+    );
+    build_catalog_output(
+        result,
+        rocky_cfg.as_ref(),
+        config_path,
+        &roots,
+        Some(facts),
+        Instant::now(),
+    )
+}
+
+/// The run history a catalog stamps onto its assets, read from the state
+/// store in one pass so the store can close before the catalog is built.
+pub(crate) struct CatalogRunFacts {
+    runs: Vec<RunRecord>,
+    run_scope: ProductionRunScope,
+}
+
+/// Read [`CatalogRunFacts`] from an open store.
+///
+/// # Errors
+///
+/// A [`rocky_core::state::StateError`] from the store.
+pub(crate) fn read_run_facts(store: &StateStore) -> Result<CatalogRunFacts> {
+    let (runs, run_scope) =
+        ProductionRunScope::read(store, STATE_RUN_LIMIT, UnrecordedScope::Count, |_| true)?;
+    Ok(CatalogRunFacts { runs, run_scope })
+}
+
+/// [`read_run_facts`] through the request-scoped store the HTTP routes use.
+///
+/// # Errors
+///
+/// The store error, unchanged, so the route can tell a busy store (`503`)
+/// from a failure.
+pub(crate) fn read_run_facts_request_scoped(state_path: &Path) -> Result<CatalogRunFacts> {
+    super::history::with_request_scoped_store(state_path, read_run_facts)
+}
+
+/// Build a [`CatalogOutput`] from a compiled project. Reads the sidecar
+/// column docs and the config bytes; no state store, no warehouse.
+fn build_catalog_output(
+    result: &CompileResult,
+    rocky_cfg: Option<&rocky_core::config::RockyConfig>,
+    config_path: Option<&Path>,
+    model_roots: &[PathBuf],
+    run_facts: Option<&CatalogRunFacts>,
+    started: Instant,
+) -> Result<CatalogOutput> {
     // Per-column descriptions from sidecar `[columns]` tables (best-effort).
-    let column_docs =
-        rocky_core::models::load_column_docs_from_tree(models_dir).unwrap_or_default();
+    // Every model root contributes, so an asset from a second pipeline
+    // keeps its descriptions. The first root to name a model wins.
+    let mut column_docs: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for root in model_roots {
+        for (model, columns) in
+            rocky_core::models::load_column_docs_from_tree(root).unwrap_or_default()
+        {
+            column_docs.entry(model).or_insert(columns);
+        }
+    }
 
     // 3. Resolve project name from the config (first pipeline if multi).
-    let project_name = match &rocky_cfg {
+    let project_name = match rocky_cfg {
         Some(cfg) => resolve_pipeline(cfg, None)
             .map(|(name, _)| name.to_string())
             .unwrap_or_else(|_| "unknown".to_string()),
@@ -377,7 +482,10 @@ pub fn compute_catalog_output(
     //     most recent run that produced each model. Falls through
     //     silently when the state store is missing or unreadable: the
     //     command must work pre-first-run.
-    let (last_run_id, run_scope) = enrich_with_state_store(state_path, &mut assets);
+    let (last_run_id, run_scope) = match run_facts {
+        Some(facts) => apply_run_facts(facts, &mut assets),
+        None => (None, None),
+    };
 
     let stats = CatalogStats {
         asset_count: assets.len(),
@@ -388,7 +496,7 @@ pub fn compute_catalog_output(
         duration_ms: started.elapsed().as_millis() as u64,
     };
 
-    let config_hash = config_fingerprint(config_path);
+    let config_hash = config_path.map_or_else(|| "unknown".to_string(), config_fingerprint);
 
     Ok(CatalogOutput {
         version: VERSION.to_string(),
@@ -426,18 +534,30 @@ const STATE_RUN_LIMIT: usize = 50;
 /// assets, so a shadow or branch build never becomes an asset's
 /// `last_materialized_at`. A run recorded before runs carried a scope is
 /// counted, as it was before — the returned tally says how many there were.
+#[cfg(test)]
 fn enrich_with_state_store(
     state_path: &Path,
     assets: &mut [CatalogAsset],
 ) -> (Option<String>, Option<ProductionRunScope>) {
-    let Ok(store) = StateStore::open_read_only_or_empty(state_path) else {
-        return (None, None);
-    };
-    let Ok((runs, run_scope)) =
-        ProductionRunScope::read(&store, STATE_RUN_LIMIT, UnrecordedScope::Count, |_| true)
-    else {
-        return (None, None);
-    };
+    match silent_run_facts(state_path) {
+        Some(facts) => apply_run_facts(&facts, assets),
+        None => (None, None),
+    }
+}
+
+/// The CLI's best-effort read of [`CatalogRunFacts`]: `None` when the store
+/// cannot be opened or read. The route never calls this.
+fn silent_run_facts(state_path: &Path) -> Option<CatalogRunFacts> {
+    let store = StateStore::open_read_only_or_empty(state_path).ok()?;
+    read_run_facts(&store).ok()
+}
+
+/// Stamp [`CatalogRunFacts`] onto the assets. Pure: no store access.
+fn apply_run_facts(
+    facts: &CatalogRunFacts,
+    assets: &mut [CatalogAsset],
+) -> (Option<String>, Option<ProductionRunScope>) {
+    let CatalogRunFacts { runs, run_scope } = facts;
 
     // Project-level: first successful run, newest-first.
     let project_last_run_id = runs
@@ -456,7 +576,7 @@ fn enrich_with_state_store(
         Option<RecipeIdentityView>,
     );
     let mut by_model: HashMap<String, ModelEnrichment> = HashMap::new();
-    for run in &runs {
+    for run in runs {
         for me in &run.models_executed {
             if me.status != "success" {
                 continue;
@@ -479,7 +599,7 @@ fn enrich_with_state_store(
         }
     }
 
-    (project_last_run_id, Some(run_scope))
+    (project_last_run_id, Some(run_scope.clone()))
 }
 
 /// Filter a [`CatalogOutput`] in place to only include assets whose

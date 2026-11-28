@@ -3,9 +3,11 @@ import {
   NOT_RECORDED,
   clipHead,
   clipMiddle,
+  effectLabel,
   formatDuration,
   formatInstant,
   orNotRecorded,
+  verdictLabel,
 } from "./format";
 
 describe("orNotRecorded", () => {
@@ -136,5 +138,30 @@ describe("clipMiddle", () => {
   it("never splits a surrogate pair at either end", () => {
     const cut = clipMiddle("aaaaaaaaa😀bbbbbbbbbb");
     expect(cut).toEqual({ clipped: true, head: "aaaaaaaaa😀", tail: "bbbbbbbb" });
+  });
+});
+
+describe("effectLabel", () => {
+  it("says each policy effect as a word", () => {
+    expect(effectLabel("allow")).toBe("Allowed");
+    expect(effectLabel("require_review")).toBe("Needs approval");
+    expect(effectLabel("deny")).toBe("Blocked");
+  });
+});
+
+describe("verdictLabel", () => {
+  it("gives the word for an evaluation", () => {
+    expect(verdictLabel({ kind: "evaluation", effect: "deny" })).toBe("Blocked");
+    expect(verdictLabel({ kind: "evaluation", effect: "require_review" })).toBe("Needs approval");
+  });
+
+  it("keeps the raw effect, in brackets, for a freeze row", () => {
+    expect(verdictLabel({ kind: "freeze", effect: "deny" })).toBe("freeze [effect deny]");
+  });
+
+  it("keeps the raw effect and the channel for an approval row", () => {
+    expect(verdictLabel({ kind: "approval", effect: "allow", approval_channel: "http_api" })).toBe(
+      "approval (http_api) [effect allow]",
+    );
   });
 });

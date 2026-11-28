@@ -9,31 +9,11 @@
 
 ## What it shows
 
-`rocky lineage-diff <base_ref>` answers the PR-review question *"which downstream columns does this branch reach?"* in one command. It combines the structural diff from `rocky ci-diff` (column added / removed / type-changed between two git refs) with the column-level downstream walk from `rocky lineage --downstream`, then renders both JSON (for CI pipelines) and Markdown (drop straight into a PR comment).
+`rocky lineage-diff <base_ref>` answers *"which downstream columns does this branch reach?"*. It combines the structural diff of `rocky ci-diff` (column added / removed / type-changed between two git refs) with the downstream walk of `rocky lineage --downstream`, and renders JSON (for CI) and Markdown (for a PR comment).
 
-The POC sets up a self-contained scratch repo at `/tmp/rocky-poc-lineage-diff` with a 5-model DAG (`raw_orders + raw_customers → stg_orders + dim_customers → fct_revenue`), commits a baseline on `main`, then applies a `feature/revenue-rework` commit that:
+The POC builds a scratch repo with a 5-model DAG (`raw_orders + raw_customers → stg_orders + dim_customers → fct_revenue`), commits a baseline on `main`, then a `feature/revenue-rework` commit that renames `stg_orders.amount` → `amount_usd`, adds `stg_orders.tax_amount_usd`, renames `fct_revenue.total` → `total_revenue` and adds `total_tax`. `rocky lineage-diff main` lists all six column changes.
 
-- renames `stg_orders.amount` → `amount_usd`,
-- adds a derived `stg_orders.tax_amount_usd`,
-- renames `fct_revenue.total` → `total_revenue` and adds `total_tax`.
-
-A single `rocky lineage-diff main` lists all six column changes (three per modified model — two adds and one removal each) across both modified models.
-
-## Why it's distinctive
-
-- **Column-level, not file-level.** `git diff` shows that `stg_orders.sql` changed; `rocky lineage-diff` shows *which columns* moved and *which downstream consumers* sit on each. CODEOWNERS-style review tooling can't reach this granularity without a compiled engine.
-- **One command per PR.** The Markdown output is pre-rendered for direct paste into a GitHub PR comment, with no JSON-to-comment glue code in CI. Pair with the GitHub Action wired into [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/) for a complete PR review surface.
-- **The trace runs on HEAD only.** A removed column can't be walked downstream (it doesn't exist on HEAD), so the table renders `_(removed; not traceable on HEAD)_`. The structural diff still reports the removal.
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        transformation pipeline config (DuckDB)
-├── run.sh            scratch-repo setup + lineage-diff demo
-└── models/           5-model DAG (raw_* → stg_orders/dim_customers → fct_revenue)
-```
+Limitation: the downstream trace runs on HEAD only. A removed column renders `_(removed; not traceable on HEAD)_`; the structural diff still reports the removal.
 
 ## Run
 
@@ -41,7 +21,7 @@ A single `rocky lineage-diff main` lists all six column changes (three per modif
 ./run.sh
 ```
 
-The scratch repo at `/tmp/rocky-poc-lineage-diff` is fully torn down at the start of each run; the POC dir itself is not modified.
+The scratch repo at `/tmp/rocky-poc-lineage-diff` is torn down at the start of each run; the POC directory's sources are not modified.
 
 ## Expected output
 
@@ -76,17 +56,9 @@ Rocky Lineage Diff (main...HEAD)
 </details>
 ```
 
-`fct_revenue` is a leaf model, so its new columns have no downstream consumers (`_none_`); the renamed-upstream `stg_orders` columns each name the `fct_revenue` column that consumes them — the blast radius a reviewer wants to see.
-
-JSON is captured at `expected/lineage_diff.json` for CI shape-contract pinning.
-
-## What happened
-
-1. `git init` a scratch repo and commit the baseline 5-model DAG on `main`.
-2. Branch to `feature/revenue-rework` and rewrite `stg_orders.sql` + `fct_revenue.sql` (rename + add columns).
-3. `rocky lineage-diff main` parses both refs, runs `ci-diff` for structural deltas, runs `lineage --downstream` per changed column on HEAD's compile, merges the two views, and renders Markdown + JSON.
+`fct_revenue` is a leaf, so its new columns have no downstream consumers (`_none_`). JSON is captured at `expected/lineage_diff.json`.
 
 ## Related
 
-- Companion: [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/) — the data-diff side of PR review (rows / cost delta vs base).
+- Companion: [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/) — rows / cost delta vs base.
 - Source: `engine/crates/rocky-cli/src/commands/lineage_diff.rs`.

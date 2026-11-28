@@ -2,11 +2,13 @@
 //!
 //! A warehouse keeps running a statement after the client stops waiting for
 //! it. When `rocky run` exits without the settle (a second signal, or the
-//! settle grace has passed), the statements it still waits on would run on.
-//! An adapter that can cancel records each statement while it waits on it,
-//! in an [`InFlightStatements`]. The forced-exit path reads that list through
-//! [`WarehouseAdapter::in_flight_statements`] and asks the adapter to cancel
-//! each one through [`WarehouseAdapter::cancel_statement`].
+//! settle grace has passed) or aborts its fan-out, the statements it still
+//! waits on would run on. An adapter that can cancel records each statement
+//! while it waits on it, in an [`InFlightStatements`]. Those paths read that
+//! list through [`WarehouseAdapter::in_flight_statements`] and ask the
+//! adapter to cancel each one through [`WarehouseAdapter::cancel_statement`].
+//! A connector that gives up on a statement itself (its deadline, a poll
+//! error) cancels it before it returns.
 //!
 //! ```text
 //!   submit ──▶ warehouse returns an id ──▶ register(id) ──▶ poll ... ──▶ done
@@ -21,12 +23,19 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+/// How long a caller that stops waiting on a statement waits for the answer
+/// to its cancel request. A connector that gives up on a statement (its
+/// deadline passed, or polling failed) and a fan-out abort both send one
+/// cancel and wait at most this long, so giving up stays prompt.
+pub const ABANDON_CANCEL_BUDGET: Duration = Duration::from_secs(3);
 
 /// The warehouse's own id for one running statement.
 ///
 /// Opaque to everyone but the adapter that made it: a Databricks
-/// `statement_id`, a Snowflake `statementHandle`. Only the adapter that
-/// registered a handle can cancel it.
+/// `statement_id`, a Snowflake `statementHandle`, a BigQuery job id, a Trino
+/// query id. Only the adapter that registered a handle can cancel it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StatementHandle(String);
 
@@ -60,6 +69,37 @@ pub enum CancelOutcome {
     Requested,
     /// This adapter cannot cancel a statement. Nothing was sent.
     Unsupported,
+}
+
+/// What came of the cancel a client sent for a statement it stopped waiting
+/// on. Carried on the connector's error, so the caller can tell a requested
+/// cancel from one that may have left the statement running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbandonCancel {
+    /// The warehouse accepted the cancel request. As with
+    /// [`CancelOutcome::Requested`], that does not prove the statement
+    /// stopped.
+    Requested,
+    /// The cancel request failed, with the rendered error. The statement may
+    /// still run.
+    Failed(String),
+    /// No answer within [`ABANDON_CANCEL_BUDGET`]. The statement may still
+    /// run.
+    NoAnswer,
+}
+
+impl fmt::Display for AbandonCancel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requested => f.write_str("cancel requested"),
+            Self::Failed(error) => write!(f, "cancel failed: {error}"),
+            Self::NoAnswer => write!(
+                f,
+                "no answer to the cancel within {}s",
+                ABANDON_CANCEL_BUDGET.as_secs()
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default)]

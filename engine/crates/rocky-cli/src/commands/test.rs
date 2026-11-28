@@ -69,7 +69,7 @@ fn dialect_marker(dialect: &rocky_core::unit_test::UnitTestDialect) -> String {
 
 /// The one table-mode warning line for unit tests whose model is not
 /// DuckDB-only, or `None` when every unit test targets DuckDB.
-fn dialect_warning(results: &[rocky_core::unit_test::UnitTestResult]) -> Option<String> {
+pub fn dialect_warning(results: &[rocky_core::unit_test::UnitTestResult]) -> Option<String> {
     let marked: Vec<&rocky_core::unit_test::UnitTestDialect> =
         results.iter().filter_map(|r| r.dialect.as_ref()).collect();
     if marked.is_empty() {
@@ -144,6 +144,7 @@ pub fn test_output(
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
     config_path: &Path,
+    strict_dialect: bool,
 ) -> Result<TestOutput> {
     let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
@@ -181,7 +182,7 @@ pub fn test_output(
         model_filter,
         &extensions,
         &unit_targets,
-        false,
+        strict_dialect,
     )?;
     if let Some(summary) = unit_summary(&unit_run) {
         output = output.with_unit_tests(summary);
@@ -1498,7 +1499,7 @@ mod tests {
         tmp: &tempfile::TempDir,
         models: &std::path::Path,
     ) -> Vec<rocky_core::unit_test::UnitTestResult> {
-        let output = super::test_output(models, None, None, &tmp.path().join("rocky.toml"))
+        let output = super::test_output(models, None, None, &tmp.path().join("rocky.toml"), false)
             .expect("test output");
         output.unit_tests.expect("unit tests ran").results
     }

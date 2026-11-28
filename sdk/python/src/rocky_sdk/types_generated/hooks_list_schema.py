@@ -14,6 +14,34 @@ class HookEntry(BaseModel):
     timeout_ms: conint(ge=0)
 
 
+class WebhookEntry(BaseModel):
+    """
+    One configured webhook in [`HooksListOutput`].
+    """
+
+    async_mode: bool
+    """
+    Whether the webhook is fire-and-forget.
+    """
+    event: str
+    header_keys: list[str]
+    """
+    Names of the headers the webhook sets. Never their values.
+    """
+    method: str
+    on_failure: str
+    preset: str | None = None
+    """
+    The preset the webhook was built from, when it names one.
+    """
+    retry_count: conint(ge=0)
+    timeout_ms: conint(ge=0)
+    url: str
+    """
+    The endpoint's scheme and host only (`https://hooks.example.com`). Never the path, query, port or credentials. A URL that does not parse prints as `<redacted>`.
+    """
+
+
 class HooksListOutput(BaseModel):
     """
     JSON output for `rocky hooks list`.
@@ -21,3 +49,7 @@ class HooksListOutput(BaseModel):
 
     hooks: list[HookEntry]
     total: conint(ge=0)
+    webhooks: list[WebhookEntry]
+    """
+    Configured `[hook.webhooks]` endpoints. Each URL is cut to its scheme and host, because a webhook URL often carries a token in its path or query. Empty for a project with no webhooks.
+    """

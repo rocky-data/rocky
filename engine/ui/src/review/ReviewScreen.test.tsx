@@ -56,14 +56,14 @@ describe("ReviewScreen", () => {
   it("shows the queue at the lane root", async () => {
     at("/ui/review");
     render(<ReviewScreen queueLoad={async () => QUEUE} planLoaders={PLAN_LOADERS} />);
-    await screen.findByText("Nothing is waiting for review");
+    await screen.findByText("Nothing is waiting for approval");
   });
 
   it("shows one plan when the path names it", async () => {
     at(`/ui/review/${PLAN}`);
     render(<ReviewScreen queueLoad={async () => QUEUE} planLoaders={PLAN_LOADERS} />);
     await screen.findByText("backfill");
-    expect(screen.queryByText("Nothing is waiting for review")).toBeNull();
+    expect(screen.queryByText("Nothing is waiting for approval")).toBeNull();
   });
 
   // Every plan id above is 64-character hex, where `encodeURIComponent` is a

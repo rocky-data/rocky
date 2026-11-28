@@ -32,6 +32,63 @@
         "timeout_ms"
       ],
       "type": "object"
+    },
+    "WebhookEntry": {
+      "description": "One configured webhook in [`HooksListOutput`].",
+      "properties": {
+        "async_mode": {
+          "description": "Whether the webhook is fire-and-forget.",
+          "type": "boolean"
+        },
+        "event": {
+          "type": "string"
+        },
+        "header_keys": {
+          "description": "Names of the headers the webhook sets. Never their values.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "method": {
+          "type": "string"
+        },
+        "on_failure": {
+          "type": "string"
+        },
+        "preset": {
+          "description": "The preset the webhook was built from, when it names one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "url": {
+          "description": "The endpoint's scheme and host only (`https://hooks.example.com`). Never the path, query, port or credentials. A URL that does not parse prints as `<redacted>`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "async_mode",
+        "event",
+        "header_keys",
+        "method",
+        "on_failure",
+        "retry_count",
+        "timeout_ms",
+        "url"
+      ],
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky hooks list`.",
@@ -46,11 +103,19 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "webhooks": {
+      "description": "Configured `[hook.webhooks]` endpoints. Each URL is cut to its scheme and host, because a webhook URL often carries a token in its path or query. Empty for a project with no webhooks.",
+      "items": {
+        "$ref": "#/definitions/WebhookEntry"
+      },
+      "type": "array"
     }
   },
   "required": [
     "hooks",
-    "total"
+    "total",
+    "webhooks"
   ],
   "title": "HooksListOutput",
   "type": "object"

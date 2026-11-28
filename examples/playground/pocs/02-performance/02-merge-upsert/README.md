@@ -7,14 +7,7 @@
 
 ## What it shows
 
-Two models in one transformation pipeline. `raw_customers` materializes a
-staging copy of `seeds.customers`; `dim_customers` reads from it with
-`[strategy] type = "merge"`, declaring `unique_key = ["customer_id"]` and
-`update_columns = ["name", "email", "tier"]`. The first `rocky run`
-materializes the dim table; between runs we mutate the seed (update one
-row's tier, rename another, insert a new customer); the second `rocky run`
-issues a MERGE that upserts the changes: existing rows updated in place,
-new rows inserted, untouched rows untouched.
+`dim_customers` declares a model-level MERGE, so you write no `MERGE INTO` SQL. It reads from `raw_customers`, a full-refresh staging copy of `seeds.customers` (50 rows). Between two runs the seed changes (one tier update, one rename, one insert); the second run upserts them against DuckDB and leaves other rows untouched. Only the listed `update_columns` are overwritten.
 
 ```toml
 [strategy]
@@ -23,40 +16,11 @@ unique_key = ["customer_id"]
 update_columns = ["name", "email", "tier"]
 ```
 
-## Why it's distinctive
-
-- **Model-level MERGE** — no hand-written `MERGE INTO` SQL. Rocky lowers
-  `[strategy] type = "merge"` to dialect-specific MERGE on the target
-  warehouse.
-- **Update column list is explicit** so unrelated columns aren't
-  overwritten when the source schema grows.
-- **End-to-end against DuckDB.** Exercises MERGE semantics on a real warehouse, not just sql-gen string assertions.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml                        transformation pipeline + auto_create_schemas
-├── run.sh                            seed -> run #1 -> mutate -> run #2 -> verify
-├── data/
-│   ├── seed.sql                      50 customers in seeds.customers
-│   └── delta.sql                     1 update + 1 rename + 1 insert (between runs)
-└── models/
-    ├── raw_customers.{sql,toml}      seeds.customers -> poc.staging.raw_customers (full_refresh)
-    └── dim_customers.{sql,toml}      poc.staging.raw_customers -> poc.demo.dim_customers (merge)
-```
-
 ## Prerequisites
 
-- `rocky` ≥ 1.29.0 on PATH. The two enabling fixes shipped in 1.29.0, in PRs
-  [#448](https://github.com/rocky-data/rocky/pull/448)
-  (`auto_create_schemas` for transformation pipelines) and
-  [#449](https://github.com/rocky-data/rocky/pull/449) (DuckDB MERGE
-  unqualified-LHS).
-- `duckdb` CLI (`brew install duckdb`), which seeds the source table, applies
-  the delta, and verifies post-MERGE row counts
-- `python3` (prints the materializations from the run JSON)
+- `rocky` ≥ 1.29.0 on PATH (PRs [#448](https://github.com/rocky-data/rocky/pull/448), `auto_create_schemas` for transformation pipelines, and [#449](https://github.com/rocky-data/rocky/pull/449), DuckDB MERGE unqualified-LHS)
+- `duckdb` CLI (`brew install duckdb`)
+- `python3`
 
 ## Run
 
@@ -92,30 +56,6 @@ customer_id |     name              |     email                       | tier
 
 ## What happened
 
-1. `data/seed.sql` populates `seeds.customers` with 50 rows.
-2. First `rocky run --pipeline transform`:
-   - `auto_create_schemas` materializes `poc.staging` and `poc.demo`.
-   - `raw_customers` runs first (full_refresh CTAS).
-   - `dim_customers` runs second: Rocky sees the target doesn't exist, so
-     it bootstraps an empty `poc.demo.dim_customers` from the model schema
-     and then issues the MERGE (which inserts all 50 rows on the first
-     pass).
-3. `data/delta.sql` mutates `seeds.customers`: update tier on id=5, rename
-   id=7, insert id=51.
-4. Second `rocky run --pipeline transform`:
-   - `raw_customers` rebuilds (full_refresh).
-   - `dim_customers` issues a MERGE. WHEN MATCHED THEN UPDATE updates the
-     two changed rows; WHEN NOT MATCHED THEN INSERT inserts customer 51.
-     Untouched rows stay byte-identical.
-5. The final query proves 51 total rows + the expected per-row deltas.
+On the first run the target does not exist, so Rocky bootstraps an empty `poc.demo.dim_customers` from the model schema and MERGE-inserts all 50 rows. Both runs use `rocky run --pipeline transform`.
 
-## Related
-
-- DuckDB MERGE dialect:
-  [`engine/crates/rocky-duckdb/src/dialect.rs`](../../../../../engine/crates/rocky-duckdb/src/dialect.rs)
-  (`merge_into`)
-- Transformation MERGE codegen:
-  [`engine/crates/rocky-core/src/sql_gen.rs`](../../../../../engine/crates/rocky-core/src/sql_gen.rs)
-  (`generate_transformation_sql` MERGE arm)
-- Sibling: [`01-incremental-watermark`](../01-incremental-watermark),
-  watermark-based incremental writes (no MERGE, append only)
+Related: [`01-incremental-watermark`](../01-incremental-watermark) (append only, no MERGE).

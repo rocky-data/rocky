@@ -7,38 +7,9 @@
 
 ## What it shows
 
-A staging model that other models read, carried by a view: no copied data, and
-every read sees the source as it is now. Use it for the intermediate steps that
-do not deserve a table — filters, renames, type casts.
+A staging model carried by a view: it copies no data, and every read sees the source as it is now. Use it for filters, renames and casts that do not deserve a table.
 
-`type = "ephemeral"` is the other choice for this staging step. Rocky inlines
-an ephemeral model as a CTE into each consumer: no warehouse object at all, at
-the cost of running the staging SQL once per consumer.
-
-## Why it's distinctive
-
-- **No copied rows** — the view stores none; `user_metrics` reads through it.
-- **Always fresh** — a change to `seeds.raw_events` shows up on the next read.
-- **One object per model** — the cost of a view, against a table's full copy.
-- **dbt comparison:** dbt's `materialized='ephemeral'` maps to Rocky's
-  `type = "ephemeral"`, inlined as a CTE the same way.
-
-## Layout
-
-```
-.
-├── README.md              this file
-├── rocky.toml             pipeline config
-├── run.sh                 end-to-end demo
-├── data/
-│   └── seed.sql           sample events (500 rows)
-└── models/
-    ├── _defaults.toml     shared target (poc.analytics)
-    ├── stg_events.sql     staging query (filtered + enriched)
-    ├── stg_events.toml    strategy = "view"
-    ├── user_metrics.sql   aggregate over stg_events
-    └── user_metrics.toml  strategy = "full_refresh"
-```
+The alternative, `type = "ephemeral"` (dbt's `materialized='ephemeral'`), creates no warehouse object: Rocky inlines it as a CTE into each consumer, so the staging SQL runs once per consumer.
 
 ## Prerequisites
 
@@ -50,8 +21,6 @@ the cost of running the staging SQL once per consumer.
 ```bash
 ./run.sh
 ```
-
-`run.sh` compiles the models, **runs** them, and then reads the warehouse back.
 
 ## Expected output
 
@@ -72,20 +41,6 @@ the cost of running the staging SQL once per consumer.
 └───────────┴─────────────┘
 ```
 
-`view_rows` counts rows *through* the view; the view itself stores none. The
-seed has 500 events and the staging query drops `page_view`, which leaves 375.
+The seed has 500 events and the staging query drops `page_view`, leaving 375. `view_rows` counts rows *through* the view.
 
-## What happened
-
-1. `rocky compile` resolved the dependency `user_metrics → stg_events`.
-2. `rocky run` created `analytics.stg_events` as a view, then built
-   `analytics.user_metrics` as a table by reading through it. `user_metrics.sql`
-   names the view as `analytics.stg_events`: Rocky does not rewrite a `.sql`
-   model's references, so they have to resolve as written.
-3. Only `user_metrics` holds rows. The view is a query Rocky named.
-
-## Related
-
-- Merge strategy POC: [`02-performance/02-merge-upsert`](../02-merge-upsert/)
-- Incremental POC: [`02-performance/01-incremental-watermark`](../01-incremental-watermark/)
-- Engine IR: `engine/crates/rocky-ir/src/ir.rs` (`MaterializationStrategy::View`)
+`user_metrics.sql` names the view as `analytics.stg_events`: Rocky does not rewrite a `.sql` model's references, so they must resolve as written.

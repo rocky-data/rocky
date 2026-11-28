@@ -7,53 +7,12 @@
 
 ## What it shows
 
-A Rocky `[policy]` block grades what an AI agent may do on its own — apply,
-promote, make an additive schema change — as `allow`, `require_review`, or
-`deny`. Like any code that guards production, that policy drifts as you edit
-it, and the failure mode is quiet: nothing breaks at edit time; the hole shows
-up the day an agent walks through it.
+A `[policy]` block grades what an AI agent may do on its own (apply, promote, additive schema change) as `allow`, `require_review`, or `deny`. `rocky policy test` runs `[[policy.tests]]` scenarios through the real policy evaluator and exits non-zero when a resolved effect differs from the expected one, so an edit cannot quietly open a hole.
 
-`rocky policy test` closes that gap. You write scenario assertions in
-`[[policy.tests]]` next to the rules they cover, and the command runs each one
-through the real policy evaluator, failing non-zero the moment a resolved
-effect differs from what the scenario expected.
+1. `rocky.toml`: the policy plus its scenarios. All pass, exit 0.
+2. `rocky-hole.toml`: the *same scenarios*, but the contract-boundary `deny` is loosened to `allow`. The scenario "an agent may not apply to a contracted model" fails; `run.sh` asserts that non-zero exit.
 
-This POC runs the command twice:
-
-1. **`rocky.toml`** — the policy plus one scenario per rule. Every scenario
-   passes; the command exits 0.
-2. **`rocky-hole.toml`** — the *same scenarios*, but the contract-boundary
-   `deny` has been loosened to `allow` (a hurried edit to unblock one change).
-   The pinned "an agent may not apply to a contracted model" scenario now
-   fails and the command exits non-zero. `run.sh` asserts that non-zero exit,
-   so the guardrail firing is the POC's success condition.
-
-## Why it's distinctive
-
-- **The predicate needs the compiler, not warehouse grants.** No `GRANT`
-  statement can express "additive, non-PII bronze change with fewer than five
-  downstream consumers." The policy plane can, and these tests pin it.
-- **It catches the blast-radius class.** One scenario asserts that a change
-  with a wide downstream fan-out is degraded to review, and another that an
-  *uncomputable* blast radius fails closed. A ceiling that quietly stops firing
-  is exactly the regression a green unit suite misses and a live incident
-  doesn't.
-- **Scenarios are declared, not compiled.** Each scenario spells out the target
-  model's attributes directly, so it pins the *policy's* behaviour regardless
-  of the current project graph — and can assert cases the project doesn't
-  happen to contain today.
-
-## Layout
-
-```
-rocky.toml         The governed pipeline + policy + passing scenarios
-rocky-hole.toml    The same scenarios after an edit loosened the deny → a red run
-run.sh             Green run on rocky.toml, red run on rocky-hole.toml (asserted)
-expected/          Captured JSON + the caught-failure log (gitignored)
-```
-
-There are no `models/` — `rocky policy test` evaluates the policy directly and
-needs no warehouse or compile step.
+Scenarios cover, among others, a wide downstream fan-out degrading to review and an *uncomputable* blast radius failing closed. Each declares the target model's attributes directly, so it needs no `models/`, warehouse or compile, and can assert cases the project does not contain.
 
 ## Run
 

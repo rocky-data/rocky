@@ -105,6 +105,14 @@ class JobKind12(StrEnum):
     compact = "compact"
 
 
+class JobKind13(StrEnum):
+    """
+    `rocky ci-diff` — the structural model diff between a git ref and the `HEAD` commit, with the column lineage it moves. Uncommitted edits are not compared. Read-only: the job writes nothing itself, except its job record, which the server keeps in its state store (by default `models/.rocky-state.redb`, inside the project). It reads `data/seed.sql` from `HEAD`; a seed committed there runs as it does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still writes where it says. Its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job and nothing is fetched. It takes no mutation permit, so it never blocks a run. At most one runs at a time; a second submission is refused `409 mutation_in_progress`.
+    """
+
+    diff = "diff"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -177,6 +185,7 @@ class JobStatus(BaseModel):
         | JobKind10
         | JobKind11
         | JobKind12
+        | JobKind13
     )
     """
     Which operation the job wraps.

@@ -109,7 +109,7 @@ fn describe(output: &Output) -> String {
     )
 }
 
-/// `(code, model)` of every E057 / W057 / E068: anywhere in the JSON, or,
+/// `(code, model)` of every E057 / W057 / E068 / E073: anywhere in the JSON, or,
 /// for `emit-sql`, which prints SQL, in its `CODE: message (model)` lines.
 fn call_codes(output: &Output) -> Vec<(String, String)> {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -131,7 +131,7 @@ fn call_codes(output: &Output) -> Vec<(String, String)> {
             }
         }
     }
-    out.retain(|(code, _)| ["E057", "W057", "E068"].contains(&code.as_str()));
+    out.retain(|(code, _)| ["E057", "W057", "E068", "E073"].contains(&code.as_str()));
     out.sort();
     out.dedup();
     out
@@ -318,5 +318,51 @@ fn a_seed_macro_is_not_judged_when_the_seed_does_not_run() {
         let args = [command, "--models", dir];
         let output = rocky(tmp.path(), &config, &args);
         assert_eq!(call_codes(&output), control_refused(), "{args:?}");
+    }
+}
+
+/// A seed file that is there but cannot be read fails closed (#2753): a call
+/// the check would refuse may be one of its macros, so `compile` and
+/// `emit-sql` refuse it with `E073`, naming the seed, and never skip the
+/// check. A call to a built-in DuckDB has is not affected. The commands that
+/// run the seed (`compile --with-seed`, `ci`, `test`) refuse the whole run,
+/// naming the seed.
+#[test]
+fn an_unreadable_seed_refuses_the_call_and_names_the_seed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("rocky.toml"), CONFIG).expect("write config");
+    write_project(
+        tmp.path(),
+        "",
+        &[
+            ("uses_fn", "SELECT my_fn(status) AS x FROM raw.orders"),
+            ("plain", "SELECT upper(status) AS x FROM raw.orders"),
+        ],
+    );
+    // Not valid UTF-8: the file is there, but does not read as text.
+    fs::write(
+        tmp.path().join("data/seed.sql"),
+        b"CREATE MACRO my_fn(x) AS x; -- \xff\xfe\n",
+    )
+    .expect("write seed");
+    let config = tmp.path().join("rocky.toml");
+    for args in [&["compile"][..], &["emit-sql"]] {
+        let output = rocky(tmp.path(), &config, args);
+        let text = describe(&output);
+        assert_eq!(
+            call_codes(&output),
+            [("E073".to_string(), "uses_fn".to_string())],
+            "{args:?}: {text}"
+        );
+        assert!(text.contains("seed.sql"), "{args:?}: {text}");
+        assert!(text.contains("could not be read"), "{args:?}: {text}");
+        assert_ne!(output.status.code(), Some(0), "{args:?}: {text}");
+    }
+    for args in [&["compile", "--with-seed"][..], &["ci"], &["test"]] {
+        let output = rocky(tmp.path(), &config, args);
+        let text = describe(&output);
+        assert_ne!(output.status.code(), Some(0), "{args:?}: {text}");
+        assert!(text.contains("seed.sql"), "{args:?}: {text}");
+        assert!(text.contains("failed to read"), "{args:?}: {text}");
     }
 }

@@ -101,6 +101,7 @@ use rocky_core::state::{
 use crate::commands::apply::{
     PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy_matching,
 };
+#[cfg(test)]
 use crate::commands::replay::classify_model;
 use crate::commands::restore::restorable_recipe;
 use crate::commands::review::record_plan_review_escalation;
@@ -115,7 +116,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Resolved cost-model inputs: `(adapter_name, warehouse_type, dbu_per_hour,
 /// cost_per_dbu)`. `None` when the config can't be loaded or the adapter is
 /// not a billed warehouse.
-type AdapterCost = (String, WarehouseType, f64, f64);
+pub(crate) type AdapterCost = (String, WarehouseType, f64, f64);
 
 // ---------------------------------------------------------------------------
 // The eligibility checks — each a pure function, each fails closed.
@@ -510,14 +511,238 @@ fn storage_prefix_from_provenance(prov: Option<&ProvenanceRecord>) -> Option<Str
     }
 }
 
+/// Every store read the derivability verdicts need, taken in one pass so
+/// the store can close before any verdict is computed.
+pub(crate) struct GcFacts {
+    groups: Vec<GcFactGroup>,
+    runs: HashMap<String, GcRunFacts>,
+    /// Which of the artifact hashes the representatives' content upstreams
+    /// name are in the ledger, or the scan's error text.
+    artifact_hashes: Result<std::collections::HashSet<String>, String>,
+}
+
+/// One distinct content hash: its representative ledger row and what the
+/// store said about it.
+struct GcFactGroup {
+    representative: ArtifactRecord,
+    refcount: u64,
+    provenance: Result<Option<ProvenanceRecord>, String>,
+}
+
+/// A producing run: its record, and the models of it that recorded no
+/// provenance.
+struct GcRunFacts {
+    record: Option<RunRecord>,
+    unrecorded: std::collections::HashSet<String>,
+}
+
+/// Read [`GcFacts`] from an open store. Reads only: the refcounts come from
+/// one pass over the ledger, not one scan per hash.
+///
+/// # Errors
+///
+/// The ledger or refcount read failed. The error downcasts to
+/// [`rocky_core::state::StateError`].
+pub(crate) fn read_gc_facts(store: &StateStore) -> Result<GcFacts> {
+    let artifacts = store
+        .list_all_artifacts()
+        .context("failed to read the artifact ledger")?;
+    let refcounts = store
+        .artifact_refcounts()
+        .context("failed to refcount the artifact ledger")?;
+
+    // Group by content hash — each distinct hash is one physical artifact.
+    // Representative row = the most recent producer (deterministic tie-break
+    // on run|model) so the reported model/run is stable across scans.
+    let mut by_hash: HashMap<String, Vec<ArtifactRecord>> = HashMap::new();
+    for artifact in artifacts {
+        by_hash
+            .entry(artifact.blake3_hash.clone())
+            .or_default()
+            .push(artifact);
+    }
+
+    let mut groups: Vec<GcFactGroup> = Vec::with_capacity(by_hash.len());
+    let mut runs: HashMap<String, GcRunFacts> = HashMap::new();
+    for (hash, mut rows) in by_hash {
+        rows.sort_by(|a, b| {
+            b.written_at
+                .cmp(&a.written_at)
+                .then_with(|| a.run_id.cmp(&b.run_id))
+                .then_with(|| a.model_name.cmp(&b.model_name))
+        });
+        let representative = rows.into_iter().next().expect("hash group is non-empty");
+        let refcount = refcounts.get(&hash).copied().unwrap_or(0);
+        let provenance = store
+            .get_provenance(&representative.run_id, &representative.model_name)
+            .map_err(|e| e.to_string());
+        runs.entry(representative.run_id.clone())
+            .or_insert_with(|| {
+                let record = store.get_run(&representative.run_id).ok().flatten();
+                let unrecorded = record
+                    .iter()
+                    .flat_map(|r| r.models_executed.iter())
+                    .filter(|m| {
+                        matches!(
+                            store.get_provenance(&representative.run_id, &m.model_name),
+                            Ok(None)
+                        )
+                    })
+                    .map(|m| m.model_name.clone())
+                    .collect();
+                GcRunFacts { record, unrecorded }
+            });
+        groups.push(GcFactGroup {
+            representative,
+            refcount,
+            provenance,
+        });
+    }
+
+    let wanted: std::collections::HashSet<String> = groups
+        .iter()
+        .filter_map(|g| g.provenance.as_ref().ok()?.as_ref())
+        .flat_map(|prov| prov.upstreams.iter())
+        .filter_map(|u| match u {
+            rocky_core::reuse::UpstreamIdentity::Content { blake3_hash, .. } => {
+                Some(blake3_hash.clone())
+            }
+            rocky_core::reuse::UpstreamIdentity::Watermark { .. } => None,
+        })
+        .collect();
+    let artifact_hashes = store
+        .artifact_hashes_among(&wanted)
+        .map_err(|e| e.to_string());
+    Ok(GcFacts {
+        groups,
+        runs,
+        artifact_hashes,
+    })
+}
+
+/// [`read_gc_facts`] through the request-scoped store the HTTP routes use.
+///
+/// # Errors
+///
+/// The store error, so the route can tell a busy store (`503`) from a
+/// failure.
+pub(crate) fn read_gc_facts_request_scoped(state_path: &Path) -> Result<GcFacts> {
+    super::history::with_request_scoped_store(state_path, read_gc_facts)
+}
+
 /// Assemble the derivability verdict for every distinct content hash in the
 /// ledger — the single source of truth the report, the plan, and the apply-time
 /// re-verification all share.
 ///
-/// All store reads live here (the honest reachability seam); the verdicts are a
-/// pure function of the ledger contents at `now`. Read-only: opens no write
-/// transaction and touches no warehouse.
+/// All store reads live in [`read_gc_facts`] (the honest reachability seam);
+/// the verdicts are a pure function of the ledger contents at `now`.
+/// Read-only: opens no write transaction and touches no warehouse.
 fn gather_eviction_candidates(
+    store: &StateStore,
+    adapter: Option<&AdapterCost>,
+    now: DateTime<Utc>,
+    min_age_days: i64,
+) -> Result<Vec<EvictionCandidate>> {
+    let facts = read_gc_facts(store)?;
+    Ok(candidates_from_facts(facts, adapter, now, min_age_days))
+}
+
+/// The verdicts for [`GcFacts`]. Touches no store: IR and SQL parsing only,
+/// so the HTTP route runs it after the store and its permit are dropped.
+fn candidates_from_facts(
+    facts: GcFacts,
+    adapter: Option<&AdapterCost>,
+    now: DateTime<Utc>,
+    min_age_days: i64,
+) -> Vec<EvictionCandidate> {
+    let GcFacts {
+        groups,
+        runs,
+        artifact_hashes,
+    } = facts;
+    let mut out: Vec<EvictionCandidate> = Vec::with_capacity(groups.len());
+
+    for group in groups {
+        let GcFactGroup {
+            representative,
+            refcount,
+            provenance,
+        } = group;
+        let run_facts = runs.get(&representative.run_id);
+        let run = run_facts.and_then(|r| r.record.as_ref());
+
+        let class = crate::commands::replay::classify_model_from(
+            &representative.model_name,
+            provenance.clone(),
+            &|| run.map(std::borrow::Cow::Borrowed),
+            &|hash| match &artifact_hashes {
+                Ok(hashes) => Ok(hashes.contains(hash)),
+                Err(e) => Err(e.clone()),
+            },
+            &|producer| run_facts.is_some_and(|r| r.unrecorded.contains(producer)),
+        );
+
+        // Provenance for the producing (run, model) — used to bind the
+        // derivable verdict to THIS artifact's exact content hash (a (run,
+        // model) can have produced a different output than this row).
+        let prov = provenance.ok().flatten();
+
+        let exec = run.and_then(|r| {
+            r.models_executed
+                .iter()
+                .find(|m| m.model_name == representative.model_name)
+        });
+
+        let output = build_candidate(
+            &representative,
+            refcount,
+            &class,
+            exec,
+            prov.as_ref(),
+            now,
+            min_age_days,
+            adapter,
+        );
+        let (recipe_hash, input_hash, input_proof_class, env_hash, hash_scheme) = exec
+            .map(|e| {
+                (
+                    e.recipe_hash.clone(),
+                    e.input_hash.clone(),
+                    e.input_proof_class.clone(),
+                    e.env_hash.clone(),
+                    e.hash_scheme.clone(),
+                )
+            })
+            .unwrap_or((None, None, None, None, None));
+
+        let storage_prefix = storage_prefix_from_provenance(prov.as_ref());
+
+        out.push(EvictionCandidate {
+            artifact: representative,
+            output,
+            recipe_hash,
+            input_hash,
+            input_proof_class,
+            env_hash,
+            hash_scheme,
+            storage_prefix,
+        });
+    }
+
+    // Newest write first; stable tie-break on hash for deterministic output.
+    out.sort_by(|a, b| {
+        b.output
+            .written_at
+            .cmp(&a.output.written_at)
+            .then_with(|| a.output.blake3_hash.cmp(&b.output.blake3_hash))
+    });
+    out
+}
+
+/// The per-hash implementation `rocky gc` used before the facts split, kept
+/// as the reference the equivalence test compares against.
+#[cfg(test)]
+fn gather_eviction_candidates_reference(
     store: &StateStore,
     adapter: Option<&AdapterCost>,
     now: DateTime<Utc>,
@@ -627,14 +852,29 @@ fn gather_eviction_candidates(
 /// the aggregate headline.
 ///
 /// Read-only: opens no write transaction and touches no warehouse.
-fn gather_report(
+pub(crate) fn gather_report(
     store: &StateStore,
     adapter: Option<&AdapterCost>,
     now: DateTime<Utc>,
     min_age_days: i64,
 ) -> Result<GcReportOutput> {
+    Ok(gc_report_from_facts(
+        read_gc_facts(store)?,
+        adapter,
+        now,
+        min_age_days,
+    ))
+}
+
+/// The report for [`GcFacts`]. Touches no store.
+pub(crate) fn gc_report_from_facts(
+    facts: GcFacts,
+    adapter: Option<&AdapterCost>,
+    now: DateTime<Utc>,
+    min_age_days: i64,
+) -> GcReportOutput {
     let candidates: Vec<GcCandidateOutput> =
-        gather_eviction_candidates(store, adapter, now, min_age_days)?
+        candidates_from_facts(facts, adapter, now, min_age_days)
             .into_iter()
             .map(|c| c.output)
             .collect();
@@ -649,7 +889,7 @@ fn gather_report(
     let derivable_pct =
         (managed_bytes > 0).then(|| (derivable_bytes as f64 / managed_bytes as f64) * 100.0);
 
-    Ok(GcReportOutput {
+    GcReportOutput {
         version: VERSION.to_string(),
         command: "gc --derivable --dry-run".to_string(),
         managed_bytes,
@@ -661,7 +901,7 @@ fn gather_report(
         min_age_days,
         notes: report_notes(min_age_days),
         candidates,
-    })
+    }
 }
 
 /// Resolve the billed-warehouse type + cost inputs from `rocky.toml`,
@@ -670,22 +910,7 @@ fn gather_report(
 /// surfaces price rebuilds identically.
 fn load_adapter_cost(config_path: &Path) -> Option<AdapterCost> {
     match load_rocky_config(config_path) {
-        Ok(cfg) => {
-            let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-            let cost_per_dbu = cfg.cost.compute_cost_per_dbu_or_default();
-            let preferred = cfg
-                .adapters
-                .iter()
-                .find(|(k, _)| k.as_str() == "default")
-                .or_else(|| cfg.adapters.iter().next())?;
-            let wh = WarehouseType::from_adapter_type(&preferred.1.adapter_type)?;
-            Some((
-                preferred.1.adapter_type.clone(),
-                wh,
-                dbu_per_hour,
-                cost_per_dbu,
-            ))
-        }
+        Ok(cfg) => adapter_cost_from_config(&cfg),
         Err(err) => {
             warn!(
                 "failed to load config at {} — rebuild-cost USD estimates will be omitted: {err}",
@@ -694,6 +919,27 @@ fn load_adapter_cost(config_path: &Path) -> Option<AdapterCost> {
             None
         }
     }
+}
+
+/// The billed-warehouse cost inputs a loaded config names, or `None` when
+/// the adapter is not a billed warehouse.
+pub(crate) fn adapter_cost_from_config(
+    cfg: &rocky_core::config::RockyConfig,
+) -> Option<AdapterCost> {
+    let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
+    let cost_per_dbu = cfg.cost.compute_cost_per_dbu_or_default();
+    let preferred = cfg
+        .adapters
+        .iter()
+        .find(|(k, _)| k.as_str() == "default")
+        .or_else(|| cfg.adapters.iter().next())?;
+    let wh = WarehouseType::from_adapter_type(&preferred.1.adapter_type)?;
+    Some((
+        preferred.1.adapter_type.clone(),
+        wh,
+        dbu_per_hour,
+        cost_per_dbu,
+    ))
 }
 
 fn print_table(report: &GcReportOutput) {
@@ -2139,7 +2385,7 @@ fn print_apply_table(output: &GcApplyOutput) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use chrono::Duration;
@@ -2521,8 +2767,13 @@ auto_create_schemas = true
     }
 
     fn record_run(store: &StateStore, run_id: &str, model: &str) {
+        record_run_models(store, run_id, &[model]);
+    }
+
+    /// A run that executed every model in `models`, in order.
+    fn record_run_models(store: &StateStore, run_id: &str, models: &[&str]) {
         let now = Utc::now();
-        let exec = ModelExecution {
+        let exec = |model: &str| ModelExecution {
             row_count: None,
             model_name: model.to_string(),
             started_at: now,
@@ -2557,7 +2808,7 @@ auto_create_schemas = true
                 started_at: now,
                 finished_at: now,
                 status: RunStatus::Success,
-                models_executed: vec![exec],
+                models_executed: models.iter().map(|m| exec(m)).collect(),
                 trigger: RunTrigger::Manual,
                 config_hash: "cfg".to_string(),
                 triggering_identity: None,
@@ -2583,6 +2834,68 @@ auto_create_schemas = true
                 hold: None,
             })
             .unwrap();
+    }
+
+    /// A consumer whose upstream is built in the same run by a model that
+    /// recorded no provenance is not derivable: the DAG replay cannot rebuild
+    /// that upstream. The producer's artifact row is in the ledger, so only
+    /// the in-run producer check refuses it.
+    #[test]
+    fn consumer_of_an_unrecorded_in_run_producer_is_not_derivable() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        let h_up = "7".repeat(64);
+        let h_down = "8".repeat(64);
+        seed(
+            &store,
+            "rp",
+            "down",
+            "SELECT 1 AS id",
+            &[UpstreamIdentity::Content {
+                upstream_key: "tgt.raw.up".to_string(),
+                blake3_hash: h_up.clone(),
+            }],
+            &h_down,
+            100,
+            old,
+        );
+        // The producer has an artifact row and no provenance.
+        store
+            .record_artifact(&ArtifactRecord {
+                blake3_hash: h_up.clone(),
+                run_id: "rp".to_string(),
+                model_name: "up".to_string(),
+                file_path: format!("s3://b/{h_up}.parquet"),
+                commit_version: 0,
+                size_bytes: 50,
+                written_at: old,
+            })
+            .unwrap();
+        record_run_models(&store, "rp", &["up", "down"]);
+
+        let report = gather_report(&store, None, Utc::now(), 7).unwrap();
+        let down = report
+            .candidates
+            .iter()
+            .find(|c| c.model_name == "down")
+            .unwrap();
+        assert!(!down.derivable, "{down:?}");
+        let replay = down
+            .checks
+            .iter()
+            .find(|k| k.check == "replayable")
+            .unwrap();
+        assert!(!replay.passed);
+    }
+
+    /// One old, unreferenced artifact with a recorded recipe, so the
+    /// inventory has a derivable candidate. For the HTTP route tests.
+    pub(crate) fn seed_one_derivable(state_path: &Path) {
+        let store = StateStore::open(state_path).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
     }
 
     /// Seed a content-addressed artifact whose `file_path` lives **under** its
@@ -2634,6 +2947,194 @@ auto_create_schemas = true
         assert_eq!(report.managed_bytes, 0);
         assert_eq!(report.derivable_count, 0);
         assert!(report.derivable_pct.is_none());
+    }
+
+    /// The facts split and the one-pass refcounts give `rocky gc` the verdicts
+    /// the per-hash implementation gave, in the same order, field for field.
+    /// The ledger has every shape: a derivable artifact, a fresh one, the
+    /// min-age boundary from both sides, two hashes with one `written_at`,
+    /// bytes shared by three producers (two of them tied on `written_at`), a
+    /// multi-input recipe whose upstream is in the ledger and one whose
+    /// upstream is not, a producer that recorded no provenance, and a row with
+    /// neither provenance nor run.
+    #[test]
+    fn facts_verdicts_equal_the_per_hash_reference() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let now = Utc::now();
+        let old = now - Duration::days(30);
+        let fresh = now - Duration::hours(1);
+        let tied = now - Duration::days(20);
+        let hd = "d".repeat(64);
+        let he = "e".repeat(64);
+        let hf = "f".repeat(64);
+        let content = |key: &str, hash: &str| UpstreamIdentity::Content {
+            upstream_key: key.to_string(),
+            blake3_hash: hash.to_string(),
+        };
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        seed(&store, "r2", "items", "SELECT 2 AS id", &[], HB, 300, fresh);
+        record_run(&store, "r2", "items");
+        // Bytes shared by three producers; two of them tie on `written_at`.
+        seed(
+            &store,
+            "r3",
+            "shared_a",
+            "SELECT 3 AS id",
+            &[],
+            HC,
+            700,
+            tied,
+        );
+        record_run(&store, "r3", "shared_a");
+        seed(
+            &store,
+            "r4",
+            "shared_b",
+            "SELECT 3 AS id",
+            &[],
+            HC,
+            700,
+            tied,
+        );
+        record_run(&store, "r4", "shared_b");
+        seed(
+            &store,
+            "r7",
+            "shared_c",
+            "SELECT 3 AS id",
+            &[],
+            HC,
+            700,
+            old,
+        );
+        record_run(&store, "r7", "shared_c");
+        seed(
+            &store,
+            "r5",
+            "joined",
+            "SELECT 4 AS id",
+            &[content("tgt.raw.orders", HA)],
+            &hd,
+            200,
+            old,
+        );
+        record_run(&store, "r5", "joined");
+        seed(
+            &store,
+            "r6",
+            "lost_input",
+            "SELECT 5 AS id",
+            &[content("tgt.raw.gone", &hf)],
+            &he,
+            150,
+            old,
+        );
+        record_run(&store, "r6", "lost_input");
+        // The min-age boundary: exactly 7 days old, and one second short.
+        let at_boundary = "1".repeat(64);
+        let under_boundary = "2".repeat(64);
+        seed(
+            &store,
+            "r10",
+            "boundary_at",
+            "SELECT 6 AS id",
+            &[],
+            &at_boundary,
+            11,
+            now - Duration::days(7),
+        );
+        record_run(&store, "r10", "boundary_at");
+        seed(
+            &store,
+            "r11",
+            "boundary_under",
+            "SELECT 7 AS id",
+            &[],
+            &under_boundary,
+            12,
+            now - Duration::days(7) + Duration::seconds(1),
+        );
+        record_run(&store, "r11", "boundary_under");
+        // Two different hashes with one `written_at`.
+        for (run, model, hash) in [("r12", "tie_x", "3"), ("r13", "tie_y", "4")] {
+            seed(
+                &store,
+                run,
+                model,
+                "SELECT 8 AS id",
+                &[],
+                &hash.repeat(64),
+                21,
+                tied,
+            );
+            record_run(&store, run, model);
+        }
+        // A producer that recorded no provenance: the run exists, the
+        // provenance does not.
+        record_run(&store, "r8", "bare");
+        let artifact = |hash: String, run: &str, model: &str| ArtifactRecord {
+            blake3_hash: hash,
+            run_id: run.to_string(),
+            model_name: model.to_string(),
+            file_path: format!("s3://b/{model}.parquet"),
+            commit_version: 0,
+            size_bytes: 50,
+            written_at: old,
+        };
+        store
+            .record_artifact(&artifact("8".repeat(64), "r8", "bare"))
+            .unwrap();
+        // Neither provenance nor run.
+        store
+            .record_artifact(&artifact("9".repeat(64), "r9", "ghost"))
+            .unwrap();
+
+        let view = |candidates: Vec<EvictionCandidate>| -> Vec<serde_json::Value> {
+            candidates
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "output": serde_json::to_value(&c.output).unwrap(),
+                        "artifact": serde_json::to_value(&c.artifact).unwrap(),
+                        "recipe_hash": c.recipe_hash,
+                        "input_hash": c.input_hash,
+                        "input_proof_class": c.input_proof_class,
+                        "env_hash": c.env_hash,
+                        "hash_scheme": c.hash_scheme,
+                        "storage_prefix": c.storage_prefix,
+                    })
+                })
+                .collect()
+        };
+        let reference = view(gather_eviction_candidates_reference(&store, None, now, 7).unwrap());
+        let split = view(gather_eviction_candidates(&store, None, now, 7).unwrap());
+        assert_eq!(split, reference, "same rows, same order, every field");
+
+        assert_eq!(reference.len(), 11);
+        let by_model = |model: &str| {
+            reference
+                .iter()
+                .find(|r| r["output"]["model_name"] == model)
+                .unwrap_or_else(|| panic!("no {model}"))
+        };
+        assert_eq!(by_model("orders")["output"]["derivable"], true);
+        assert_eq!(by_model("items")["output"]["derivable"], false);
+        assert_eq!(by_model("boundary_at")["output"]["derivable"], true);
+        assert_eq!(by_model("boundary_under")["output"]["derivable"], false);
+        assert_eq!(by_model("ghost")["output"]["derivable"], false);
+        assert_eq!(by_model("bare")["output"]["derivable"], false);
+        assert_eq!(by_model("joined")["output"]["derivable"], false);
+        // The representative of the shared hash is the newest, then the
+        // lowest run id: `shared_a` (r3), not `shared_b` (r4) or `shared_c`.
+        assert_eq!(by_model("shared_a")["output"]["refcount"], 3);
+        assert!(
+            reference
+                .iter()
+                .all(|r| r["output"]["model_name"] != "shared_b"
+                    && r["output"]["model_name"] != "shared_c")
+        );
     }
 
     #[test]

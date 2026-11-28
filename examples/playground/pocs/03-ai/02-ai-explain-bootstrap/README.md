@@ -7,29 +7,7 @@
 
 ## What it shows
 
-`rocky ai-explain` reads each model's SQL and generates a plain-English
-description. With `--save`, the description is written to the model's
-`.toml` sidecar as an `intent` field. This is the canonical first step
-for adopting AI features on an existing project.
-
-## Why it's distinctive
-
-- **Bootstrap AI on a legacy project** in one command instead of writing
-  intent fields manually.
-- The intent field enables downstream AI features (`ai-sync`, `ai-test`).
-
-## Layout
-
-```
-models/
-  raw_orders.sql          # upstream staging SELECT over the seed orders
-  raw_orders.toml         # sidecar — gains an intent field after the run
-  customer_revenue.rocky  # downstream rollup grouping orders by customer
-  customer_revenue.toml   # sidecar — gains an intent field after the run
-data/seed.sql             # sample orders
-rocky.toml
-run.sh
-```
+`rocky ai-explain --all --save` reads each model's SQL and writes a plain-English description into its `.toml` sidecar as `intent`. This is the first step for adopting AI features (`ai-sync`, `ai-test`) on an existing project.
 
 ## Run
 
@@ -38,18 +16,11 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ./run.sh
 ```
 
-`run.sh` calls `rocky ai-explain --all --save --models models` (teeing to
-`expected/explain.log`), then cats every `models/*.toml` so you can see the
-new `intent` fields.
+`run.sh` calls `rocky ai-explain --all --save --models models` (teeing to `expected/explain.log`), then prints every `models/*.toml`.
 
 ## Expected output
 
-`ai-explain` reads each model's SQL, asks Claude for a one-line description,
-and — because of `--save` — writes it back to the model's `.toml` sidecar as
-an `intent` key. The exact wording is LLM-generated and varies run to run;
-a representative result for `models/raw_orders.toml` (the writer serializes
-the sidecar fresh, so the injected `intent` — and a `name` key, added when the
-sidecar has none — sort ahead of the existing `[strategy]`/`[target]` tables):
+Wording is LLM-generated and varies run to run. A representative `models/raw_orders.toml` (the sidecar is serialized fresh, so `intent`, and a `name` key if there was none, sort ahead of the tables):
 
 ```toml
 intent = "Stages raw order rows (order_id, customer_id, amount) from the seed source for downstream aggregation."

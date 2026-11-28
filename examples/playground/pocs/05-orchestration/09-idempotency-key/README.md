@@ -8,47 +8,19 @@
 
 ## What it shows
 
-`rocky run --idempotency-key <key>` is defense-in-depth run deduplication
-below whatever driver pressed "go":
+`rocky run --idempotency-key <key>` deduplicates runs below whatever triggered
+them (pod retries, redelivered webhooks, cron races). A new key runs and, on
+success, stores the key → `run_id` mapping. The same key again returns
+`status: "SkippedIdempotent"` and `skipped_by_run_id: <prior_run_id>` without
+touching the warehouse. A different key starts fresh.
 
-1. First invocation with a new key runs normally and stamps the key →
-   `run_id` mapping in the state store on success.
-2. Second invocation with the same key short-circuits, returning
-   `status: "SkippedIdempotent"` and `skipped_by_run_id: <prior_run_id>`
-   without touching the warehouse.
-3. A different key starts fresh.
-
-The guarantee is backend-specific:
+The guarantee is backend-specific (this POC uses `local`):
 
 | State backend | Atomic primitive |
 |---|---|
 | `local` | redb write txn inside the existing `state.redb.lock` file lock |
 | `valkey` / `tiered` | Valkey `SET NX EX` on `{prefix}:idempotency:<key>` |
 | `s3` / `gcs` | Object-store conditional PUT (`If-None-Match: "*"` on S3, `x-goog-if-generation-match: 0` on GCS) |
-
-This POC uses the `local` backend (DuckDB, single-writer) so no external
-services are required.
-
-## Why this exists
-
-Dagster sensors dedup at the `RunRequest` layer via `run_key`, but once a
-run launches the pod body has no second guard. Pod retries, Kafka
-re-delivery, webhook duplicates, cron races: all re-execute today. A
-key at the `rocky run` boundary catches them after `run_key` already let
-them through, and works for non-Dagster callers (cron, CI, webhooks,
-custom orchestrators) too.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml          Default `[state.idempotency]` block (30d retention,
-│                       dedup_on = "success", 24h in-flight TTL)
-├── run.sh              Runs the three scenarios (fresh → repeat → new key)
-├── data/seed.sql       Minimal DuckDB fixtures
-└── expected/           Captured JSON for regression comparison
-```
 
 ## Run it
 
@@ -57,17 +29,15 @@ cd examples/playground/pocs/05-orchestration/09-idempotency-key
 ./run.sh
 ```
 
-You should see three JSON outputs showing `status = "Success"` →
-`status = "SkippedIdempotent"` → `status = "Success"` (with a new key).
+You should see three status lines, `status = Success` → `SkippedIdempotent` →
+`Success` (new key). The JSON is saved in `expected/`.
 
 ## Key decisions
 
-- **Verbatim key storage.** Keys stored as-is in the state store;
-  **do NOT put secrets in idempotency keys**.
-- **`dedup_on = "success"` default.** Failed runs delete their entry so
-  retries can claim the key again. Set `dedup_on = "any"` to dedup on
-  any terminal status.
-- **30-day retention default.** Entries swept during the next state
-  upload (the existing post-run cadence).
-- **`--idempotency-key` + `--resume` is rejected** because resume is an
-  explicit override and should never be short-circuited by dedup.
+- Keys are stored verbatim: **do NOT put secrets in idempotency keys**.
+- `dedup_on = "success"` (default): failed runs delete their entry so retries can
+  claim the key. `dedup_on = "any"` dedups on any terminal status.
+- 30-day retention by default; entries are swept during the next state upload.
+- The POC's `[state.idempotency]` block sets a 24h in-flight TTL.
+- `--idempotency-key` with `--resume` is rejected, because resume is an explicit
+  override.

@@ -137,18 +137,22 @@ impl WarehouseAdapter for TrinoAdapter {
         crate::connector::classify_trino_failure(err)
     }
 
-    /// Trino polls each query, but cancelling one is not wired yet. Its
-    /// statements run on after a forced exit.
+    /// The queries this adapter waits on now, by Trino query id. A query is
+    /// listed from the coordinator's first answer to its submit.
     fn in_flight_statements(&self) -> Vec<rocky_core::statement_cancel::StatementHandle> {
-        Vec::new()
+        self.client.in_flight().snapshot()
     }
 
-    /// See [`Self::in_flight_statements`].
+    /// Cancel a listed query through `DELETE /v1/query/{id}`.
     async fn cancel_statement(
         &self,
-        _handle: &rocky_core::statement_cancel::StatementHandle,
+        handle: &rocky_core::statement_cancel::StatementHandle,
     ) -> AdapterResult<rocky_core::statement_cancel::CancelOutcome> {
-        Ok(rocky_core::statement_cancel::CancelOutcome::Unsupported)
+        self.client
+            .cancel_query(handle.as_str())
+            .await
+            .map_err(AdapterError::new)?;
+        Ok(rocky_core::statement_cancel::CancelOutcome::Requested)
     }
 
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
@@ -367,19 +371,68 @@ mod tests {
         );
     }
 
+    /// #2768: what a forced exit does. A running query is listed through
+    /// the adapter, and cancelling the listed handle sends
+    /// `DELETE /v1/query/{id}`.
     #[tokio::test]
-    async fn cancel_is_unsupported_and_nothing_is_in_flight() {
-        let cfg = TrinoClientConfig::new("http://localhost:8080");
-        let adapter = TrinoAdapter::new(cfg, crate::test_helpers::test_basic_auth());
-        assert!(adapter.in_flight_statements().is_empty());
-        let outcome = adapter
-            .cancel_statement(&rocky_core::statement_cancel::StatementHandle::new("any"))
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            rocky_core::statement_cancel::CancelOutcome::Unsupported
-        );
+    async fn a_running_query_is_listed_and_a_forced_exit_cancels_it() {
+        use rocky_core::statement_cancel::{CancelOutcome, StatementHandle};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const ID: &str = "20260101_000000_00009_zzzzz";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": ID,
+                "nextUri": format!("{}/v1/statement/executing/{ID}/x/1", server.uri()),
+                "stats": {"state": "RUNNING"},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/statement/executing/{ID}/x/1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": ID, "stats": {"state": "FINISHED"}}))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/query/{ID}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg =
+            TrinoClientConfig::new(server.uri()).with_timeout(std::time::Duration::from_secs(60));
+        let adapter = std::sync::Arc::new(TrinoAdapter::new(
+            cfg,
+            crate::test_helpers::test_basic_auth(),
+        ));
+        let running = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move { adapter.execute_statement("INSERT INTO t SELECT 1").await })
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while adapter.in_flight_statements().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "never listed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let listed = adapter.in_flight_statements();
+        assert_eq!(listed, vec![StatementHandle::new(ID)]);
+        for handle in &listed {
+            assert_eq!(
+                adapter.cancel_statement(handle).await.unwrap(),
+                CancelOutcome::Requested
+            );
+        }
+        running.abort();
+        // `.expect(1)` on the cancel mock asserts the request on drop.
     }
 
     #[test]

@@ -7,11 +7,7 @@
 
 ## What it shows
 
-An exercise of every generic adapter capability using a local DuckDB file
-as the warehouse. This POC proves the end-to-end flow without any external
-credentials or cloud services.
-
-The pipeline:
+The generic adapter commands end to end against a local DuckDB file, with no credentials. CSV seeds with TOML sidecars are routed into source schemas so `rocky discover` finds them:
 
 ```
 seeds/                  rocky seed         rocky discover       rocky plan/compile/test
@@ -20,56 +16,9 @@ seeds/                  rocky seed         rocky discover       rocky plan/compi
   products.csv   ──┘                     └─ raw__products   ┘
 ```
 
-Commands exercised:
+`run.sh` runs `validate`, `list pipelines` / `adapters` / `models`, `doctor --check auth`, `seed`, `discover`, `plan --filter`, `compile` and `test`.
 
-| Command | What it proves |
-|---------|----------------|
-| `rocky validate` | Config parsing, adapter type resolution |
-| `rocky list pipelines` | Pipeline introspection |
-| `rocky list adapters` | Adapter registry |
-| `rocky list models` | Model discovery with `_defaults.toml` |
-| `rocky doctor --check auth` | Adapter health check (DuckDB file access) |
-| `rocky seed` | CSV seed loading with TOML sidecar target routing |
-| `rocky discover` | Schema pattern matching against DuckDB schemas |
-| `rocky plan` | Dry-run SQL generation with `--filter` |
-| `rocky compile` | Model type-checking |
-| `rocky test` | Local model execution in an in-memory DuckDB (1 model passes) |
-
-## Why it's distinctive
-
-- **Only POC that exercises `rocky seed` with CSV files and TOML sidecars.**
-  Seeds are routed into source schemas (`raw__customers`, `raw__orders`,
-  `raw__products`) so that `rocky discover` finds them naturally.
-- Covers the widest surface of generic commands in a single script.
-- Validates the adapter-agnostic contract: everything here works identically
-  against Databricks or Snowflake (with credentials).
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml              pipeline: flat schema pattern, checks enabled
-├── run.sh                  exercises every generic command
-├── seeds/
-│   ├── customers.csv       7 rows (customer_id, name, email, tier, created_at)
-│   ├── customers.toml      routes to raw__customers schema
-│   ├── orders.csv          10 rows (order_id, customer_id, product, amount, status, ordered_at)
-│   ├── orders.toml         routes to raw__orders schema
-│   ├── products.csv        5 rows (product_id, name, category, price, in_stock)
-│   └── products.toml       routes to raw__products schema
-├── data/
-│   └── seed.sql            raw__orders table — auto-loaded by `rocky test`
-└── models/
-    ├── _defaults.toml      target: poc.analytics
-    ├── stg_orders.sql      SELECT from replicated orders
-    └── stg_orders.toml     [[tests]]: unique(order_id), not_null(customer_id), accepted_values(status)
-```
-
-`run.sh` calls `rocky test` without `--declarative`. That compiles the models
-and runs them in an in-memory DuckDB loaded from `data/seed.sql`. It does
-**not** run the `[[tests]]` in `stg_orders.toml`. Those run only under
-`rocky test --declarative`, against the configured warehouse adapter.
+Plain `rocky test` (no `--declarative`) compiles the models and runs them in an in-memory DuckDB loaded from `data/seed.sql`. It does **not** run the `[[tests]]` in `stg_orders.toml`. Those run only under `rocky test --declarative`, against the configured warehouse adapter.
 
 ## Prerequisites
 
@@ -83,10 +32,7 @@ bash run.sh
 
 ## Expected output
 
-Rocky emits **JSON by default** when stdout is not a TTY (as under `bash run.sh`);
-only the explicit `-o table` steps render as tables. The `plan`, `compile`, and
-`test` JSON is redirected into `expected/`, so those sections print little or
-nothing to the terminal.
+Rocky emits **JSON by default** when stdout is not a TTY (as under `bash run.sh`); only the `-o table` steps render as tables. The `plan`, `compile` and `test` JSON goes to `expected/`.
 
 ```
 === validate ===
@@ -139,11 +85,9 @@ POC complete: generic adapter exercise passed.
   - Artifacts saved to expected/
 ```
 
-The `stg_orders compiled and tested` line of the summary names the three
-`[[tests]]`. As explained above, plain `rocky test` does not run them.
+The `stg_orders compiled and tested` summary line names the three `[[tests]]`, but as noted above they are not run.
 
 ## Related
 
-- [00-playground-default](../00-playground-default/) -- baseline scaffold
-- [02-inline-checks](../../01-quality/02-inline-checks/) -- pipeline-level `[checks]` in depth
-- [04-local-test-with-duckdb](../../01-quality/04-local-test-with-duckdb/) -- `rocky test` focus
+- [02-inline-checks](../../01-quality/02-inline-checks/): pipeline-level `[checks]`
+- [04-local-test-with-duckdb](../../01-quality/04-local-test-with-duckdb/): `rocky test`

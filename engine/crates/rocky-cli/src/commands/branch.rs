@@ -2525,7 +2525,8 @@ pub(crate) fn base_compile_gate_action(
         }
         BaseCompileError::BadRef { .. }
         | BaseCompileError::DidNotCompile { .. }
-        | BaseCompileError::Unreadable(_) => BaseCompileGateAction::Refuse,
+        | BaseCompileError::Unreadable(_)
+        | BaseCompileError::PartialCloneObjectMissing(_) => BaseCompileGateAction::Refuse,
     }
 }
 
@@ -2547,7 +2548,8 @@ pub(crate) fn base_compile_gate_action_for(
         | BaseCompileError::BadRef { .. }
         | BaseCompileError::NoModelsAtBase(_)
         | BaseCompileError::DidNotCompile { .. }
-        | BaseCompileError::Unreadable(_) => base_compile_gate_action(error),
+        | BaseCompileError::Unreadable(_)
+        | BaseCompileError::PartialCloneObjectMissing(_) => base_compile_gate_action(error),
     }
 }
 

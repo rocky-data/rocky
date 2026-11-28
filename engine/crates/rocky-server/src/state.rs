@@ -114,6 +114,10 @@ pub struct ServerState {
     /// `409 mutation_in_progress`. In-memory only — does not survive a restart
     /// (the redb advisory lock is the correctness backstop).
     pub mutation_permit: crate::jobs::MutationPermit,
+    /// Single-flight slot for the read-only `diff` job. Separate from
+    /// [`mutation_permit`](Self::mutation_permit) so a diff never blocks a run,
+    /// and a run never blocks a diff.
+    pub diff_permit: crate::jobs::MutationPermit,
     /// Fast in-memory cache of job records fronting the durable `jobs` state
     /// table, serving `GET /api/v1/jobs/{id}` without touching redb on the hot
     /// path. Repopulated lazily from redb after a restart.
@@ -451,6 +455,7 @@ impl ServerState {
             publish_hold: std::sync::Mutex::new(None),
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),
+            diff_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
             job_cancels: crate::jobs::JobCancels::new(),
             auth,

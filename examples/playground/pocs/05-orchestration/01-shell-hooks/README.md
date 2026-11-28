@@ -7,28 +7,10 @@
 
 ## What it shows
 
-Lifecycle hooks declared in `rocky.toml` that fire shell commands on
-pipeline events. Each hook receives a JSON event payload on stdin and can
-set `on_failure` to abort, warn, or ignore. `rocky run` only logs a failing hook; only `rocky hooks test` acts on abort.
-
-## Why it's distinctive
-
-- **Built into the binary**, no orchestrator dependency.
-- Hooks can do approval gating, notifications, or custom side-effects.
-- `rocky hooks test on_pipeline_start` lets you exercise hooks without running
-  the full pipeline.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml          [[hook.on_pipeline_start]] / [[hook.on_pipeline_complete]]
-├── run.sh
-└── scripts/
-    ├── notify_start.sh    Logs the event JSON to stdout
-    └── notify_success.sh  Same, on pipeline completion
-```
+Hooks declared in `rocky.toml` fire shell commands on pipeline events. Each
+receives a JSON event payload on stdin and can set `on_failure` to abort, warn,
+or ignore. `rocky run` only logs a failing hook; only `rocky hooks test` acts on
+abort.
 
 ## Run
 
@@ -38,12 +20,9 @@ set `on_failure` to abort, warn, or ignore. `rocky run` only logs a failing hook
 
 ## Expected output
 
-- `rocky validate` reports the config valid (one `duckdb` adapter, one
-  `replication` / `full_refresh` pipeline).
-- `rocky hooks list` prints both hooks (`on_pipeline_start` →
-  `scripts/notify_start.sh`, `on_pipeline_complete` →
-  `scripts/notify_success.sh`), each with `on_failure: Warn` and
-  `"total": 2`.
-- `rocky hooks test on_pipeline_start` fires `notify_start.sh` and reports
-  `"status": "continue"`.
+- `rocky validate` reports the config valid.
+- `rocky hooks list` shows `on_pipeline_start` and `on_pipeline_complete`, each
+  with `on_failure: Warn`, and `"total": 2`.
+- `rocky hooks test on_pipeline_start` fires `scripts/notify_start.sh` and
+  reports `"status": "continue"`.
 - Final line: `POC complete: hooks listed and tested.` (exit 0).

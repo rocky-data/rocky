@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { clipHead, clipMiddle } from "./format";
+import { NOT_RECORDED, clipHead, clipMiddle } from "./format";
 
 /** Trust-signal tone, the idiom the VS Code Inspector uses. */
 export type Tone = "ok" | "warn" | "risk" | "muted" | "pending";
@@ -43,6 +43,37 @@ export function runStatusTone(status: string): Tone {
     default:
       return "muted";
   }
+}
+
+/**
+ * A run's status in words, by the same reading as `runStatusTone`. A status
+ * this does not know is shown as the engine wrote it.
+ */
+export function runStatusLabel(status: string): string {
+  switch (status.toLowerCase()) {
+    case "success":
+      return "Succeeded";
+    case "partialfailure":
+    case "partial_failure":
+      return "Partly failed";
+    case "failure":
+      return "Failed";
+    default:
+      return status;
+  }
+}
+
+/**
+ * A value that was not recorded, as a grey "-" with the reason in `title`.
+ * A missing value asks nothing of the reader, so it is not amber. The reason
+ * is also the accessible name, so a screen reader hears more than "dash".
+ */
+export function Missing({ reason }: { reason: string }) {
+  return (
+    <span role="img" className="text-muted" title={reason} aria-label={`${NOT_RECORDED}: ${reason}`}>
+      -
+    </span>
+  );
 }
 
 /** The dot alone, for a line of status outside a card. */

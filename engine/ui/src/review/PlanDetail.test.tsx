@@ -9,7 +9,7 @@ import type { PreviewRowsOutput } from "@rocky-types/preview_rows";
 import statusFixture from "@rocky-fixtures/review_status.json";
 import { ApiError } from "../api";
 import { READ_ONLY_REASON, WriteAccessProvider } from "../operator";
-import { PlanDetail, type PlanLoaders, describeFinding, productNameFromId } from "./PlanDetail";
+import { PlanDetail, type PlanLoaders, describeFinding, productNameFromId, replanCommand } from "./PlanDetail";
 
 // The status panel reads a payload captured from the live engine, so a shape
 // change there fails this test rather than passing against a hand-written
@@ -131,7 +131,7 @@ describe("PlanDetail", () => {
     const view = render(
       <PlanDetail planId={PLAN} loaders={loaders({ diff: vi.fn(() => pending) })} />,
     );
-    await screen.findByText("awaiting a human");
+    await screen.findByText("not approved yet");
     expect(screen.queryByText(`rocky review ${PLAN} --approve`)).toBeNull();
 
     resolveDiff(DIFF);
@@ -229,7 +229,7 @@ describe("PlanDetail", () => {
 
     await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
-    expect(screen.getByText(/This plan touches 3 models: orders, customers, payments/)).toBeTruthy();
+    expect(screen.getByText(/This change touches 3 models: orders, customers, payments/)).toBeTruthy();
   });
 
   /// The screen used a `^[a-zA-Z0-9_]+$` regex on the label to decide whether
@@ -296,7 +296,7 @@ describe("PlanDetail", () => {
 
     await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
-    expect(screen.getByText(/names no compiled model for this plan \(gc "gc"\)/)).toBeTruthy();
+    expect(screen.getByText(/names no compiled model for this change \(gc "gc"\)/)).toBeTruthy();
   });
 
   /// A graph key is not a licence to read. The engine says per row what the
@@ -330,7 +330,7 @@ describe("PlanDetail", () => {
     await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
     expect(
-      screen.getByText(/The samples route would read none of the models this plan names \(v2\.fct_orders\)/),
+      screen.getByText(/The samples route would read none of the models this change names \(v2\.fct_orders\)/),
     ).toBeTruthy();
   });
 
@@ -364,7 +364,7 @@ describe("PlanDetail", () => {
     await screen.findByText("matches the approval");
     // …and still no offer.
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
-    expect(screen.getByText(/The samples route would read none of the models this plan names/))
+    expect(screen.getByText(/The samples route would read none of the models this change names/))
       .toBeTruthy();
   });
 
@@ -372,7 +372,7 @@ describe("PlanDetail", () => {
   /// queue keeps one row per (plan, model): a plan over two models under two
   /// rules pends twice. Keeping only the first row showed one reason and one
   /// model beside a command that clears both (#1815).
-  it("shows every escalation of one plan, and one command that clears them all", async () => {
+  it("shows every approval request of one change, and one command that clears them all", async () => {
     const twice: ReviewQueueOutput = {
       ...QUEUE,
       total: 2,
@@ -413,14 +413,14 @@ describe("PlanDetail", () => {
     expect(screen.getByRole("region", { name: "Conditional DROPs" })).toBeTruthy();
     expect(screen.getByText('DROP TABLE IF EXISTS "main"."orders"')).toBeTruthy();
     expect(screen.getByText("#5")).toBeTruthy();
-    expect(screen.getByText(/2 escalations name this plan/)).toBeTruthy();
+    expect(screen.getByText(/2 approval requests name this change/)).toBeTruthy();
     // Two models is not one to sample; both are named.
     expect(screen.getByText("no single model to sample")).toBeTruthy();
     expect(screen.getByText(/touches 2 models: orders, customers/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
     // One command, and it says what it clears.
     expect(screen.getAllByText(`rocky review ${PLAN} --approve`)).toHaveLength(1);
-    expect(screen.getByText(/clears every one of the 2 escalations/)).toBeTruthy();
+    expect(screen.getByText(/clears every one of the 2 approval requests/)).toBeTruthy();
   });
 
   /// Backfill is not the only capability whose queue `model` holds a sentence:
@@ -452,7 +452,7 @@ describe("PlanDetail", () => {
     );
 
     await screen.findByText("no single model to sample");
-    expect(screen.getByText(/This plan touches 2 models: orders, customers/)).toBeTruthy();
+    expect(screen.getByText(/This change touches 2 models: orders, customers/)).toBeTruthy();
     // The capability is shown where the engine put it — on the escalation —
     // and the sample card does not guess one.
     expect(screen.getByText("restore")).toBeTruthy();
@@ -529,7 +529,7 @@ describe("PlanDetail", () => {
         queue: vi.fn(async () => queue),
       });
       const view = render(<PlanDetail planId={PLAN} loaders={shared} />);
-      await screen.findByText("awaiting a human");
+      await screen.findByText("not approved yet");
       expect(screen.getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
       // Consent for A's model, given by a click.
       fireEvent.click(screen.getByRole("button", { name: /Show \d+ rows/ }));
@@ -542,8 +542,8 @@ describe("PlanDetail", () => {
       expect(document.querySelector(`[title="${PLAN_B}"]`)).toBeTruthy();
       expect(document.querySelector(`[title="${PLAN}"]`)).toBeNull();
       expect(screen.queryByText(`rocky review ${PLAN} --approve`)).toBeNull();
-      expect(screen.queryByText("awaiting a human")).toBeNull();
-      expect(screen.getByText("reading the plan…")).toBeTruthy();
+      expect(screen.queryByText("not approved yet")).toBeNull();
+      expect(screen.getByText("reading the change…")).toBeTruthy();
 
       releaseB({ ...STATUS, plan_id: PLAN_B });
       await screen.findByText(`rocky review ${PLAN_B} --approve`);
@@ -559,11 +559,11 @@ describe("PlanDetail", () => {
     }
   });
 
-  it("shows the plan, its findings, the escalation and the approve command", async () => {
+  it("shows the change, its findings, the approval request and the approve command", async () => {
     render(<PlanDetail planId={PLAN} loaders={loaders()} />);
 
     await screen.findByText(STATUS.kind);
-    expect(screen.getByText("awaiting a human")).toBeTruthy();
+    expect(screen.getByText("not approved yet")).toBeTruthy();
     await waitFor(() =>
       expect(screen.getByText(/orders.total changes type, INT64 to INT32/)).toBeTruthy(),
     );
@@ -661,7 +661,7 @@ describe("PlanDetail", () => {
       expect(screen.getByText(/the approved spec is/)).toBeTruthy();
     });
 
-    it("says no approval is recorded, and does not compare with the working spec", async () => {
+    it("says no approval is recorded, and does not compare with the current spec", async () => {
       // The working spec equals the plan; with no approval that must not read as a match.
       planWith("sha256:1111", { ...PRODUCT, approval: null } as ProductStatusOutput);
       await screen.findByText("no approval recorded");
@@ -669,7 +669,7 @@ describe("PlanDetail", () => {
       expect(screen.queryByText("the spec moved")).toBeNull();
     });
 
-    it("does not report drift when only the working spec was edited, but says the edits are not approved", async () => {
+    it("does not report drift when only the current spec was edited, but says the edits are not approved", async () => {
       planWith("sha256:1111", {
         ...PRODUCT,
         spec_digest: "sha256:edited-after-approval",
@@ -678,11 +678,11 @@ describe("PlanDetail", () => {
       await screen.findByText("matches the approval");
       expect(screen.queryByText("the spec moved")).toBeNull();
       expect(
-        await screen.findByText(/The working spec has been edited since the approval; those edits are not approved\./),
+        await screen.findByText(/The current spec has been edited since the approval; those edits are not approved\./),
       ).toBeInTheDocument();
     });
 
-    it("reports drift when the working spec matches the plan but the approval does not", async () => {
+    it("reports drift when the current spec matches the plan but the approval does not", async () => {
       planWith("sha256:1111", {
         ...PRODUCT,
         approval: { ...PRODUCT.approval, spec_digest: "sha256:approved-other" },
@@ -695,7 +695,7 @@ describe("PlanDetail", () => {
     const product = vi.fn(async () => PRODUCT);
     render(<PlanDetail planId={PLAN} loaders={loaders({ product })} />);
     await screen.findByText(STATUS.kind);
-    expect(screen.getByText("not product-bound")).toBeTruthy();
+    expect(screen.getByText("not tied to a data product")).toBeTruthy();
     expect(product).not.toHaveBeenCalled();
   });
 
@@ -721,7 +721,7 @@ describe("PlanDetail", () => {
   /// Archive deletes rows and vacuums with no retention window. The server
   /// refuses to apply it over the HTTP API, and the page mirrors that: no
   /// button that would only be refused, and the terminal command instead.
-  it("does not offer to apply an archive plan, and shows the terminal command", async () => {
+  it("does not offer to apply an archive change, and shows the terminal command", async () => {
     render(
       <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
         <PlanDetail
@@ -732,9 +732,9 @@ describe("PlanDetail", () => {
       </WriteAccessProvider>,
     );
     await screen.findByRole("region", { name: "Approval" });
-    const apply = screen.getByRole("button", { name: "Apply" });
+    const apply = screen.getByRole("button", { name: "Apply to production" });
     expect(apply).toBeDisabled();
-    expect(apply).toHaveAttribute("title", "An archive plan is applied in a terminal, not from this page.");
+    expect(apply).toHaveAttribute("title", "An archive change is applied in a terminal, not from this page.");
     expect(screen.getByText(`rocky apply ${PLAN}`)).toBeTruthy();
     fireEvent.click(apply);
   });
@@ -742,7 +742,7 @@ describe("PlanDetail", () => {
   /// A promote plan replaces production tables. The server applies one only
   /// when the config requires a branch approval; the page mirrors that, with
   /// the server staying the authority.
-  it("disables Apply for a promote plan unless the project requires a branch approval", async () => {
+  it("disables Apply to production for a promote change unless the project requires a branch approval", async () => {
     const asPromote = { status: vi.fn(async () => ({ ...STATUS, kind: "promote", reviewed: true })) };
     for (const [label, project] of [
       ["off", { ...PROJECT, branch_approval_required: false }],
@@ -754,7 +754,7 @@ describe("PlanDetail", () => {
         </WriteAccessProvider>,
       );
       await screen.findByRole("region", { name: "Approval" });
-      await waitFor(() => expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled(), { timeout: 3000 });
+      await waitFor(() => expect(screen.getByRole("button", { name: "Apply to production" })).toBeDisabled(), { timeout: 3000 });
       const text = document.body.textContent ?? "";
       expect(text, label).toContain("[branch.approval] required = true");
       expect(screen.getByText(`rocky apply ${PLAN}`), label).toBeTruthy();
@@ -762,7 +762,7 @@ describe("PlanDetail", () => {
     }
   });
 
-  it("offers Apply for a promote plan when the project requires a branch approval", async () => {
+  it("offers Apply change for a promote change when the project requires a branch approval", async () => {
     render(
       <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
         <PlanDetail
@@ -772,7 +772,7 @@ describe("PlanDetail", () => {
       </WriteAccessProvider>,
     );
     await screen.findByRole("region", { name: "Approval" });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Apply" })).not.toBeDisabled(), { timeout: 3000 });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Apply change" })).not.toBeDisabled(), { timeout: 3000 });
   });
 
   it("does not read the project for a plan that is not a promote plan", async () => {
@@ -786,7 +786,37 @@ describe("PlanDetail", () => {
     expect(project).not.toHaveBeenCalled();
   });
 
-  it("keeps Apply for a plan that is not an archive plan", async () => {
+  it("names the command that re-plans, per kind, and none where the refusal cannot happen", async () => {
+    expect(replanCommand("run")).toBe("rocky plan");
+    expect(replanCommand("ai_authored")).toBe("rocky plan");
+    expect(replanCommand("backfill")).toBe("rocky backfill");
+    for (const kind of ["promote", "gc", "restore", "compact", "archive", "something_new"]) {
+      expect(replanCommand(kind)).toBeNull();
+    }
+    const { unmount } = render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "backfill", reviewed: true, product_id: undefined })) })}
+        />
+      </WriteAccessProvider>,
+    );
+    const hint = await screen.findByText(/plan_models_changed/);
+    expect(hint.querySelector("code")?.textContent).toBe("rocky backfill");
+    unmount();
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "gc", reviewed: true, product_id: undefined })) })}
+        />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("button", { name: "Apply change" });
+    expect(screen.queryByText(/plan_models_changed/)).toBeNull();
+  });
+
+  it("keeps Apply change for a change that is not an archive change", async () => {
     render(
       <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
         <PlanDetail
@@ -796,7 +826,7 @@ describe("PlanDetail", () => {
       </WriteAccessProvider>,
     );
     await screen.findByRole("region", { name: "Approval" });
-    expect(screen.getByRole("button", { name: "Apply" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Apply change" })).not.toBeDisabled();
     expect(screen.queryByText(`rocky apply ${PLAN}`)).toBeNull();
   });
 
@@ -813,11 +843,11 @@ describe("PlanDetail", () => {
       .filter((b) => !b.disabled)
       .map((b) => b.textContent ?? "");
     expect(enabled).toEqual(["Show 20 rows"]);
-    expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Approve change" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Apply change" })).toBeDisabled();
     // One place for the read-only reason (the shell banner); here it is
     // each button's tooltip, never a line under every button.
-    expect(screen.getByRole("button", { name: "Apply" })).toHaveAttribute("title", READ_ONLY_REASON);
+    expect(screen.getByRole("button", { name: "Apply change" })).toHaveAttribute("title", READ_ONLY_REASON);
     expect(screen.queryAllByText(READ_ONLY_REASON)).toEqual([]);
     expect(container.querySelector("form")).toBeNull();
   });

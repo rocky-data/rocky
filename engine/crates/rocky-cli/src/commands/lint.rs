@@ -23,6 +23,12 @@ fn default_severity(code: &str) -> LintSeverity {
     }
 }
 
+/// A `[lint]` section that names a rule the engine does not have. The HTTP
+/// route answers it as an invalid config, not as an internal failure.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct LintConfigError(pub String);
+
 /// `[lint]` resolved against the rule table.
 struct Settings {
     disabled: HashSet<&'static str>,
@@ -34,12 +40,12 @@ impl Settings {
     /// silently leaves a rule on.
     fn resolve(config: &LintConfig) -> Result<Self> {
         let known = |code: &str, key: &str| -> Result<&'static RuleInfo> {
-            style_lint::rule_info(code).with_context(|| {
+            style_lint::rule_info(code).ok_or_else(|| {
                 let codes: Vec<&str> = style_lint::RULES.iter().map(|r| r.code).collect();
-                format!(
+                anyhow::Error::new(LintConfigError(format!(
                     "[lint] {key}: unknown rule `{code}` (known rules: {})",
                     codes.join(", ")
-                )
+                )))
             })
         };
         let mut disabled = HashSet::new();
@@ -100,7 +106,85 @@ pub fn run_lint(config_path: &Path, paths: &[PathBuf], fix: bool, json: bool) ->
     Ok(())
 }
 
+/// The directories the server reads models from, absolute: every
+/// transformation pipeline's existing models directory, as the server's own
+/// compile reads them (#2011). An explicit `--models`, a project with no such
+/// pipeline, or a project whose pipelines the loader refuses (so the compile
+/// fell back to `models_dir`) gives `models_dir` alone.
+pub(crate) fn served_model_roots(
+    config: Option<&rocky_core::config::RockyConfig>,
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    models_dir_is_explicit: bool,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let (false, Some(config), Some(config_path)) = (models_dir_is_explicit, config, config_path)
+    {
+        // The server compiles the union only when the loader accepts it. A
+        // refusal (a model name shared across pipelines, say) makes it compile
+        // `models_dir` alone, and these roots must match that compile.
+        let has_pipeline = config
+            .pipelines
+            .values()
+            .any(|pipeline| pipeline.as_transformation().is_some());
+        let union_loads = has_pipeline
+            && rocky_compiler::models_loader::load_transformation_models(config_path, config)
+                .is_ok();
+        if union_loads {
+            for tx in config
+                .pipelines
+                .values()
+                .filter_map(|pipeline| pipeline.as_transformation())
+            {
+                if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
+                    crate::models_loader::locate_models_dir(&tx.models, config_path)
+                {
+                    roots.push(dir);
+                }
+            }
+        }
+    }
+    if roots.is_empty() {
+        roots.push(models_dir.to_path_buf());
+    }
+    let mut absolute: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let root = std::path::absolute(&root).unwrap_or(root);
+        if !absolute.contains(&root) {
+            absolute.push(root);
+        }
+    }
+    absolute
+}
+
+/// The `rocky lint` report for `paths`, without `--fix`.
+///
+/// Pure: it reads the `.sql` files under `paths` and rewrites nothing.
+/// `relative_to` makes each reported file path relative to that directory,
+/// so the report carries no absolute local path.
+///
+/// # Errors
+///
+/// An unknown rule code in `[lint]`, or a path that cannot be read.
+pub(crate) fn lint_report(
+    lint: &LintConfig,
+    paths: &[PathBuf],
+    relative_to: &Path,
+) -> Result<LintOutput> {
+    let settings = Settings::resolve(lint)?;
+    lint_paths_displayed(paths, false, &settings, Some(relative_to))
+}
+
 fn lint_paths(paths: &[PathBuf], fix: bool, settings: &Settings) -> Result<LintOutput> {
+    lint_paths_displayed(paths, fix, settings, None)
+}
+
+fn lint_paths_displayed(
+    paths: &[PathBuf],
+    fix: bool,
+    settings: &Settings,
+    relative_to: Option<&Path>,
+) -> Result<LintOutput> {
     let default_root = [PathBuf::from("models")];
     let roots: &[PathBuf] = if paths.is_empty() {
         &default_root
@@ -116,7 +200,17 @@ fn lint_paths(paths: &[PathBuf], fix: bool, settings: &Settings) -> Result<LintO
     let mut ast_rules_skipped = Vec::new();
 
     for file in &files {
-        let display = file.display().to_string();
+        let display = match relative_to {
+            // A file outside the root keeps only its name: never an
+            // absolute local path.
+            Some(root) => match file.strip_prefix(root) {
+                Ok(relative) => relative.display().to_string(),
+                Err(_) => file
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            },
+            None => file.display().to_string(),
+        };
         let mut sql =
             std::fs::read_to_string(file).with_context(|| format!("reading {display}"))?;
 
@@ -434,5 +528,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn served_roots_fall_back_to_models_dir_when_the_loader_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in ["models", "other"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(root.join(sub).join("dup.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                root.join(sub).join("dup.toml"),
+                "name = \"dup\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"dup\"\n",
+            )
+            .unwrap();
+        }
+        let config_path = root.join("rocky.toml");
+        let toml = |extra: &str| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n\n{extra}"
+            )
+        };
+        let second = "[pipeline.q]\ntype = \"transformation\"\nmodels = \"other/**\"\n\n\
+                      [pipeline.q.target.governance]\nauto_create_schemas = true\n";
+        let models_dir = root.join("models");
+
+        std::fs::write(&config_path, toml(second)).unwrap();
+        let config = rocky_core::config::load_optional_project_config(Some(&config_path))
+            .unwrap()
+            .unwrap();
+        // The same model name in two pipelines: the loader refuses.
+        assert_eq!(
+            served_model_roots(Some(&config), Some(&config_path), &models_dir, false),
+            [std::path::absolute(&models_dir).unwrap()]
+        );
+        // Without the clash both roots are served.
+        std::fs::remove_file(root.join("other").join("dup.sql")).unwrap();
+        std::fs::remove_file(root.join("other").join("dup.toml")).unwrap();
+        std::fs::write(root.join("other").join("solo.sql"), "SELECT 2 AS id\n").unwrap();
+        std::fs::write(
+            root.join("other").join("solo.toml"),
+            "name = \"solo\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"solo\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            served_model_roots(Some(&config), Some(&config_path), &models_dir, false).len(),
+            2
+        );
     }
 }

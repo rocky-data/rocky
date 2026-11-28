@@ -7,26 +7,7 @@
 
 ## What it shows
 
-How to enable Rocky's built-in pipeline-level data quality checks via the
-`[checks]` block in `rocky.toml`. Checks run inline during `rocky run` and
-report results in the JSON output, distinct from the `rocky test` (model
-assertion) flow.
-
-## Why it's distinctive
-
-- **Pipeline-level**, not per-model: checks live in `rocky.toml`, not in
-  individual model files. Configure once, applies to every replicated table.
-- Runs inline with the pipeline (no second pass).
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml          [pipeline.poc.checks] enables row_count + column_match
-├── run.sh
-└── data/seed.sql       raw__events.events seed (replication is pattern-discovery based; no model files)
-```
+Pipeline-level data quality checks, configured in `[pipeline.NAME.checks]` in `rocky.toml`, run inline during `rocky run` and report in its JSON output. They are separate from `rocky test` model assertions and apply to every replicated table.
 
 ## Run
 
@@ -34,25 +15,16 @@ assertion) flow.
 ./run.sh
 ```
 
-## What happened
-
-`rocky -c rocky.toml run` discovers `raw__events.events`, replicates it to
-`poc.staging__events.events`, and runs the configured checks against the
-target. The JSON output's `check_results` array contains one entry per
-table.
-
 ## Expected output
 
-`rocky run`'s local (DuckDB) execution path runs the configured checks inline
-and populates `check_results` in the JSON output. The run log shows the
-batched-checks phase:
+The run discovers `raw__events.events`, replicates it to `poc.staging__events.events` and checks the target. The log shows:
 
 ```
 running batched checks concurrently  row_count_tables:1 freshness_tables:0
 batched checks complete              tables:1
 ```
 
-and `expected/run.json` carries one `check_results` entry per table:
+`expected/run.json` carries one `check_results` entry per table:
 
 ```json
 "check_results": [
@@ -66,9 +38,4 @@ and `expected/run.json` carries one `check_results` entry per table:
 ]
 ```
 
-Both checks pass. `row_count` compares the source and target row counts
-(500 == 500). `column_match` finds no missing and no extra columns. You can
-list the target columns with
-`duckdb poc.duckdb "PRAGMA table_info('staging__events.events')"`.
-`run.sh` does not assert the check results. It only writes them to
-`expected/run.json`.
+`row_count` compares source and target counts; `column_match` looks for missing or extra columns (list them with `duckdb poc.duckdb "PRAGMA table_info('staging__events.events')"`). `run.sh` does not assert the check results; it only writes them.
