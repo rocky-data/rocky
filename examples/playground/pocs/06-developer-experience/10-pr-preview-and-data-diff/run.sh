@@ -102,7 +102,7 @@ echo "==> 7. rocky run --branch $PREVIEW_BRANCH — record the branch run diff/c
     --branch "$PREVIEW_BRANCH" \
     > expected/run_branch.json
 
-echo "==> 8a. rocky preview diff --name $PREVIEW_BRANCH (sampled — default)"
+echo "==> 8a. rocky preview diff --name $PREVIEW_BRANCH (default: compares recorded row counts, reads no rows)"
 "$ROCKY_BIN" -c rocky.toml -o json preview diff \
     --name "$PREVIEW_BRANCH" \
     --base "$BASE_REF" \
@@ -112,7 +112,7 @@ echo "==> 8b. rocky preview diff --algorithm bisection --name $PREVIEW_BRANCH"
 # Bisection requires a model declaring a single-column integer / numeric
 # `unique_key` on a `Merge` strategy; the POC's models are
 # `full_refresh`, so bisection skips them (the tracing log records it)
-# and the sampled diff is what applies here.
+# and the default diff is what applies here.
 "$ROCKY_BIN" -c rocky.toml -o json preview diff \
     --name "$PREVIEW_BRANCH" \
     --base "$BASE_REF" \
@@ -125,7 +125,7 @@ echo "==> 9. rocky preview cost --name $PREVIEW_BRANCH"
     > expected/preview_cost.json
 
 # Quick non-empty sanity check; we don't pin the JSON shape here because
-# the example shapes already live in `expected/preview_*.example.json`.
+# the README describes the shapes.
 for f in expected/preview_create.json expected/run_branch.json expected/preview_diff.json expected/preview_diff_bisection.json expected/preview_cost.json; do
     if [[ ! -s "$f" ]]; then
         echo "FAIL: $f is empty" >&2

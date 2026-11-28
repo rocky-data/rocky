@@ -25,7 +25,7 @@ echo "=== 1. ingest pipeline — Parquet -> main.events ==="
 rocky load --pipeline ingest --output json | tee expected/load.json
 
 echo ""
-echo "=== pre-create per-tenant schemas (rocky transformation runs don't auto-create yet) ==="
+echo "=== pre-create per-tenant schemas (auto_create_schemas is not set in rocky.toml) ==="
 duckdb poc.duckdb <<SQL
 CREATE SCHEMA IF NOT EXISTS account_acme;
 CREATE SCHEMA IF NOT EXISTS account_beta;
