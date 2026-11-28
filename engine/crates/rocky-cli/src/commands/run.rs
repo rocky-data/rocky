@@ -73,7 +73,40 @@ struct CopyErrorClass {
     may_still_run: bool,
 }
 
+/// Context on the error of a copy's write statement when the warehouse may
+/// have applied the write ([`crate::output::statement_outcome_unknown`]).
+/// Rocky cannot prove the write did not run, so the `table_retries` arm must
+/// not run the table again: a bare `INSERT` could apply twice (#2800).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the copy of {table} was sent, but Rocky does not know if the warehouse applied it; \
+     it is not retried, because a second copy could apply twice. Check {table} before \
+     you run it again"
+)]
+struct CopyWriteOutcomeUnknown {
+    table: String,
+}
+
+/// Tag `err`, returned by the copy's write statement, with
+/// [`CopyWriteOutcomeUnknown`] when the write's outcome is unknown.
+fn tag_copy_write_error(err: anyhow::Error, table: &TableRef) -> anyhow::Error {
+    if crate::output::statement_outcome_unknown(&err) {
+        err.context(CopyWriteOutcomeUnknown {
+            table: table.full_name(),
+        })
+    } else {
+        err
+    }
+}
+
 fn classify_table_error(err: &anyhow::Error) -> CopyErrorClass {
+    if err.is::<CopyWriteOutcomeUnknown>() {
+        return CopyErrorClass {
+            failure_kind: FailureKind::Unknown,
+            cooldown_seconds: None,
+            may_still_run: true,
+        };
+    }
     let (failure_kind, cooldown_seconds) = if err.is::<MissingTimestampColumn>() {
         (FailureKind::CompileError, None)
     } else {
@@ -20964,7 +20997,7 @@ async fn process_table(
         None => warehouse
             .execute_statement_with_stats(&sql)
             .await
-            .map_err(anyhow::Error::from)?,
+            .map_err(|e| tag_copy_write_error(anyhow::Error::from(e), &target_table))?,
     };
 
     // Tagging and watermark updates are deferred to post-run batch phase
@@ -56193,6 +56226,302 @@ timestamp_column = "ts"
     #[tokio::test]
     async fn checkpoint_recovery_fresh_restart_scans_older_unconfirmed_headers() {
         checkpoint_recovery_retry_case(true, true).await;
+    }
+
+    /// What [`LostAnswerDuckDb`] returns after it runs a statement.
+    #[cfg(feature = "duckdb")]
+    #[derive(Clone, Copy)]
+    enum LostAnswer {
+        /// The copy's `INSERT` runs, then answers with an exhausted 503:
+        /// the warehouse applied the write and the answer was lost.
+        OnWrite,
+        /// The source `MAX(ts)` read before the copy answers with the same
+        /// 503 once. Nothing was written.
+        OnPreCopyRead,
+    }
+
+    /// Runs every statement on DuckDB, and fails one call with a wrapped
+    /// Snowflake 503 as [`LostAnswer`] says. Counts the copy's `INSERT`s.
+    #[cfg(feature = "duckdb")]
+    struct LostAnswerDuckDb<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        mode: LostAnswer,
+        inserts: std::sync::atomic::AtomicU32,
+        failed_once: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn lost_503() -> rocky_core::traits::AdapterError {
+        rocky_core::traits::AdapterError::new(
+            rocky_snowflake::connector::ConnectorError::ApiError {
+                status: 503,
+                body: "Service Unavailable".into(),
+            },
+        )
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for LostAnswerDuckDb<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            use std::sync::atomic::Ordering;
+            let stats = self.inner.execute_statement_with_stats(sql).await?;
+            if sql.trim_start().starts_with("INSERT INTO") {
+                self.inserts.fetch_add(1, Ordering::SeqCst);
+                if matches!(self.mode, LostAnswer::OnWrite)
+                    && !self.failed_once.swap(true, Ordering::SeqCst)
+                {
+                    return Err(lost_503());
+                }
+            }
+            Ok(stats)
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            use std::sync::atomic::Ordering;
+            if matches!(self.mode, LostAnswer::OnPreCopyRead)
+                && sql.trim_start().starts_with("SELECT MAX(")
+                && sql.contains("src")
+                && !self.failed_once.swap(true, Ordering::SeqCst)
+            {
+                return Err(lost_503());
+            }
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// Runs one incremental copy through `LostAnswerDuckDb`, then the
+    /// `table_retries` arm's decision (`classify_table_error`, then
+    /// `auto_retry_indices`), then the retry it allows. No watermark
+    /// recovery, as on an adapter without it or while the first copy still
+    /// runs. Returns the first attempt's error entry, the copy's `INSERT`
+    /// count and the target's row count.
+    #[cfg(feature = "duckdb")]
+    async fn lost_answer_case(mode: LostAnswer) -> (TableError, u32, String) {
+        use chrono::TimeZone;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::WatermarkState;
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            // Row 3 is held back (#2376), so the copy appends row 2 only.
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-02 12:00:00'), \
+                (3, TIMESTAMP '2026-03-03 00:00:00')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events WHERE id = 1",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let target = TableRef {
+            catalog: String::new(),
+            schema: "tgt".into(),
+            table: "events".into(),
+        };
+        let prior = Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap();
+        state
+            .set_watermark(
+                &target.state_key(),
+                &WatermarkState {
+                    last_value: prior,
+                    updated_at: prior,
+                },
+            )
+            .unwrap();
+        let pipeline = parse_pipeline(
+            r#"strategy = "incremental"
+timestamp_column = "ts"
+"#,
+        );
+        let task = TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            source_table_name: "events".into(),
+            target_table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            column_match: None,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+        let warehouse = LostAnswerDuckDb {
+            inner: &inner,
+            mode,
+            inserts: std::sync::atomic::AtomicU32::new(0),
+            failed_once: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let Err(error) = process_table(&warehouse, &state, &pipeline, &task, false).await else {
+            panic!("the injected 503 must fail the first copy");
+        };
+        let class = classify_table_error(&error);
+        let mut entry = copy_table_error("events");
+        entry.task_index = Some(0);
+        entry.error = format!("{error:#}");
+        entry.failure_kind = class.failure_kind;
+        entry.cooldown_seconds = class.cooldown_seconds;
+        entry.may_still_run = class.may_still_run;
+
+        for idx in super::auto_retry_indices(std::slice::from_ref(&entry)) {
+            assert_eq!(idx, 0);
+            retry_table_after_recovery(
+                &warehouse, &state, &pipeline, &task, None, false, false, false,
+            )
+            .await
+            .unwrap();
+        }
+        let inserts = warehouse.inserts.load(std::sync::atomic::Ordering::SeqCst);
+        let rows = inner
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        let rows = rows.rows[0][0].as_str().unwrap_or_default().to_string();
+        (entry, inserts, rows)
+    }
+
+    /// #2800: a copy whose write the warehouse applied, but whose answer was
+    /// lost (an exhausted 503), was run again by `table_retries`. The second
+    /// `INSERT` appended the same rows. The table must keep its first error,
+    /// be reported `unknown` and not run again.
+    ///
+    /// Fails before the fix: two `INSERT`s, and three rows in the target.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_copy_whose_write_answer_was_lost_is_not_run_again() {
+        let (entry, inserts, rows) = lost_answer_case(LostAnswer::OnWrite).await;
+        assert_eq!(inserts, 1, "the table must not be run twice");
+        assert_eq!(rows, "2", "the delta must be applied once");
+        assert!(entry.may_still_run);
+        assert_eq!(entry.failure_kind, FailureKind::Unknown);
+        assert_eq!(entry.cooldown_seconds, None);
+        assert!(
+            entry
+                .error
+                .contains("does not know if the warehouse applied it")
+                && entry.error.contains("503"),
+            "{}",
+            entry.error
+        );
+    }
+
+    /// #2800, the known-safe side: the same 503 on a read before the write
+    /// changed nothing, so `table_retries` still runs the table again, and
+    /// the failure keeps its `transient` kind.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_pre_copy_read_failure_is_still_retried() {
+        let (entry, inserts, rows) = lost_answer_case(LostAnswer::OnPreCopyRead).await;
+        assert!(!entry.may_still_run);
+        assert_eq!(entry.failure_kind, FailureKind::Transient);
+        assert_eq!(inserts, 1, "the retry runs the copy once");
+        assert_eq!(rows, "2");
+    }
+
+    /// #2800: which connector errors at a copy's write leave its outcome
+    /// unknown. A rejection, a 4xx (401 and 429 among them), a failed
+    /// connect and an open breaker are known not to have applied the write;
+    /// a 5xx and a spent retry budget are not.
+    #[test]
+    fn copy_write_outcome_is_unknown_only_without_a_definite_answer() {
+        use rocky_core::traits::AdapterError;
+        use rocky_databricks::connector::ConnectorError as DbE;
+        use rocky_snowflake::connector::ConnectorError as SnE;
+
+        let table = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let at_write = |e: AdapterError| {
+            let tagged = tag_copy_write_error(anyhow::Error::from(e), &table);
+            classify_table_error(&tagged)
+        };
+        let sf_api = |status| SnE::ApiError {
+            status,
+            body: String::new(),
+        };
+        for status in [500, 502, 503, 504] {
+            let class = at_write(AdapterError::new(sf_api(status)));
+            assert!(class.may_still_run, "{status}");
+            assert_eq!(class.failure_kind, FailureKind::Unknown, "{status}");
+        }
+        let budget = at_write(AdapterError::new(DbE::RetryBudgetExhausted { limit: 3 }));
+        assert!(budget.may_still_run);
+        assert_eq!(budget.failure_kind, FailureKind::Unknown);
+
+        for (name, err, kind) in [
+            (
+                "429",
+                AdapterError::new(sf_api(429)),
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                "401",
+                AdapterError::new(sf_api(401)),
+                FailureKind::AuthFailed,
+            ),
+            (
+                "rejected",
+                AdapterError::new(DbE::StatementFailed {
+                    id: "s".into(),
+                    message: "syntax error".into(),
+                }),
+                FailureKind::QueryRejected,
+            ),
+            (
+                "breaker",
+                AdapterError::new(SnE::CircuitBreakerOpen {
+                    consecutive_failures: 5,
+                    cooldown_seconds: Some(30),
+                }),
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                "no connector error",
+                AdapterError::msg("IO Error: Could not set lock on file"),
+                FailureKind::Unknown,
+            ),
+        ] {
+            let class = at_write(err);
+            assert!(!class.may_still_run, "{name}");
+            assert_eq!(class.failure_kind, kind, "{name}");
+        }
     }
 
     #[test]
