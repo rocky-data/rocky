@@ -10224,9 +10224,11 @@ async fn run_batched_checks(
                         // is not folded into the lag (it used to read the
                         // distance ahead as the lag). Within the clock-skew
                         // tolerance it is fresh. Past it the lag cannot be
-                        // measured: the check is not evaluated, at Warning
+                        // measured: the check is not evaluated, marked Warning
                         // severity, as `rocky freshness` grades the same
-                        // reading `warn`. So it never fails the run.
+                        // reading `warn`. Like every not-evaluated check, the
+                        // check gate still counts it as an error under
+                        // `fail_on_error` (#2813).
                         let gap = now - ts;
                         let skew = chrono::TimeDelta::seconds(
                             rocky_core::source_freshness::FUTURE_SKEW_TOLERANCE_SECONDS,
@@ -52519,8 +52521,9 @@ threshold = 0
             ),
             "{result:?}"
         );
-        // An unevaluated check gates at Error whatever the configured
-        // severity, like every other `freshness_not_evaluated` (#1719).
+        // An unevaluated check is at Error whatever the configured
+        // severity (#1719). Only the future-timestamp case is marked
+        // Warning (#2621), and the gate still counts it as an error.
         assert_eq!(result.severity, rocky_core::tests::TestSeverity::Error);
     }
 
@@ -52991,8 +52994,8 @@ threshold = 0
 
     /// #2621: a lag is rounded up, never toward zero, and a newest
     /// timestamp in the future is not read as lag. Within the 60 s clock
-    /// skew it is fresh; past it the check is not evaluated, at Warning
-    /// severity, so it never fails the run.
+    /// skew it is fresh; past it the check is not evaluated, marked Warning
+    /// severity. The check gate still counts it as an error (#2813).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn freshness_rounds_up_and_does_not_read_the_future_as_lag() {
@@ -53040,8 +53043,9 @@ threshold = 0
 
     /// The other half of a NULL maximum: rows exist and none carries a
     /// timestamp. That is a check the engine could not evaluate, reported as
-    /// such with the count in its reason, at the Error severity every
-    /// unevaluated check keeps (#1930).
+    /// such with the count in its reason, at Error severity (#1930). Only a
+    /// newest timestamp more than 60 s in the future is marked Warning
+    /// instead (#2621); the check gate still counts that one as an error.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_batched_freshness_leg_that_answers_null_over_rows_is_not_evaluated() {
