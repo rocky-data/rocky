@@ -95,6 +95,8 @@ Read routes return the same payloads as the matching CLI command, byte for byte.
 | `GET /api/v1/lint` | `rocky lint --output json` | Never `--fix`. It lints every pipeline's models directory. File paths are relative to the project root. |
 | `GET /api/v1/doctor` | `rocky doctor --check-set local --output json` | It runs the local checks only (`config`, `state`, `state_schema`, `adapters`, `pipelines`, `state_sync`, `scheduler`, `spool`). It skips `state_rw`, `state_concurrency` and `auth`, so it makes no network or warehouse call. A store another process holds is a `warning` check, never a `503`. An invalid `rocky.toml` is a `critical` check in a `200` answer, with no quoted TOML source line and paths relative to the project root. It creates no file. When a pipeline has a `[schedule]`, the `scheduler` check tries `.rocky/tick.lock` for an instant, so a `rocky tick` at that moment skips once. |
 | `GET /api/v1/policy` | `rocky policy show --output json` | See below |
+| `GET /api/v1/freshness` (`?pipeline=`) | `rocky freshness --output json` | `checked_at`. Error messages are fixed text with no warehouse error, paths are cut, and it creates no DuckDB file. A busy state store is `503 engine_busy`. See below. |
+| `GET /api/v1/estimate` (`?model=`, `?pipeline=`) | `rocky estimate --output json` | `raw_explain` is empty, `explain_failed` reasons are fixed text, and it creates no DuckDB file. See below. |
 
 To approve a plan, use `POST /api/v1/jobs/approve` or `rocky review <plan-id> --approve`.
 
@@ -130,6 +132,17 @@ Four things bound it:
 A sample that cannot be masked is refused. Rocky can express a mask on Databricks, Snowflake and DuckDB. On any other adapter, a model with a masked column gets `422 masking_unsupported_by_adapter`. The `hash` strategy is an unsalted SHA-256, so a hashed email address or phone number is recoverable from its digest. Treat a hashed column as pseudonymous, not anonymous.
 
 Ad-hoc SQL is not exposed over HTTP. The CLI's `--sql-file` has no route.
+
+`GET /api/v1/estimate` runs `EXPLAIN` for the project's transformation models, or for `?model=` only. `GET /api/v1/freshness` runs one `MAX(..)` query per declared check. Both query the warehouse, so they carry the sample route's bounds:
+
+- **Consent, per request.** If any adapter the call can query is remote, send `X-Rocky-Allow-Warehouse: true`. Without it the answer is `403 warehouse_gated`, before any adapter is built. A DuckDB adapter needs none. For freshness this covers each pipeline's target adapter and each model's `adapter` override.
+- **A timeout, and one at a time.** The call gets 30 seconds. After that the answer is `504`, never a partial report. The statement in flight runs to its end and no further one starts. It keeps the one warehouse-read lane until then, shared with the sample route. A second call gets `503 engine_busy` with a `Retry-After`.
+- **No writes.** A DuckDB database is opened read-only. A database file that does not exist is `409 warehouse_unavailable` and is not created. An adapter with `[[adapter.<name>.attach]]` catalogs is refused the same way, because attaching can create files.
+- **No caching.** The response carries `Cache-Control: no-store`.
+
+`EXPLAIN` covers one statement. A model whose SQL is more than one statement, or cannot be parsed to prove it is one, is listed in `skipped` with the reason. On DuckDB, `EXPLAIN` covers the query over the model's input, not the write, because the database is read-only. A model whose `EXPLAIN` failed is listed in `explain_failed`. An empty `estimates` list always comes with a `message`.
+
+`GET /api/v1/runs` also carries each run's `test_results`: one entry per declared test the run evaluated, passes included. A run with no `test_results` has no test evidence. The record does not say why: `tests_on_run` was off, the built models declare no tests, or the run stopped first. The route replaces the `detail` of a test that could not run with fixed text.
 
 ### Mutations are jobs you poll
 

@@ -23,6 +23,7 @@
 //!
 //! Read-only: nothing is written to the warehouse or the state store.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -37,6 +38,8 @@ use rocky_core::source_freshness::{
 };
 use rocky_core::traits::WarehouseAdapter;
 
+use super::history::with_request_scoped_store;
+use super::warehouse_read::{ReadRouteError, WarehouseAccess};
 use crate::output::print_json;
 use crate::registry::AdapterRegistry;
 
@@ -145,7 +148,57 @@ pub async fn freshness_output(
     pipeline: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<FreshnessOutput> {
-    let pipelines: Vec<(&str, &TransformationPipelineConfig)> = match pipeline {
+    let pipelines = selected_pipelines(cfg, pipeline)?;
+    let registry = AdapterRegistry::from_config(cfg)?;
+    let plan = plan_freshness(cfg, config_path, pipelines)?;
+    check_planned(
+        plan,
+        &registry,
+        Builds::Store(state_path),
+        WarehouseAccess::Cli,
+        now,
+    )
+    .await
+}
+
+/// [`freshness_output`] for `GET /api/v1/freshness`.
+///
+/// The consent gate and the read-only adapters come from
+/// [`WarehouseAccess::registry`]. Every state-store fact is read under
+/// `store_access` and the store is dropped BEFORE the first warehouse query,
+/// so a slow warehouse never holds the state lock. A busy store is an error,
+/// not a `runtime_error` row.
+pub(crate) async fn freshness_read(
+    access: WarehouseAccess,
+    config_path: &Path,
+    state_path: &Path,
+    pipeline: Option<&str>,
+    store_access: std::sync::Arc<tokio::sync::Semaphore>,
+    now: DateTime<Utc>,
+) -> Result<FreshnessOutput> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let pipelines = selected_pipelines(&cfg, pipeline)
+        .map_err(|e| anyhow::Error::new(ReadRouteError::Pipeline(format!("{e:#}"))))?;
+    let plan = plan_freshness(&cfg, config_path, pipelines)?;
+    let registry = access.registry(&cfg, &plan.adapters(), "freshness")?;
+
+    let keys = plan.build_keys();
+    let builds = if keys.is_empty() {
+        LastBuilds::new()
+    } else {
+        let _held = store_access.acquire_owned().await?;
+        with_request_scoped_store(state_path, |store| Ok(read_last_builds(store, &keys)))?
+    };
+
+    check_planned(plan, &registry, Builds::Read(&builds), access, now).await
+}
+
+fn selected_pipelines<'a>(
+    cfg: &'a RockyConfig,
+    pipeline: Option<&'a str>,
+) -> Result<Vec<(&'a str, &'a TransformationPipelineConfig)>> {
+    let pipelines = match pipeline {
         Some(name) => {
             let p = cfg
                 .pipelines
@@ -170,35 +223,130 @@ pub async fn freshness_output(
             })
             .collect(),
     };
+    Ok(pipelines)
+}
 
-    let registry = AdapterRegistry::from_config(cfg)?;
-    let mut sources = Vec::new();
-    let mut models = Vec::new();
+/// What one pipeline has to check.
+struct PlannedPipeline {
+    name: String,
+    target_adapter: String,
+    sources: Vec<PipelineSourceConfig>,
+    models: Vec<rocky_core::models::Model>,
+}
+
+/// Every check the report will run, read from config and model files only.
+struct FreshnessPlan {
+    pipelines: Vec<PlannedPipeline>,
+    warnings: Vec<String>,
+}
+
+impl FreshnessPlan {
+    /// Every adapter a check can query: each pipeline's target adapter and
+    /// each model's `adapter` override.
+    fn adapters(&self) -> BTreeSet<String> {
+        self.pipelines
+            .iter()
+            .flat_map(|p| {
+                std::iter::once(p.target_adapter.clone())
+                    .chain(p.models.iter().filter_map(|m| m.config.adapter.clone()))
+            })
+            .collect()
+    }
+
+    /// `(model name, target table)` of every model, the two keys run history
+    /// can file its builds under.
+    fn build_keys(&self) -> Vec<(String, String)> {
+        self.pipelines
+            .iter()
+            .flat_map(|p| &p.models)
+            .map(|m| (m.config.name.clone(), m.config.target.table.clone()))
+            .collect()
+    }
+}
+
+fn plan_freshness(
+    cfg: &RockyConfig,
+    config_path: &Path,
+    pipelines: Vec<(&str, &TransformationPipelineConfig)>,
+) -> Result<FreshnessPlan> {
+    let mut planned = Vec::new();
     // Two pipelines may load the same models directory; check each model once.
     let mut seen_models: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut warnings = Vec::new();
-
     for (name, tx) in pipelines {
-        let declared: Vec<&PipelineSourceConfig> = tx
+        let sources: Vec<PipelineSourceConfig> = tx
             .sources
             .iter()
             .filter(|s| s.freshness.is_some())
+            .cloned()
             .collect();
-        let mut model_list = load_models_with_freshness(cfg, name, tx, config_path, &mut warnings)?;
-        model_list.retain(|m| seen_models.insert(m.config.name.clone()));
-        if declared.is_empty() && model_list.is_empty() {
+        let mut models = load_models_with_freshness(cfg, name, tx, config_path, &mut warnings)?;
+        models.retain(|m| seen_models.insert(m.config.name.clone()));
+        if sources.is_empty() && models.is_empty() {
             continue;
         }
+        planned.push(PlannedPipeline {
+            name: name.to_string(),
+            target_adapter: tx.target.adapter.clone(),
+            sources,
+            models,
+        });
+    }
+    Ok(FreshnessPlan {
+        pipelines: planned,
+        warnings,
+    })
+}
+
+/// A model's newest successful production build, or why history could not be
+/// read, keyed by model name.
+type LastBuilds = HashMap<String, std::result::Result<Option<DateTime<Utc>>, String>>;
+
+fn read_last_builds(
+    store: &rocky_core::state::StateStore,
+    keys: &[(String, String)],
+) -> LastBuilds {
+    keys.iter()
+        .map(|(model, table)| {
+            let last = last_production_build(store, [model.as_str(), table.as_str()])
+                .map_err(|e| format!("could not read run history: {e}"));
+            (model.clone(), last)
+        })
+        .collect()
+}
+
+/// Where [`check_planned`] gets a model's last build.
+enum Builds<'a> {
+    /// Open the state store when the first model needs it (the CLI).
+    Store(&'a Path),
+    /// Read before any warehouse query (the route).
+    Read(&'a LastBuilds),
+}
+
+async fn check_planned(
+    plan: FreshnessPlan,
+    registry: &AdapterRegistry,
+    builds: Builds<'_>,
+    access: WarehouseAccess,
+    now: DateTime<Utc>,
+) -> Result<FreshnessOutput> {
+    let mut sources = Vec::new();
+    let mut models = Vec::new();
+
+    for planned in &plan.pipelines {
+        let name = planned.name.as_str();
         let default_adapter = registry
-            .warehouse_adapter(&tx.target.adapter)
+            .warehouse_adapter(&planned.target_adapter)
             .with_context(|| format!("pipeline '{name}': no warehouse adapter"))?;
 
-        for source in declared {
-            sources.push(check_source(default_adapter.as_ref(), name, source, now).await);
+        for source in &planned.sources {
+            access.check_deadline()?;
+            sources.push(check_source(default_adapter.as_ref(), access, name, source, now).await);
         }
 
         let mut store: Option<rocky_core::state::StateStore> = None;
-        for model in &model_list {
+        for model in &planned.models {
+            access.check_deadline()?;
             let adapter = match &model.config.adapter {
                 Some(a) => match registry.warehouse_adapter(a) {
                     Ok(a) => a,
@@ -216,7 +364,7 @@ pub async fn freshness_output(
                 .expect("filtered to freshness");
             let mut fallback_reason = None;
             if freshness.time_column.is_some() {
-                let result = check_model_column(adapter.as_ref(), name, model, now).await;
+                let result = check_model_column(adapter.as_ref(), access, name, model, now).await;
                 // An inherited `time_column` (from `_defaults.toml` or the
                 // project `[freshness]`) was not written for this model and may
                 // not exist on it. Fall back to the last successful build
@@ -227,16 +375,31 @@ pub async fn freshness_output(
                 }
                 fallback_reason = result.message;
             }
-            if store.is_none() {
-                store = Some(
-                    rocky_core::state::StateStore::open_read_only_or_empty(state_path)
-                        .with_context(|| {
-                            format!("failed to open state store {}", state_path.display())
-                        })?,
-                );
-            }
-            let mut result =
-                check_model_state(store.as_ref().expect("opened above"), name, model, now);
+            let last_built = match &builds {
+                Builds::Read(read) => read
+                    .get(&model.config.name)
+                    .cloned()
+                    .unwrap_or_else(|| Err("run history was not read".to_string())),
+                Builds::Store(state_path) => {
+                    if store.is_none() {
+                        store = Some(
+                            rocky_core::state::StateStore::open_read_only_or_empty(state_path)
+                                .with_context(|| {
+                                    format!("failed to open state store {}", state_path.display())
+                                })?,
+                        );
+                    }
+                    last_production_build(
+                        store.as_ref().expect("opened above"),
+                        [
+                            model.config.name.as_str(),
+                            model.config.target.table.as_str(),
+                        ],
+                    )
+                    .map_err(|e| format!("could not read run history: {e}"))
+                }
+            };
+            let mut result = check_model_state(last_built, name, model, now);
             if let Some(reason) = fallback_reason {
                 result.message = Some(format!(
                     "inherited time_column could not be read ({reason}); measured the last \
@@ -269,7 +432,7 @@ pub async fn freshness_output(
         sources,
         models,
         summary,
-        warnings,
+        warnings: plan.warnings,
     })
 }
 
@@ -313,8 +476,11 @@ fn load_models_with_freshness(
 }
 
 /// One `MAX(field)` read: `(Some(max) | None for no rows, message)`.
+///
+/// A route gets fixed text in place of a warehouse error or a column value.
 async fn read_max(
     adapter: &dyn WarehouseAdapter,
+    access: WarehouseAccess,
     catalog: &str,
     schema: &str,
     table: &str,
@@ -325,7 +491,16 @@ async fn read_max(
     let result = adapter
         .execute_query(&sql)
         .await
-        .map_err(|e| format!("the freshness query failed: {e}"))?;
+        .map_err(|e| match access {
+            WarehouseAccess::Cli => format!("the freshness query failed: {e}"),
+            WarehouseAccess::ReadRoute { .. } if adapter.is_missing_object_error(&e) => {
+                "the freshness query failed: the table does not exist".to_string()
+            }
+            WarehouseAccess::ReadRoute { .. } => {
+                "the freshness query failed; run `rocky freshness` on the server for the error"
+                    .to_string()
+            }
+        })?;
     let row = result
         .rows
         .first()
@@ -348,7 +523,11 @@ async fn read_max(
     parse_loaded_at_cell_for(adapter.dialect().name(), &text)
         .map(|ts| (Some(ts), None))
         .ok_or_else(|| {
-            format!("could not read {text} as a timestamp; use a DATE or TIMESTAMP column")
+            let value = match access {
+                WarehouseAccess::Cli => text.as_str(),
+                WarehouseAccess::ReadRoute { .. } => "the newest value",
+            };
+            format!("could not read {value} as a timestamp; use a DATE or TIMESTAMP column")
         })
 }
 
@@ -362,6 +541,7 @@ fn qualified(catalog: &str, schema: &str, table: &str) -> String {
 
 async fn check_source(
     adapter: &dyn WarehouseAdapter,
+    access: WarehouseAccess,
     pipeline: &str,
     source: &PipelineSourceConfig,
     now: DateTime<Utc>,
@@ -401,6 +581,7 @@ async fn check_source(
     result.error_after_seconds = thresholds.error_after_seconds;
     let read = read_max(
         adapter,
+        access,
         &source.catalog,
         &source.schema,
         &source.table,
@@ -451,6 +632,7 @@ fn model_runtime_error(
 
 async fn check_model_column(
     adapter: &dyn WarehouseAdapter,
+    access: WarehouseAccess,
     pipeline: &str,
     model: &rocky_core::models::Model,
     now: DateTime<Utc>,
@@ -464,12 +646,14 @@ async fn check_model_column(
     let thresholds = freshness.thresholds();
     let t = &model.config.target;
     let mut result = model_shell(pipeline, model);
-    let read = read_max(adapter, &t.catalog, &t.schema, &t.table, column, None).await;
+    let read = read_max(
+        adapter, access, &t.catalog, &t.schema, &t.table, column, None,
+    )
+    .await;
     grade(&mut result, read, now, &thresholds);
     result
 }
 
-/// Without a `time_column`, a model is as fresh as its last successful build.
 /// The newest successful build of a model by a production run (#2201).
 ///
 /// Run history keys an execution by the model name, or by the target table
@@ -496,8 +680,9 @@ fn last_production_build<'a>(
     Ok(last_built)
 }
 
+/// Without a `time_column`, a model is as fresh as its last successful build.
 fn check_model_state(
-    store: &rocky_core::state::StateStore,
+    last_built: std::result::Result<Option<DateTime<Utc>>, String>,
     pipeline: &str,
     model: &rocky_core::models::Model,
     now: DateTime<Utc>,
@@ -511,16 +696,10 @@ fn check_model_state(
     let mut result = model_shell(pipeline, model);
     result.measured_from = "state_store".to_string();
     result.loaded_at_field = None;
-    let last_built = match last_production_build(
-        store,
-        [
-            model.config.name.as_str(),
-            model.config.target.table.as_str(),
-        ],
-    ) {
+    let last_built = match last_built {
         Ok(t) => t,
-        Err(e) => {
-            result.message = Some(format!("could not read run history: {e}"));
+        Err(message) => {
+            result.message = Some(message);
             return result;
         }
     };

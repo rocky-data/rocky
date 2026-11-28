@@ -196,15 +196,7 @@ fn prepare_preview(
 
     // Gate (before compile, so it can't fail on missing warehouse creds):
     // remote execution requires an explicit opt-in.
-    if !is_local_adapter(&adapter_type) && !allow_warehouse {
-        return Err(fail(
-            "warehouse_gated",
-            &format!(
-                "preview would execute against '{adapter_name}' ({adapter_type}); pass --allow-warehouse to run against a remote warehouse"
-            ),
-            Some(serde_json::json!({ "adapter_kind": adapter_type })),
-        ));
-    }
+    require_warehouse_consent("preview", &adapter_name, &adapter_type, allow_warehouse)?;
 
     let compiler_cfg = CompilerConfig {
         // Each model's warehouse, as `rocky compile` resolves it (#2342).
@@ -479,6 +471,26 @@ pub async fn compute_preview_rows(
     };
 
     Ok(out)
+}
+
+/// The consent gate every warehouse-executing read shares: a remote adapter
+/// needs `allow_warehouse`; a local DuckDB adapter needs nothing.
+pub(crate) fn require_warehouse_consent(
+    action: &str,
+    adapter_name: &str,
+    adapter_type: &str,
+    allow_warehouse: bool,
+) -> std::result::Result<(), PreviewFailure> {
+    if is_local_adapter(adapter_type) || allow_warehouse {
+        return Ok(());
+    }
+    Err(fail(
+        "warehouse_gated",
+        &format!(
+            "{action} would execute against '{adapter_name}' ({adapter_type}); pass --allow-warehouse to run against a remote warehouse"
+        ),
+        Some(serde_json::json!({ "adapter_kind": adapter_type })),
+    ))
 }
 
 /// DuckDB is the only "local" adapter — it needs no credentials and incurs no

@@ -113,6 +113,7 @@ mod tick;
 mod trace;
 mod validate;
 mod validate_migration;
+mod warehouse_read;
 mod watch;
 
 pub use adapter::{
@@ -184,11 +185,16 @@ pub use docs::{DocsFormat, run_docs};
 pub use doctor::{DoctorCheckSet, doctor};
 pub(crate) use doctor::{DoctorOutput, doctor_output};
 pub use emit_sql::{run_emit_sql, run_emit_sql_with_selection};
+pub(crate) use estimate::compute_estimate_as;
 pub use estimate::{EstimateReport, compute_estimate, run_estimate};
 pub use export_openapi::export_openapi;
 pub use export_schemas::{export_schemas, schemas_hash};
 pub use fmt::run_fmt;
+#[cfg(test)]
+pub(crate) use freshness::freshness_output;
+pub(crate) use freshness::freshness_read;
 pub use freshness::run_freshness;
+pub use freshness::{FreshnessCheckResult, FreshnessOutput, FreshnessSummary};
 pub use fulfill_api::propose_governed_run_plan;
 #[cfg(test)]
 pub(crate) use gc::gather_report as gather_gc_report;
@@ -266,6 +272,9 @@ pub use review::{
 };
 pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_schedule_spool};
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
+#[cfg(test)]
+pub(crate) use warehouse_read::{READ_HOLD_FOR_TEST, hold_read_for_test};
+pub(crate) use warehouse_read::{ReadRouteError, WarehouseAccess};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use declarative_test::TestBatching;

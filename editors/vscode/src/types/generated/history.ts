@@ -92,6 +92,10 @@ export interface RunHistoryRecord {
    * Best-available target catalog — the `catalog_template` for replication pipelines, the literal `target.catalog` for transformation/quality/snapshot/load.
    */
   target_catalog?: string | null;
+  /**
+   * The `[[tests]]` outcomes this run recorded, passes included (`[run] tests_on_run` / `rocky run --tests`). Omitted when the run recorded none. The record does not say why: the tests were off, the built models declare none, or the run stopped before them.
+   */
+  test_results?: RunTestResultOutput[];
   trigger: string;
   /**
    * Resolved caller identity (Unix `$USER` / Windows `$USERNAME`). `None` in CI / container contexts where no human caller is discernible.
@@ -139,6 +143,36 @@ export interface RecipeIdentityView {
    * The program **identity** key: blake3 (hex) of the canonical `ModelIr` JSON. Stable across environments and engine versions for the same program text. The value `rocky history --recipe <hash>` filters on.
    */
   recipe_hash?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * One `[[tests]]` outcome on [`RunOutput::test_results`].
+ */
+export interface RunTestResultOutput {
+  /**
+   * The column the test checks, when it checks one.
+   */
+  column?: string | null;
+  /**
+   * What the test found, or why it could not run.
+   */
+  detail?: string | null;
+  /**
+   * The model the test belongs to.
+   */
+  model: string;
+  /**
+   * `error` or `warning`. Only `error` can fail a model.
+   */
+  severity: string;
+  /**
+   * `pass`, `fail`, or `error` (the test query could not run).
+   */
+  status: string;
+  /**
+   * The test type (`not_null`, `unique`, `accepted_values`, ...).
+   */
+  test_type: string;
   [k: string]: unknown;
 }
 /**

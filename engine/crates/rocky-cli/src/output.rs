@@ -2114,6 +2114,19 @@ pub struct RunTestResultOutput {
     pub detail: Option<String>,
 }
 
+impl From<&rocky_core::state::RunTestRecord> for RunTestResultOutput {
+    fn from(r: &rocky_core::state::RunTestRecord) -> Self {
+        Self {
+            model: r.model.clone(),
+            test_type: r.test_type.clone(),
+            column: r.column.clone(),
+            severity: r.severity.clone(),
+            status: r.status.clone(),
+            detail: r.detail.clone(),
+        }
+    }
+}
+
 impl From<&RunTestResultOutput> for rocky_core::state::RunTestRecord {
     fn from(r: &RunTestResultOutput) -> Self {
         Self {
@@ -3914,6 +3927,13 @@ pub struct RunHistoryRecord {
     /// on schema-v5 rows that predate the audit trail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rocky_version: Option<String>,
+
+    /// The `[[tests]]` outcomes this run recorded, passes included
+    /// (`[run] tests_on_run` / `rocky run --tests`). Omitted when the run
+    /// recorded none. The record does not say why: the tests were off, the
+    /// built models declare none, or the run stopped before them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<RunTestResultOutput>,
 }
 
 /// Per-model execution record embedded in [`RunHistoryRecord`].

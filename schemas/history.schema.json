@@ -152,6 +152,13 @@
             "null"
           ]
         },
+        "test_results": {
+          "description": "The `[[tests]]` outcomes this run recorded, passes included (`[run] tests_on_run` / `rocky run --tests`). Omitted when the run recorded none. The record does not say why: the tests were off, the built models declare none, or the run stopped before them.",
+          "items": {
+            "$ref": "#/definitions/RunTestResultOutput"
+          },
+          "type": "array"
+        },
         "trigger": {
           "type": "string"
         },
@@ -247,6 +254,48 @@
           "type": "string"
         }
       ]
+    },
+    "RunTestResultOutput": {
+      "description": "One `[[tests]]` outcome on [`RunOutput::test_results`].",
+      "properties": {
+        "column": {
+          "description": "The column the test checks, when it checks one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "description": "What the test found, or why it could not run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The model the test belongs to.",
+          "type": "string"
+        },
+        "severity": {
+          "description": "`error` or `warning`. Only `error` can fail a model.",
+          "type": "string"
+        },
+        "status": {
+          "description": "`pass`, `fail`, or `error` (the test query could not run).",
+          "type": "string"
+        },
+        "test_type": {
+          "description": "The test type (`not_null`, `unique`, `accepted_values`, ...).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "severity",
+        "status",
+        "test_type"
+      ],
+      "type": "object"
     },
     "UnrecordedRunEvidence": {
       "description": "What left an [`UnrecordedRunRecord`] in the ledger (#1884).",

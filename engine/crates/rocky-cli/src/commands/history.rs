@@ -95,6 +95,7 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         target_catalog,
         hostname,
         rocky_version,
+        test_results: run.test_results.iter().map(Into::into).collect(),
     }
 }
 

@@ -244,6 +244,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/gc/derivable", get(gc_derivable))
         .route("/api/v1/lint", get(lint))
         .route("/api/v1/doctor", get(doctor_local))
+        .route("/api/v1/estimate", get(estimate))
+        .route("/api/v1/freshness", get(freshness))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -1059,6 +1061,8 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/gc/derivable",
         "GET /api/v1/lint",
         "GET /api/v1/doctor",
+        "GET /api/v1/estimate",
+        "GET /api/v1/freshness",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -1571,12 +1575,30 @@ async fn list_runs(
     // The redb open + scan are sync work that can sleep on the state flock
     // (see `StateStore::open_redb_with_retry`); move it off the async runtime.
     let state_path = state_path_for(&state);
-    let output = store_read(&state, move || {
+    let mut output = store_read(&state, move || {
         history_runs_output(&state_path, None, false)
     })
     .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    withhold_test_errors(&mut output);
     Ok(PrettyJson(output))
+}
+
+/// The detail `GET /api/v1/runs` serves for a test that could not run. The
+/// stored detail is the warehouse's error text, which quotes SQL, data values
+/// and local paths.
+const TEST_COULD_NOT_RUN: &str =
+    "the test could not run; run `rocky history --output json` on the server for the error";
+
+/// Replace the detail of every test that did not reach a verdict. A `pass` or
+/// `fail` detail is a count Rocky wrote and is kept; any other status is
+/// withheld.
+fn withhold_test_errors(output: &mut HistoryOutput) {
+    for test in output.runs.iter_mut().flat_map(|run| &mut run.test_results) {
+        if test.status != "pass" && test.status != "fail" && test.detail.is_some() {
+            test.detail = Some(TEST_COULD_NOT_RUN.to_string());
+        }
+    }
 }
 
 /// `GET /api/v1/models/:name/history` — canonical [`ModelHistoryOutput`].
@@ -2097,10 +2119,7 @@ async fn model_rows(
         ));
     }
 
-    let consented = headers
-        .get(CONSENT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let consented = warehouse_consent(&headers);
 
     // One sample at a time, refused immediately rather than queued: waiting
     // behind a call that may run the full timeout is worse for the caller than
@@ -2152,6 +2171,226 @@ async fn model_rows(
             Some("the warehouse may still be running the query; narrow the model or lower `limit`"),
         )),
     }
+}
+
+/// Whether the request carries the per-request warehouse consent: the literal
+/// `true`, case-insensitively.
+fn warehouse_consent(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONSENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// Run a warehouse read under the bounds of `GET /api/v1/models/{name}/rows`:
+/// one at a time across all three routes, the sample deadline, never a partial
+/// result, and `Cache-Control: no-store`.
+///
+/// The whole read runs on the blocking pool and the permit rides with it, so
+/// the deadline fires even during synchronous work, and a read the route
+/// stopped waiting for keeps the lane until it really ends (#1816).
+async fn bounded_warehouse_read<T, F, Fut>(
+    state: &ServerState,
+    timeout_code: &str,
+    work: F,
+) -> Result<Response, ApiError>
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    let Ok(permit) = Arc::clone(&state.warehouse_samples).try_acquire_owned() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_busy",
+            "another warehouse read is in flight",
+            Some("retry in a moment; one warehouse read runs at a time"),
+        )
+        .retry_after(5));
+    };
+    let timeout = state.sample_timeout();
+    let runtime = tokio::runtime::Handle::current();
+    let task = tokio::task::spawn_blocking(move || {
+        let _held = permit;
+        runtime.block_on(work())
+    });
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(Ok(output))) => {
+            let mut response = PrettyJson(output).into_response();
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok(response)
+        }
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(join)) => Err(map_join_err(&join)),
+        Err(_) => Err(ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            timeout_code,
+            format!("the read did not finish within {timeout:?}"),
+            Some("the warehouse may still be running the query; retry once it has finished"),
+        )),
+    }
+}
+
+/// One line of a read route's message: no absolute path, no registered secret.
+fn route_text(text: &str, state: &ServerState) -> String {
+    sanitize_job_text(&scrubbed_message(text, state))
+}
+
+/// Map an error of the estimate or freshness read, with the statuses and codes
+/// of [`sample_failure_to_api_error`].
+fn map_warehouse_read_err(error: anyhow::Error, state: &ServerState) -> ApiError {
+    use crate::commands::{PreviewFailure, ReadRouteError};
+    let failure = |kind: &str, message: String| {
+        sample_failure_to_api_error(PreviewFailure {
+            kind: kind.to_string(),
+            message,
+            extra: None,
+        })
+    };
+    let error = match error.downcast::<ReadRouteError>() {
+        Ok(ReadRouteError::Consent(refusal)) => return sample_failure_to_api_error(refusal),
+        Ok(ReadRouteError::Adapter(message)) => {
+            return failure("adapter_error", route_text(&message, state));
+        }
+        Ok(ReadRouteError::Pipeline(message)) => {
+            return failure("pipeline_error", route_text(&message, state));
+        }
+        // The route already answered `504`; nothing reads this.
+        Ok(deadline @ ReadRouteError::Deadline) => {
+            return ApiError::internal(deadline.to_string());
+        }
+        Err(other) => other,
+    };
+    if let Some(unavailable) = error.downcast_ref::<crate::registry::WarehouseUnavailable>() {
+        return ApiError::new(
+            StatusCode::CONFLICT,
+            "warehouse_unavailable",
+            route_text(&unavailable.0, state),
+            None,
+        );
+    }
+    if let Some(unknown) = error.downcast_ref::<crate::commands::ModelNotFound>() {
+        return failure("model_not_found", unknown.to_string());
+    }
+    if error
+        .downcast_ref::<rocky_core::state::StateError>()
+        .is_some()
+    {
+        return map_state_err(error, state.mutation_permit.running_job());
+    }
+    let message = format!("{error:#}");
+    if error
+        .downcast_ref::<rocky_core::config::ConfigError>()
+        .is_some()
+    {
+        return ApiError::config_invalid(&route_text(&message, state));
+    }
+    ApiError::internal(route_text(&without_config_values(&message), state))
+}
+
+/// Query string of `GET /api/v1/estimate`.
+#[derive(Debug, Deserialize)]
+struct EstimateQuery {
+    /// Estimate this model only.
+    model: Option<String>,
+    /// The pipeline whose target adapter runs the `EXPLAIN`.
+    pipeline: Option<String>,
+}
+
+/// `GET /api/v1/estimate` — canonical [`EstimateOutput`].
+///
+/// `rocky estimate --output json` with `raw_explain` empty and fixed text for
+/// a failed `EXPLAIN`. `EXPLAIN` receives one statement per model or none, and
+/// a DuckDB database is opened read-only, never created. Bounded by
+/// [`bounded_warehouse_read`].
+async fn estimate(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<EstimateQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let access = crate::commands::WarehouseAccess::ReadRoute {
+        allow_warehouse: warehouse_consent(&headers),
+        deadline: Some(std::time::Instant::now() + state.sample_timeout()),
+    };
+    let shared = Arc::clone(&state);
+    bounded_warehouse_read(&state, "estimate_timeout", move || async move {
+        #[cfg(test)]
+        crate::commands::hold_read_for_test(&config).await;
+        let mut output = crate::commands::compute_estimate_as(
+            access,
+            &config,
+            &shared.models_dir,
+            query.pipeline.as_deref(),
+            query.model.as_deref(),
+        )
+        .await
+        .map_err(|e| map_warehouse_read_err(e, &shared))?
+        .output;
+        for gap in output.skipped.iter_mut().chain(&mut output.explain_failed) {
+            gap.reason = route_text(&gap.reason, &shared);
+        }
+        Ok(output)
+    })
+    .await
+}
+
+/// Query string of `GET /api/v1/freshness`.
+#[derive(Debug, Deserialize)]
+struct FreshnessQuery {
+    /// Check this transformation pipeline only.
+    pipeline: Option<String>,
+}
+
+/// `GET /api/v1/freshness` — canonical [`FreshnessOutput`].
+///
+/// `rocky freshness --output json` with fixed text for a warehouse error. It
+/// reads run history and drops the state store before the first warehouse
+/// query, and opens DuckDB read-only. A failing check is a `200` report, not an
+/// HTTP error. Bounded by [`bounded_warehouse_read`].
+async fn freshness(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<FreshnessQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let access = crate::commands::WarehouseAccess::ReadRoute {
+        allow_warehouse: warehouse_consent(&headers),
+        deadline: Some(std::time::Instant::now() + state.sample_timeout()),
+    };
+    let shared = Arc::clone(&state);
+    bounded_warehouse_read(&state, "freshness_timeout", move || async move {
+        #[cfg(test)]
+        crate::commands::hold_read_for_test(&config).await;
+        let mut output = crate::commands::freshness_read(
+            access,
+            &config,
+            &state_path_for(&shared),
+            query.pipeline.as_deref(),
+            Arc::clone(&shared.store_access),
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|e| map_warehouse_read_err(e, &shared))?;
+        for check in output.sources.iter_mut().chain(&mut output.models) {
+            if let Some(message) = &mut check.message {
+                *message = route_text(message, &shared);
+            }
+        }
+        for warning in &mut output.warnings {
+            *warning = route_text(warning, &shared);
+        }
+        Ok(output)
+    })
+    .await
 }
 
 /// Map a `PreviewFailure` onto the API error surface, one `error_kind` at a
@@ -13770,6 +14009,444 @@ mod tests {
              the cache never evicts in-flight records, so caching it would strand \
              a slot for the life of the process"
         );
+    }
+
+    // --- Warehouse reads: estimate, freshness, and run test results ---
+
+    /// A project with a DuckDB warehouse OUTSIDE the project root, so a leaked
+    /// database path is not hidden by the project-root scrub.
+    #[cfg(feature = "duckdb")]
+    struct ReadProject {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(feature = "duckdb")]
+    const PLAN_LITERAL: &str = "literal-only-a-plan-would-quote";
+
+    #[cfg(feature = "duckdb")]
+    impl ReadProject {
+        /// `leaky` adds models whose warehouse errors name local paths and
+        /// values.
+        async fn new(leaky: bool) -> Self {
+            use rocky_core::traits::WarehouseAdapter;
+
+            let project = Self {
+                dir: tempfile::tempdir().unwrap(),
+            };
+            std::fs::create_dir_all(project.root().join("models")).unwrap();
+            std::fs::create_dir_all(project.outside()).unwrap();
+            std::fs::write(
+                project.config(),
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+                     [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                     [[pipeline.p.sources]]\ncatalog = \"warehouse\"\nschema = \"main\"\n\
+                     table = \"src\"\n\n\
+                     [pipeline.p.sources.freshness]\nloaded_at_field = \"ts\"\n\
+                     warn_after = \"1h\"\n\n\
+                     [pipeline.p.target]\n",
+                    project.database().display()
+                ),
+            )
+            .unwrap();
+            let from_source =
+                format!("SELECT ts FROM warehouse.main.src WHERE 'x' <> '{PLAN_LITERAL}'");
+            project.model("by_column", &from_source, "time_column = \"ts\"\n");
+            project.model("by_state", &from_source, "");
+            if leaky {
+                project.model("bad_column", &from_source, "time_column = \"nope\"\n");
+                project.model(
+                    "reads_a_file",
+                    &format!(
+                        "SELECT * FROM read_csv('{}')",
+                        project.outside().join("absent-input.csv").display()
+                    ),
+                    "",
+                );
+            }
+            {
+                let adapter =
+                    rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&project.database())
+                        .unwrap();
+                adapter
+                    .execute_statement(
+                        "CREATE TABLE src AS SELECT TIMESTAMP '2026-01-01 00:00:00' AS ts;
+                         CREATE TABLE by_column AS SELECT TIMESTAMP '2026-01-02 00:00:00' AS ts;
+                         CREATE TABLE bad_column AS SELECT 1 AS a;",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let store = rocky_core::state::StateStore::open(&project.state_path()).unwrap();
+            store.record_run(&tested_run("run-1", "by_state")).unwrap();
+            project
+        }
+
+        fn model(&self, name: &str, sql: &str, freshness: &str) {
+            let models = self.root().join("models");
+            std::fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n\n\
+                     [freshness]\nwarn_after = \"1d\"\n{freshness}"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn root(&self) -> PathBuf {
+            self.dir.path().join("project")
+        }
+
+        fn outside(&self) -> PathBuf {
+            self.dir.path().join("outside")
+        }
+
+        fn config(&self) -> PathBuf {
+            self.root().join("rocky.toml")
+        }
+
+        fn database(&self) -> PathBuf {
+            self.outside().join("warehouse.duckdb")
+        }
+
+        fn state_path(&self) -> PathBuf {
+            self.dir.path().join("state.redb")
+        }
+
+        fn server(&self) -> Arc<ServerState> {
+            pinned_server(
+                self.root().join("models"),
+                Some(self.config()),
+                &self.state_path(),
+            )
+        }
+
+        /// Every file beside the database, with its bytes.
+        fn warehouse_files(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            std::fs::read_dir(self.outside())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .map(|path| (path.clone(), std::fs::read(&path).unwrap()))
+                .collect()
+        }
+
+        /// `body` names neither this project's directory nor a temp path.
+        fn assert_no_local_path(&self, body: &str) {
+            let dir = self.dir.path().display().to_string();
+            let real = std::fs::canonicalize(self.dir.path())
+                .unwrap()
+                .display()
+                .to_string();
+            assert!(
+                !body.contains(&dir) && !body.contains(&real),
+                "a response names a local path"
+            );
+        }
+    }
+
+    /// A run that evaluated one test that passed and one that could not run.
+    fn tested_run(run_id: &str, model: &str) -> rocky_core::state::RunRecord {
+        let at = "2026-01-03T00:00:00Z";
+        serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "started_at": at,
+            "finished_at": at,
+            "status": "Success",
+            "models_executed": [{
+                "model_name": model,
+                "started_at": at,
+                "finished_at": at,
+                "duration_ms": 1,
+                "rows_affected": null,
+                "status": "success",
+                "sql_hash": "h",
+            }],
+            "trigger": "Manual",
+            "config_hash": "h",
+            "hostname": "test",
+            "rocky_version": "0.0.0-test",
+            "test_results": [
+                {"model": model, "test_type": "not_null", "column": "ts",
+                 "severity": "error", "status": "pass"},
+                {"model": model, "test_type": "unique", "column": "ts",
+                 "severity": "error", "status": "error",
+                 "detail": "execution error: value 'warehouse-row-value' in /srv/data/x.db"},
+            ],
+        }))
+        .expect("run record")
+    }
+
+    async fn get_text(url: String) -> (u16, Option<String>, String) {
+        let resp = reqwest::get(url).await.unwrap();
+        let status = resp.status().as_u16();
+        let cache = resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        (status, cache, resp.text().await.unwrap())
+    }
+
+    /// Both routes answer without changing the database or the state store,
+    /// are never cached, and carry no plan text, warehouse error or path.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn estimate_and_freshness_answer_without_writing_or_leaking() {
+        let project = ReadProject::new(true).await;
+        let database = project.warehouse_files();
+        let state = project.server();
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        let (status, cache, body) = get_text(format!("{base}/api/v1/estimate")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert!(body.contains("\"model_name\": \"by_column\""), "{body}");
+        assert!(body.contains("\"raw_explain\": \"\""), "{body}");
+        assert!(body.contains("\"explain_failed\""), "{body}");
+        assert!(
+            body.contains("EXPLAIN failed; run `rocky estimate` on the server"),
+            "{body}"
+        );
+        for leaked in [PLAN_LITERAL, "absent-input"] {
+            assert!(!body.contains(leaked), "estimate leaked a plan or error");
+        }
+        project.assert_no_local_path(&body);
+
+        let (status, _, one) = get_text(format!("{base}/api/v1/estimate?model=by_column")).await;
+        assert_eq!(status, 200, "{one}");
+        assert!(one.contains("\"total_models\": 1"), "{one}");
+
+        let (status, _, body) = get_text(format!("{base}/api/v1/estimate?model=ghost")).await;
+        assert_eq!(status, 404, "{body}");
+        assert!(body.contains("\"model_not_found\""), "{body}");
+
+        let (status, cache, body) = get_text(format!("{base}/api/v1/freshness")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert!(body.contains("\"runtime_error\": 1"), "{body}");
+        assert!(body.contains("the freshness query failed"), "{body}");
+        assert!(!body.contains("nope\\\" not found"), "{body}");
+        assert!(!body.contains("Binder Error"), "{body}");
+        project.assert_no_local_path(&body);
+
+        let (status, _, body) = get_text(format!("{base}/api/v1/freshness?pipeline=nope")).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("\"pipeline_error\""), "{body}");
+
+        assert!(
+            project.warehouse_files() == database,
+            "a read route changed or added a warehouse file"
+        );
+    }
+
+    /// The route's report is the CLI's report for the same instant, the state
+    /// fallback included.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn freshness_route_report_equals_the_cli_report() {
+        let project = ReadProject::new(false).await;
+        let now: chrono::DateTime<chrono::Utc> = "2026-01-04T00:00:00Z".parse().unwrap();
+        let route = crate::commands::freshness_read(
+            crate::commands::WarehouseAccess::ReadRoute {
+                allow_warehouse: false,
+                deadline: None,
+            },
+            &project.config(),
+            &project.state_path(),
+            None,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            now,
+        )
+        .await
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&project.config()).unwrap();
+        let cli = crate::commands::freshness_output(
+            &cfg,
+            &project.config(),
+            &project.state_path(),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reference_bytes(&route), reference_bytes(&cli));
+        assert_eq!(route.sources.len(), 1);
+        let by_state = route.models.iter().find(|m| m.name == "by_state").unwrap();
+        assert_eq!(by_state.measured_from, "state_store");
+        assert!(by_state.max_loaded_at.is_some());
+        let by_column = route.models.iter().find(|m| m.name == "by_column").unwrap();
+        assert_eq!(by_column.measured_from, "warehouse");
+        assert!(by_column.max_loaded_at.is_some());
+    }
+
+    /// An absent DuckDB file is `409` on both routes and is not created.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn warehouse_reads_never_create_the_database() {
+        let project = ReadProject::new(false).await;
+        std::fs::remove_file(project.database()).unwrap();
+        let base = spawn_router(project.server()).await;
+        for path in ["/api/v1/estimate", "/api/v1/freshness"] {
+            let (status, _, body) = get_text(format!("{base}{path}")).await;
+            assert_eq!(status, 409, "{path}: {body}");
+            assert!(body.contains("\"warehouse_unavailable\""), "{body}");
+            project.assert_no_local_path(&body);
+        }
+        assert!(!project.database().exists(), "a read created the database");
+    }
+
+    /// A busy state store is `503`, not a report of `runtime_error` rows.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn freshness_answers_503_on_a_busy_store() {
+        let project = ReadProject::new(false).await;
+        let state = project.server();
+        let base = spawn_router(Arc::clone(&state)).await;
+        let held = {
+            let _gate = store_gate(&state).await;
+            rocky_core::state::StateStore::open(&project.state_path()).unwrap()
+        };
+        let (status, _, body) = get_text(format!("{base}/api/v1/freshness")).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("\"engine_busy\""), "{body}");
+        drop(held);
+    }
+
+    /// A project whose `[adapter.far]` is remote and cannot be built: it has
+    /// no credentials. `403` therefore proves the consent gate ran first.
+    fn unbuildable_remote_project(dir: &std::path::Path, as_override: bool) -> (PathBuf, PathBuf) {
+        let root = dir.join("far");
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let config = root.join("rocky.toml");
+        let far = "type = \"databricks\"\nhost = \"example.invalid\"\n\
+                   http_path = \"/sql/1.0/warehouses/x\"\n";
+        let adapters = if as_override {
+            format!("[adapter.default]\ntype = \"duckdb\"\n\n[adapter.far]\n{far}")
+        } else {
+            format!("[adapter]\n{far}")
+        };
+        std::fs::write(
+            &config,
+            format!(
+                "{adapters}\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("models/m.sql"), "SELECT 1 AS a").unwrap();
+        let adapter = if as_override {
+            "adapter = \"far\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            root.join("models/m.toml"),
+            format!(
+                "{adapter}[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n\n\
+                 [freshness]\nwarn_after = \"1d\"\ntime_column = \"a\"\n"
+            ),
+        )
+        .unwrap();
+        (root, config)
+    }
+
+    /// Without the consent header a remote adapter is `403` before any adapter
+    /// is built, for the pipeline's adapter and for a model's override.
+    #[tokio::test]
+    async fn warehouse_reads_gate_a_remote_adapter_before_building_it() {
+        for (as_override, paths) in [
+            (false, &["/api/v1/estimate", "/api/v1/freshness"][..]),
+            (true, &["/api/v1/freshness"][..]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (root, config) = unbuildable_remote_project(dir.path(), as_override);
+            let state_path = dir.path().join("state.redb");
+            let base = spawn_router(pinned_server(
+                root.join("models"),
+                Some(config),
+                &state_path,
+            ))
+            .await;
+            let client = reqwest::Client::new();
+            for path in paths {
+                let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+                assert_eq!(resp.status(), 403, "{path} override={as_override}");
+                let err: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(err.code, "warehouse_gated", "{path}");
+
+                // With consent the gate passes and construction is what fails.
+                let resp = client
+                    .get(format!("{base}{path}"))
+                    .header("x-rocky-allow-warehouse", "true")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 502, "{path} override={as_override}");
+                let err: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(err.code, "adapter_error", "{path}: {}", err.message);
+            }
+        }
+    }
+
+    /// A read past the deadline is `504`, keeps the lane until it really ends,
+    /// and a second read meanwhile is `503`.
+    #[tokio::test]
+    async fn a_slow_warehouse_read_times_out_and_keeps_the_lane() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config) = unbuildable_remote_project(dir.path(), false);
+        let hold = Duration::from_millis(1500);
+        *crate::commands::READ_HOLD_FOR_TEST.lock().unwrap() = Some((config.clone(), hold));
+        let state_path = dir.path().join("state.redb");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        state.set_sample_timeout(Duration::from_millis(100));
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        for (path, code) in [
+            ("/api/v1/estimate", "estimate_timeout"),
+            ("/api/v1/freshness", "freshness_timeout"),
+        ] {
+            let started = Instant::now();
+            let (status, _, body) = get_text(format!("{base}{path}")).await;
+            assert_eq!(status, 504, "{path}: {body}");
+            assert!(body.contains(code), "{body}");
+            assert!(started.elapsed() < hold, "the deadline waited for the read");
+
+            let (status, _, body) = get_text(format!("{base}{path}")).await;
+            assert_eq!(status, 503, "{path}: {body}");
+            assert!(body.contains("\"engine_busy\""), "{body}");
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while state.warehouse_samples.available_permits() == 0 {
+                assert!(Instant::now() < deadline, "the permit never came back");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    /// `GET /api/v1/runs` carries each run's test results, and withholds the
+    /// warehouse text of a test that could not run.
+    #[tokio::test]
+    async fn runs_carry_test_results_without_warehouse_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        rocky_core::state::StateStore::open(&state_path)
+            .unwrap()
+            .record_run(&tested_run("run-1", "orders"))
+            .unwrap();
+        let state = pinned_server(dir.path().join("models"), None, &state_path);
+        let base = spawn_router(state).await;
+
+        let (status, _, body) = get_text(format!("{base}/api/v1/runs")).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"test_results\""), "{body}");
+        assert!(body.contains("\"status\": \"pass\""), "{body}");
+        assert!(body.contains(TEST_COULD_NOT_RUN), "{body}");
+        assert!(!body.contains("warehouse-row-value"), "a value leaked");
+        assert!(!body.contains("/srv/data"), "a path leaked");
     }
 
     // --- Route-table ↔ router anti-drift probes (FIX for silent drift) ---
