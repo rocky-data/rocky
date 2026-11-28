@@ -126,9 +126,15 @@ Rocky writes `swapping`, `cleaning` and `restoring` as intents before the step s
 
 **Where the record lives, and when it is durable.** The record is a state-store table. Each write is one redb commit, which returns only when durable. A step starts only after its intent is durable. A failed record write stops the run before the step.
 
-`publish = "staged"` refuses on remote state (`[state] backend` other than `local`). The remote state object changes only at the end of a run, so it cannot hold a durable intent.
+`publish = "staged"` refuses on remote state (`[state] backend` other than `local`). A remote state object is not written durably before each step, so it cannot hold a durable intent.
 
-**Who may act on a record.** A transformation run holds the state store's writer lock for its whole life. A second run, or a `rocky publish` command, cannot open the store while the first holds the lock. So only one process on the host can act on a record, and no stalled run can send a statement after another one has acted. One host and one local state path are what make this true.
+**Who may act on a record.** A transformation run holds the state store's writer lock for its whole life. A second run, or a `rocky publish` command, cannot open the store while the first holds the lock. So only one process on the host can act on a record. One host and one local state path are what make this true.
+
+The lock does not cover everything yet:
+
+- `rocky backfill` and `rocky branch promote` open the store read-only today and take no writer lock. v1 makes each take the writer lock before it checks for an open record, and refuse when the store cannot be read.
+- A second state file for the same targets (`[state] namespacing = "pipeline"`, `--state-namespace`, `--state-path`), or a second host with its own local state, has its own lock. Only the identity tag guards against it. v1 refuses `staged` when state namespacing is on.
+- A statement sent before a crash can still be running in the warehouse. `restore` refuses while the warehouse reports a statement of the record's run id still running, where the adapter can tell (a D2 spike item); elsewhere this is a residual of option A.
 
 **Table identity.** Working names carry no run id (decided below). So Rocky tags each stage with the run id, as a table property, or a comment where the warehouse has no properties. The tag moves with the table on rename. Before any drop or rename, `restore` reads it:
 
@@ -174,7 +180,7 @@ Tables created by this run (no target before):
 | # | Phase | Warehouse state | Action |
 |---|---|---|---|
 | 14 | `built` or `swapping` | no target, stage run or none | drop the stage if present |
-| 15 | `swapping` or `swapped`, not published | target run, no stage | restore: write `restoring`, rename the target to stage, drop the stage |
+| 15 | `swapping`, `swapped` (not published) or `restoring` | target run, no stage | restore: write `restoring` if not yet written, rename the target to stage, drop the stage |
 | 16 | `restoring` or `restored` | no target, stage run or none | drop the stage if present; nothing else |
 | 17 | published | target run | nothing to clean |
 
@@ -184,7 +190,9 @@ A one-statement swap (Snowflake `SWAP WITH`, ClickHouse `EXCHANGE TABLES`) leave
 
 | # | Phase | Warehouse state | Action |
 |---|---|---|---|
-| 18 | `swapping` | view old, or no view when created by this run | the step never ran: nothing |
+| 18 | `built` or `swapping` | view old, or no view when created by this run | the step never ran: nothing |
+| 18a | `restoring` | view run | the restore never ran: as row 19 |
+| 18b | `restored` | view old, or no view when created by this run | nothing |
 | 19 | `swapping` or `swapped`, not published | view run | restore: write `restoring`, re-create the old definition, or drop a view this run created |
 | 20 | `restoring` | view old, or no view when created by this run | the restore ran: it is `restored` |
 | 21 | published | view run | nothing |
@@ -265,6 +273,12 @@ Proposed in this revision, for Hugo to confirm. None changes the 2026-11-22 or 2
 - **First-time targets.** A restore drops a table this run created, because the pre-run state had none. The alternative is to keep it and report it.
 - **New v1 refusals.** `staged` refuses on remote state, on a view whose definition the adapter cannot read, and on any pipeline with an Iceberg target that one transaction cannot overwrite whole. Model-only runs, `rocky backfill` and `rocky branch promote` refuse while an open record lists their target.
 - **Command names.** `rocky publish restore` and `rocky publish abandon`.
+- **Leftovers after `abandon`.** `abandon` leaves stages and backups with no record. A later staged run must refuse on any leftover stage or backup of its targets, not let `StagedSwap::execute` restore a backup on its own.
+- **One transaction killed before `COMMIT`.** The record must mark entries `swapped` only after the warehouse commits, or `restore` must read a fully marked record whose targets are old as not published.
+- **An untagged stage.** A kill between creating a stage and tagging it leaves a table no row matches; it refuses today.
+- **Views by name.** A restore re-creates or drops a view by its production name. A view holds no data, so this is read as outside the "never drop by name" rule.
+- **Unpublished models downstream.** How `not_published` reaches the run JSON, the SDK and Dagster (which emits one result per materialization) is not settled.
+- **Run ids.** "Old" means "tag differs from the run id", so run ids must be unique for everything that tags the warehouse.
 - **Skip gate off.** Turning it off is the simple answer. Running the gate before the rewrite would keep it, at the cost of routing decided per run.
 
 ## Alternatives considered
