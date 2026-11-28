@@ -23748,6 +23748,13 @@
               "null"
             ]
           },
+          "test_results": {
+            "description": "The `[[tests]]` outcomes this run recorded, passes included (`[run] tests_on_run` / `rocky run --tests`). Omitted when the run recorded none. The record does not say why: the tests were off, the built models declare none, or the run stopped before them.",
+            "items": {
+              "$ref": "#/components/schemas/RunTestResultOutput"
+            },
+            "type": "array"
+          },
           "trigger": {
             "type": "string"
           },
@@ -29960,6 +29967,229 @@
         "summary": "Local health checks",
         "tags": [
           "project"
+        ]
+      }
+    },
+    "/api/v1/estimate": {
+      "get": {
+        "description": "Runs `EXPLAIN` for each transformation model: `rocky estimate --output json`, except that `raw_explain` is empty and an `explain_failed` reason is fixed text. A model whose SQL cannot be shown to be one statement is listed in `skipped`. A remote adapter requires the `X-Rocky-Allow-Warehouse: true` header. DuckDB is opened read-only and never created. One warehouse read runs at a time, bounded by 30 seconds. The response carries `Cache-Control: no-store`.",
+        "operationId": "getEstimate",
+        "parameters": [
+          {
+            "description": "Estimate this model only.",
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Which pipeline's adapter runs the `EXPLAIN`. Required only when the project declares more than one.",
+            "in": "query",
+            "name": "pipeline",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Allow-Warehouse",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EstimateOutput"
+                }
+              }
+            },
+            "description": "The estimates, with the models skipped or failed."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "An adapter the call can query is remote and the request carried no `X-Rocky-Allow-Warehouse: true` header."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The named model is not in the compiled graph."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A DuckDB adapter cannot be opened without writing: its file does not exist, or it attaches catalogs."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "`rocky.toml` or a model file could not be read."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "An adapter could not be built."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No config is loaded, the pipeline cannot be used, another warehouse read is in flight, or the state store is locked."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The read did not finish within 30 seconds. No partial result is returned."
+          }
+        },
+        "summary": "Dry-run cost estimate of the models",
+        "tags": [
+          "estate"
+        ]
+      }
+    },
+    "/api/v1/freshness": {
+      "get": {
+        "description": "Queries each declared freshness check: `rocky freshness --output json`, with fixed text in place of a warehouse error. A failing check is a `200` report. A remote adapter requires the `X-Rocky-Allow-Warehouse: true` header. DuckDB is opened read-only and never created, and the state store is released before the first warehouse query. One warehouse read runs at a time, bounded by 30 seconds. The response carries `Cache-Control: no-store`.",
+        "operationId": "getFreshness",
+        "parameters": [
+          {
+            "description": "Check this transformation pipeline only.",
+            "in": "query",
+            "name": "pipeline",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Allow-Warehouse",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreshnessOutput"
+                }
+              }
+            },
+            "description": "The freshness report."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "An adapter the call can query is remote and the request carried no `X-Rocky-Allow-Warehouse: true` header."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A DuckDB adapter cannot be opened without writing: its file does not exist, or it attaches catalogs."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "`rocky.toml` or a model file could not be read."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "An adapter could not be built."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No config is loaded, the pipeline cannot be used, another warehouse read is in flight, or the state store is locked."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The read did not finish within 30 seconds. No partial result is returned."
+          }
+        },
+        "summary": "Source and model freshness",
+        "tags": [
+          "estate"
         ]
       }
     },

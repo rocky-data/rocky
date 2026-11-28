@@ -15,6 +15,7 @@ use rocky_core::cost::WarehouseCostModel;
 use rocky_core::models;
 use rocky_core::traits::WarehouseAdapter;
 
+use super::warehouse_read::{ReadRouteError, WarehouseAccess};
 use crate::output::{EstimateGap, EstimateOutput, ModelEstimate, print_json};
 use crate::registry::{self, AdapterRegistry, WarehouseUnavailable};
 
@@ -52,11 +53,39 @@ pub async fn compute_estimate(
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
 ) -> Result<EstimateReport> {
+    compute_estimate_as(
+        WarehouseAccess::Cli,
+        config_path,
+        models_dir,
+        pipeline_name,
+        model_filter,
+    )
+    .await
+}
+
+/// [`compute_estimate`] for a named caller. A read route adds the consent
+/// gate for a remote adapter, answers an unopenable DuckDB database as an
+/// error, empties `raw_explain` (a plan quotes literals and paths, wrapped
+/// across lines where redaction cannot see them), returns no warehouse error
+/// text, and starts no statement after its deadline.
+pub(crate) async fn compute_estimate_as(
+    access: WarehouseAccess,
+    config_path: &Path,
+    models_dir: &Path,
+    pipeline_name: Option<&str>,
+    model_filter: Option<&str>,
+) -> Result<EstimateReport> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
     ))?;
-    let (_, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
+    let (_, pipeline) =
+        registry::resolve_pipeline(&rocky_cfg, pipeline_name).map_err(|e| match access {
+            WarehouseAccess::Cli => e,
+            WarehouseAccess::ReadRoute { .. } => {
+                anyhow::Error::new(ReadRouteError::Pipeline(format!("{e:#}")))
+            }
+        })?;
 
     let (pricing_source, pricing) = resolve_pricing(&rocky_cfg, pipeline.target_adapter());
 
@@ -91,8 +120,13 @@ pub async fn compute_estimate(
     }
 
     let touched = std::collections::BTreeSet::from([pipeline.target_adapter().to_string()]);
-    let adapter_registry = match AdapterRegistry::from_config_read_only(&rocky_cfg, &touched) {
+    let built = match access {
+        WarehouseAccess::Cli => AdapterRegistry::from_config_read_only(&rocky_cfg, &touched),
+        WarehouseAccess::ReadRoute { .. } => access.registry(&rocky_cfg, &touched, "estimate"),
+    };
+    let adapter_registry = match built {
         Ok(registry) => registry,
+        Err(error) if access != WarehouseAccess::Cli => return Err(error),
         Err(error) => {
             let unavailable = error.downcast::<WarehouseUnavailable>()?;
             let mut output = EstimateOutput::empty("no model produced an estimate");
@@ -111,7 +145,14 @@ pub async fn compute_estimate(
             });
         }
     };
-    let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
+    let warehouse_adapter = adapter_registry
+        .warehouse_adapter(pipeline.target_adapter())
+        .map_err(|e| match access {
+            WarehouseAccess::Cli => e,
+            WarehouseAccess::ReadRoute { .. } => {
+                anyhow::Error::new(ReadRouteError::Adapter(format!("{e:#}")))
+            }
+        })?;
 
     let mut estimates = Vec::new();
     let mut skipped: Vec<EstimateGap> = Vec::new();
@@ -155,13 +196,25 @@ pub async fn compute_estimate(
             }
         };
 
+        access.check_deadline()?;
         match run_explain(&warehouse_adapter, &model.config.name, &sql, &pricing).await {
-            Ok(estimate) => estimates.push(estimate),
+            Ok(mut estimate) => {
+                if access != WarehouseAccess::Cli {
+                    estimate.raw_explain.clear();
+                }
+                estimates.push(estimate);
+            }
             Err(e) => {
                 debug!(model = %model.config.name, "explain failed: {e:#}");
+                let reason = match access {
+                    WarehouseAccess::Cli => format!("{e:#}"),
+                    WarehouseAccess::ReadRoute { .. } => {
+                        route_explain_failure(warehouse_adapter.as_ref(), &e)
+                    }
+                };
                 explain_failed.push(EstimateGap {
                     model_name: model.config.name.clone(),
-                    reason: format!("{e:#}"),
+                    reason,
                 });
             }
         }
@@ -349,6 +402,20 @@ fn single_explainable_statement(
         Err(
             e @ (SingleStatementError::Several(_) | SingleStatementError::AmbiguousSemicolon(_)),
         ) => Err(refused(e)),
+    }
+}
+
+/// The reason a read route reports for a failed `EXPLAIN`. Fixed text: a
+/// warehouse error quotes SQL, data values and local paths.
+fn route_explain_failure(adapter: &dyn WarehouseAdapter, error: &anyhow::Error) -> String {
+    let missing = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<rocky_core::traits::AdapterError>())
+        .any(|cause| adapter.is_missing_object_error(cause));
+    if missing {
+        "a referenced table does not exist; run the upstream models first".to_string()
+    } else {
+        "EXPLAIN failed; run `rocky estimate` on the server for the error".to_string()
     }
 }
 
@@ -965,5 +1032,27 @@ type = "some-future-warehouse"
         let report = project.estimate().await;
         assert_eq!(report.output.estimates.len(), 1, "{report:?}");
         drop(held);
+    }
+
+    /// A read route past its deadline returns no partial estimate, and a CLI
+    /// estimate has no deadline.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_read_route_past_its_deadline_starts_no_statement() {
+        let project = OneModel::new("SELECT 1 AS a", "type = \"full_refresh\"").await;
+        let access = WarehouseAccess::ReadRoute {
+            allow_warehouse: false,
+            deadline: Some(std::time::Instant::now()),
+        };
+        let error = compute_estimate_as(access, &project.config(), &project.models(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ReadRouteError>(),
+                Some(ReadRouteError::Deadline)
+            ),
+            "{error:#}"
+        );
     }
 }

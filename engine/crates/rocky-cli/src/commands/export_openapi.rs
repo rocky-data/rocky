@@ -1791,6 +1791,143 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/estimate",
+            operation_id: "getEstimate",
+            tag: "estate",
+            summary: "Dry-run cost estimate of the models",
+            description: "Runs `EXPLAIN` for each transformation model: `rocky estimate \
+                 --output json`, except that `raw_explain` is empty and an `explain_failed` \
+                 reason is fixed text. A model whose SQL cannot be shown to be one statement \
+                 is listed in `skipped`. A remote adapter requires the \
+                 `X-Rocky-Allow-Warehouse: true` header. DuckDB is opened read-only and \
+                 never created. One warehouse read runs at a time, bounded by 30 seconds. \
+                 The response carries `Cache-Control: no-store`.",
+            path_params: &[],
+            query_params: &[
+                QueryParam {
+                    name: "model",
+                    description: "Estimate this model only.",
+                    allowed: &[],
+                },
+                QueryParam {
+                    name: "pipeline",
+                    description: "Which pipeline's adapter runs the `EXPLAIN`. Required only \
+                         when the project declares more than one.",
+                    allowed: &[],
+                },
+            ],
+            header_params: &["X-Rocky-Allow-Warehouse"],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The estimates, with the models skipped or failed.",
+                    body: Body::Component("EstimateOutput"),
+                },
+                Resp {
+                    status: "403",
+                    description: "An adapter the call can query is remote and the request \
+                         carried no `X-Rocky-Allow-Warehouse: true` header.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                MODEL_NOT_FOUND,
+                Resp {
+                    status: "409",
+                    description: "A DuckDB adapter cannot be opened without writing: its \
+                         file does not exist, or it attaches catalogs.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "500",
+                    description: "`rocky.toml` or a model file could not be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "502",
+                    description: "An adapter could not be built.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "503",
+                    description: "No config is loaded, the pipeline cannot be used, another \
+                         warehouse read is in flight, or the state store is locked.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "504",
+                    description: "The read did not finish within 30 seconds. No partial \
+                         result is returned.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/freshness",
+            operation_id: "getFreshness",
+            tag: "estate",
+            summary: "Source and model freshness",
+            description: "Queries each declared freshness check: `rocky freshness --output \
+                 json`, with fixed text in place of a warehouse error. A failing check is a \
+                 `200` report. A remote adapter requires the `X-Rocky-Allow-Warehouse: true` \
+                 header. DuckDB is opened read-only and never created, and the state store \
+                 is released before the first warehouse query. One warehouse read runs at a \
+                 time, bounded by 30 seconds. The response carries `Cache-Control: \
+                 no-store`.",
+            path_params: &[],
+            query_params: &[QueryParam {
+                name: "pipeline",
+                description: "Check this transformation pipeline only.",
+                allowed: &[],
+            }],
+            header_params: &["X-Rocky-Allow-Warehouse"],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The freshness report.",
+                    body: Body::Component("FreshnessOutput"),
+                },
+                Resp {
+                    status: "403",
+                    description: "An adapter the call can query is remote and the request \
+                         carried no `X-Rocky-Allow-Warehouse: true` header.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "409",
+                    description: "A DuckDB adapter cannot be opened without writing: its \
+                         file does not exist, or it attaches catalogs.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "500",
+                    description: "`rocky.toml` or a model file could not be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "502",
+                    description: "An adapter could not be built.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "503",
+                    description: "No config is loaded, the pipeline cannot be used, another \
+                         warehouse read is in flight, or the state store is locked.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "504",
+                    description: "The read did not finish within 30 seconds. No partial \
+                         result is returned.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/brief",
             operation_id: "getBrief",
             tag: "governor",
@@ -2392,6 +2529,8 @@ mod tests {
             "GcReportOutput",
             "LintOutput",
             "DoctorOutput",
+            "EstimateOutput",
+            "FreshnessOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -2474,6 +2613,8 @@ mod tests {
             ("/api/v1/gc/derivable", "GcReportOutput"),
             ("/api/v1/lint", "LintOutput"),
             ("/api/v1/doctor", "DoctorOutput"),
+            ("/api/v1/estimate", "EstimateOutput"),
+            ("/api/v1/freshness", "FreshnessOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

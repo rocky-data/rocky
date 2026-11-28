@@ -84,6 +84,37 @@ class RunScopeKind8(StrEnum):
     unrecorded = "unrecorded"
 
 
+class RunTestResultOutput(BaseModel):
+    """
+    One `[[tests]]` outcome on [`RunOutput::test_results`].
+    """
+
+    column: str | None = None
+    """
+    The column the test checks, when it checks one.
+    """
+    detail: str | None = None
+    """
+    What the test found, or why it could not run.
+    """
+    model: str
+    """
+    The model the test belongs to.
+    """
+    severity: str
+    """
+    `error` or `warning`. Only `error` can fail a model.
+    """
+    status: str
+    """
+    `pass`, `fail`, or `error` (the test query could not run).
+    """
+    test_type: str
+    """
+    The test type (`not_null`, `unique`, `accepted_values`, ...).
+    """
+
+
 class UnrecordedRunEvidence1(StrEnum):
     """
     A replication run's resume checkpoint header.
@@ -189,6 +220,10 @@ class RunHistoryRecord(BaseModel):
     target_catalog: str | None = None
     """
     Best-available target catalog — the `catalog_template` for replication pipelines, the literal `target.catalog` for transformation/quality/snapshot/load.
+    """
+    test_results: list[RunTestResultOutput] | None = None
+    """
+    The `[[tests]]` outcomes this run recorded, passes included (`[run] tests_on_run` / `rocky run --tests`). Omitted when the run recorded none. The record does not say why: the tests were off, the built models declare none, or the run stopped before them.
     """
     trigger: str
     triggering_identity: str | None = None
