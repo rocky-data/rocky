@@ -2597,3 +2597,134 @@ async fn a_load_job_deadline_cancels_the_job() {
         "{err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (h) #2774: a resend of a submit whose outcome is unknown runs one job
+// ---------------------------------------------------------------------------
+
+/// A fake `jobs.query` that runs a job the way BigQuery documents
+/// `requestId`: a request with the `requestId` and `query` of an earlier
+/// one is a duplicate, and BigQuery returns the earlier job instead of
+/// running the query again. Any other request runs it.
+///
+/// The first `lost_answers` submits run the job and then answer 503, as if
+/// the answer was lost after BigQuery accepted the job.
+struct FakeJobsQuery {
+    lost_answers: usize,
+    state: std::sync::Mutex<FakeJobsQueryState>,
+}
+
+#[derive(Default)]
+struct FakeJobsQueryState {
+    submits: usize,
+    runs: usize,
+    seen: std::collections::HashSet<(String, String)>,
+}
+
+impl FakeJobsQuery {
+    fn new(lost_answers: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            lost_answers,
+            state: std::sync::Mutex::new(FakeJobsQueryState::default()),
+        })
+    }
+
+    fn runs(&self) -> usize {
+        self.state.lock().unwrap().runs
+    }
+}
+
+/// A newtype, because `Respond` is foreign and so is `Arc`.
+struct FakeJobsQueryResponder(std::sync::Arc<FakeJobsQuery>);
+
+impl wiremock::Respond for FakeJobsQueryResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let query = body["query"].as_str().unwrap_or_default().to_string();
+        let mut state = self.0.state.lock().unwrap();
+        state.submits += 1;
+        let duplicate = match body["requestId"].as_str() {
+            Some(id) => !state.seen.insert((id.to_string(), query)),
+            None => false,
+        };
+        if !duplicate {
+            state.runs += 1;
+        }
+        if state.submits <= self.0.lost_answers {
+            return ResponseTemplate::new(503).set_body_string("backend error");
+        }
+        finished_job(&format!("job-run-{}", state.runs))
+    }
+}
+
+/// The `requestId` of each `jobs.query` submit, in order.
+async fn submit_request_ids(server: &MockServer) -> Vec<Option<String>> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == QUERIES_PATH)
+        .map(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            body["requestId"].as_str().map(str::to_string)
+        })
+        .collect()
+}
+
+/// #2774 acceptance: BigQuery accepts the job but the answer is lost (503)
+/// twice. Every resend carries the first `requestId`, so the job runs once.
+#[tokio::test]
+async fn a_resend_after_a_lost_submit_answer_runs_the_job_once() {
+    let server = MockServer::start().await;
+    let fake = FakeJobsQuery::new(2);
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(FakeJobsQueryResponder(fake.clone()))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let adapter = retrying_adapter(&server, 3);
+    adapter
+        .execute_statement("INSERT INTO ds.t VALUES (1)")
+        .await
+        .expect("the resend returns the job BigQuery already ran");
+
+    assert_eq!(fake.runs(), 1, "the job ran more than once");
+    let ids = submit_request_ids(&server).await;
+    assert_eq!(ids.len(), 3);
+    let first = ids[0].clone().expect("the first submit has a requestId");
+    assert!(first.len() <= 36, "BigQuery allows 36 characters: {first}");
+    assert!(ids.iter().all(|id| id.as_deref() == Some(first.as_str())));
+}
+
+/// Two statements are two requests, each with its own key. A shared key
+/// would make BigQuery return the first job for an identical second query.
+#[tokio::test]
+async fn each_statement_gets_its_own_request_id() {
+    let server = MockServer::start().await;
+    let fake = FakeJobsQuery::new(0);
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(FakeJobsQueryResponder(fake.clone()))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let adapter = retrying_adapter(&server, 2);
+    adapter
+        .execute_statement("INSERT INTO ds.t VALUES (1)")
+        .await
+        .unwrap();
+    adapter
+        .execute_statement("INSERT INTO ds.t VALUES (1)")
+        .await
+        .unwrap();
+
+    assert_eq!(fake.runs(), 2, "both statements must run");
+    let ids = submit_request_ids(&server).await;
+    assert_eq!(ids.len(), 2);
+    assert!(ids[0].is_some());
+    assert_ne!(ids[0], ids[1]);
+}

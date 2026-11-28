@@ -17,6 +17,7 @@ use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::retry::compute_backoff;
 use rocky_core::statement_cancel::{
     ABANDON_CANCEL_BUDGET, AbandonCancel, InFlightStatements, StatementHandle,
+    new_submit_request_id,
 };
 use rocky_core::traits::AdapterError;
 use rocky_observe::events::{
@@ -385,8 +386,14 @@ impl SnowflakeConnector {
             });
         }
 
+        // One idempotency key per statement, kept across every resend of a
+        // submit whose outcome is unknown. Snowflake documents that such a
+        // resend does not run the statement again when the first copy
+        // already succeeded. A resend while the first copy still runs is
+        // not documented and not verified (#2774).
+        let mut submit = SubmitAttempt::first();
         for attempt in 0..=retry.max_retries {
-            match self.submit_and_wait_once(sql).await {
+            match self.submit_and_wait_once(sql, &submit).await {
                 Ok(resp) => {
                     if self.circuit_breaker.record_success() == TransitionOutcome::Recovered {
                         let evt = PipelineEvent::new("circuit_breaker_recovered")
@@ -460,6 +467,7 @@ impl SnowflakeConnector {
                             "transient error, retrying"
                         );
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        submit = submit.next(&err);
                         continue;
                     }
                     // Retry exhausted (or non-transient) — terminal failure.
@@ -480,7 +488,11 @@ impl SnowflakeConnector {
     ///                          deadline, or a poll error that re-polling
     ///                          did not fix ──▶ cancel (bounded) ──▶ Abandoned
     /// ```
-    async fn submit_and_wait_once(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+    async fn submit_and_wait_once(
+        &self,
+        sql: &str,
+        submit: &SubmitAttempt,
+    ) -> Result<StatementResponse, ConnectorError> {
         let deadline = tokio::time::Instant::now() + self.config.timeout;
         let token = self.auth.get_token().await?;
         let url = self.base_url();
@@ -546,6 +558,7 @@ impl SnowflakeConnector {
             // first. The statement can then be cancelled from its first
             // moment.
             .query(&[("async", "true")])
+            .query(&submit.query_params())
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
         let request = request.json(&body);
@@ -565,6 +578,9 @@ impl SnowflakeConnector {
         // No handle yet, so nothing to cancel. Snowflake may have accepted
         // the statement, so this deadline is not retried. A transport
         // timeout of the same POST (`Http`) still is: see `is_transient`.
+        // That resend carries the same `requestId` with `retry=true`
+        // (`SubmitAttempt`): safe when the first copy already succeeded, not
+        // verified while the first copy still runs (#2774).
         .map_err(|_| ConnectorError::Timeout {
             handle: "<not yet assigned>".to_string(),
             seconds: self.config.timeout.as_secs(),
@@ -747,6 +763,67 @@ impl SnowflakeConnector {
             .map_err(ConnectorError::Http)?;
 
         Ok(())
+    }
+}
+
+/// The idempotency key of one submit, and whether it is a resend.
+///
+/// ```text
+///   attempt 1: requestId=K                ──▶ 503 / lost answer (accepted?)
+///   attempt 2: requestId=K & retry=true   ──▶ first copy succeeded: not run
+///                                             again (documented); first copy
+///                                             still running: not verified
+///   statement failed (known outcome)      ──▶ next attempt: new key, no retry
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubmitAttempt {
+    request_id: String,
+    resend: bool,
+}
+
+impl SubmitAttempt {
+    /// The first submit of a statement: a new key, not a resend.
+    fn first() -> Self {
+        Self {
+            request_id: new_submit_request_id(),
+            resend: false,
+        }
+    }
+
+    /// The submit that follows a retryable failure `err` of this one.
+    ///
+    /// When the failure leaves the submit's outcome unknown (a 429, a 5xx,
+    /// a lost connection), Snowflake may have accepted the statement. The
+    /// next submit then carries the same key with `retry=true`. Snowflake
+    /// documents that this does not run the statement again when the first
+    /// copy already succeeded; a resend while the first copy still runs is
+    /// not verified. When the statement is known to have
+    /// failed, its outcome is known and it wrote nothing, so the next submit
+    /// is a new request with a new key.
+    fn next(self, err: &ConnectorError) -> Self {
+        match err {
+            ConnectorError::StatementFailed { .. } => Self::first(),
+            ConnectorError::ApiError { .. }
+            | ConnectorError::Http(_)
+            | ConnectorError::Auth(_)
+            | ConnectorError::Timeout { .. }
+            | ConnectorError::Abandoned { .. }
+            | ConnectorError::CircuitBreakerOpen { .. }
+            | ConnectorError::RetryBudgetExhausted { .. } => Self {
+                request_id: self.request_id,
+                resend: true,
+            },
+        }
+    }
+
+    /// The query parameters that carry the key: `requestId`, plus
+    /// `retry=true` on a resend.
+    fn query_params(&self) -> Vec<(&'static str, &str)> {
+        let mut params = vec![("requestId", self.request_id.as_str())];
+        if self.resend {
+            params.push(("retry", "true"));
+        }
+        params
     }
 }
 
@@ -1073,6 +1150,67 @@ pub(crate) fn classify_connector_failure(err: &AdapterError) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2774: every retried submit failure that leaves the outcome unknown
+    /// keeps the key and becomes a resend; a statement known to have failed
+    /// gets a new key and is not a resend.
+    #[tokio::test]
+    async fn submit_attempt_keeps_the_key_unless_the_statement_is_known_to_have_failed() {
+        let first = SubmitAttempt::first();
+        assert!(!first.resend);
+        assert_eq!(
+            first.query_params(),
+            vec![("requestId", first.request_id.as_str())]
+        );
+
+        // A real transport error: nothing listens on port 9 of localhost.
+        let http = reqwest::Client::new()
+            .post("http://127.0.0.1:9/api/v2/statements")
+            .send()
+            .await
+            .expect_err("nothing listens on port 9");
+        let unknown_outcomes = [
+            ConnectorError::ApiError {
+                status: 401,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 429,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 502,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 503,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 504,
+                body: String::new(),
+            },
+            ConnectorError::Http(http),
+        ];
+        for err in &unknown_outcomes {
+            let next = first.clone().next(err);
+            assert_eq!(next.request_id, first.request_id, "{err}");
+            assert!(next.resend, "{err}");
+            assert_eq!(
+                next.query_params(),
+                vec![("requestId", first.request_id.as_str()), ("retry", "true")],
+                "{err}"
+            );
+        }
+
+        let failed = ConnectorError::StatementFailed {
+            handle: "h".into(),
+            message: "000625: Warehouse COMPUTE_WH is resuming".into(),
+        };
+        let next = first.clone().next(&failed);
+        assert_ne!(next.request_id, first.request_id);
+        assert!(!next.resend);
+    }
 
     #[test]
     fn error_debug_prints_a_resolved_value_as_its_name() {

@@ -15,6 +15,7 @@ use rocky_core::retry::compute_backoff;
 use rocky_core::retry_budget::RetryBudget;
 use rocky_core::statement_cancel::{
     ABANDON_CANCEL_BUDGET, AbandonCancel, InFlightStatements, StatementHandle,
+    new_submit_request_id,
 };
 use rocky_core::traits::{
     AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, ObjectKind, PkRange, QueryResult,
@@ -409,8 +410,20 @@ impl BigQueryAdapter {
     /// `NoJobReference`): a resubmit could run it twice (#2768). The run-level [`RetryBudget`] caps total retries so one
     /// rate-limited statement can't drain the whole run's quota.
     async fn run_query_with_retry(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
+        // One `requestId` for every submit of this statement. A retried
+        // error is always a failed submit (a 429, a 5xx, a lost connection),
+        // which BigQuery may still have accepted. With the same key it
+        // returns the job it already made instead of running a second copy
+        // (#2774). BigQuery keeps the key for 15 minutes only. The time to
+        // the last resend depends on `max_retries`, `initial_backoff_ms` and
+        // `max_backoff_ms`, plus the 120 s request timeout per attempt. With
+        // the defaults (3 retries, at most 30 s apart) the last resend goes
+        // out within about 10 minutes. Nothing caps these settings: a larger
+        // `max_retries`, or a large backoff even with 3 retries, can pass
+        // 15 minutes, and a resend after that may run a second copy.
+        let request_id = new_submit_request_id();
         for attempt in 0..=self.retry.max_retries {
-            match self.run_query_once(sql).await {
+            match self.run_query_once(sql, &request_id).await {
                 Ok(resp) => {
                     if attempt > 0 {
                         rocky_observe::metrics::METRICS.inc_retries_succeeded();
@@ -467,7 +480,11 @@ impl BigQueryAdapter {
     ///                                 ▼
     ///         deadline, not DONE, or no answer ──▶ jobs.cancel (bounded) ──▶ Abandoned
     /// ```
-    async fn run_query_once(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
+    async fn run_query_once(
+        &self,
+        sql: &str,
+        request_id: &str,
+    ) -> Result<BigQueryResponse, BigQueryError> {
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
         let token = self.auth.get_token(&self.client).await?;
         let url = format!(
@@ -485,6 +502,7 @@ impl BigQueryAdapter {
             format_options: DataFormatOptions {
                 use_int64_timestamp: true,
             },
+            request_id: request_id.to_string(),
         };
 
         debug!(
@@ -514,7 +532,9 @@ impl BigQueryAdapter {
         .await
         // No job id yet, so nothing to cancel. BigQuery may have accepted
         // the job, so this deadline is not retried. A transport timeout of
-        // the same POST (`Http`) still is: see `is_transient` (#2774).
+        // the same POST (`Http`) still is: see `is_transient`. That resend
+        // carries the same `requestId`, so it does not run a second copy
+        // (#2774).
         .map_err(|_| BigQueryError::Timeout {
             timeout_secs: self.timeout_secs,
         })??;
@@ -2081,6 +2101,9 @@ struct QueryRequest {
     timeout_ms: u64,
     max_results: u32,
     format_options: DataFormatOptions,
+    /// The idempotency key of this statement's submit, the same on every
+    /// resend, so BigQuery runs the statement once (#2774).
+    request_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2741,8 +2764,10 @@ mod tests {
             format_options: DataFormatOptions {
                 use_int64_timestamp: true,
             },
+            request_id: "k-1".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"requestId\":\"k-1\""));
         assert!(json.contains("useLegacySql"));
         assert!(json.contains("timeoutMs"));
         assert!(json.contains("\"formatOptions\":{\"useInt64Timestamp\":true}"));
