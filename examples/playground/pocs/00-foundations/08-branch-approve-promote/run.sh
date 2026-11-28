@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 08-branch-approve-promote — gated promotion of a branch into prod, plus the
-# soundness property that the signed approval is bound to your *model bytes*.
+# soundness property that the approval is bound to your *model bytes*.
 set -euo pipefail
 export ROCKY_SUPPRESS_DEPRECATION=1
 
@@ -13,7 +13,7 @@ restore_model() {
     cat > models/orders_clean.sql <<'SQL'
 -- A transformation model on top of the replicated orders. Its file bytes are
 -- folded into the branch_state_hash, so editing this SQL after an approval is
--- signed drifts the hash and invalidates the approval (the soundness property
+-- recorded drifts the hash and invalidates the approval (the soundness property
 -- this POC's step 8 demonstrates).
 SELECT
     order_id,
@@ -52,14 +52,14 @@ rocky -c rocky.toml branch promote fix_orders > expected/promote_blocked.json 2>
 echo "    (exit $?)"
 set -e
 
-echo "==> 6. Approve — signs an artifact bound to branch_state_hash"
+echo "==> 6. Approve — writes an approval artifact bound to branch_state_hash"
 echo "       (the hash covers the config AND the models/ source bytes)"
 rocky -c rocky.toml branch approve fix_orders \
     --message "verified row counts + orders_clean SQL; safe to ship" \
     > expected/branch_approve.json
 ls -1 .rocky/approvals/fix_orders/
 
-echo "==> 7. Tamper: edit models/orders_clean.sql AFTER the sign-off"
+echo "==> 7. Tamper: edit models/orders_clean.sql AFTER the approval"
 printf '  AND amount > 0   -- sneaked in after approval\n' >> models/orders_clean.sql
 
 echo "==> 8. Promote — the approval is now STALE (model bytes changed -> hash drift)"
@@ -82,6 +82,6 @@ WHERE table_catalog = 'poc' ORDER BY table_schema, table_name;
 SQL
 
 echo
-echo "POC complete: the gate refused promote without a signed approval (step 5),"
+echo "POC complete: the gate refused promote without an approval (step 5),"
 echo "rejected the approval once a model was edited under it (step 8), and shipped"
 echo "only after a re-approval matched the new branch_state_hash (step 9)."

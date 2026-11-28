@@ -2,7 +2,7 @@
 # Drives the Rust-native adapter skeleton end-to-end. No credentials.
 #
 # What this proves:
-# - The skeleton crate compiles cleanly against the published SDK trait
+# - The skeleton crate compiles cleanly against the SDK trait
 #   surface (`rocky_adapter_sdk::traits::WarehouseAdapter` + `SqlDialect`).
 # - All adapter unit tests pass against an in-memory mock backend.
 # - The example binary prints the SQL the adapter would have sent to a
@@ -18,7 +18,7 @@ fi
 
 mkdir -p ../expected
 
-echo "=== cargo check (skeleton compiles against published SDK) ==="
+echo "=== cargo check (skeleton compiles against the SDK trait) ==="
 cargo check --tests --examples
 
 echo

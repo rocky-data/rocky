@@ -241,6 +241,7 @@ Rocky does not always measure freshness:
 | The table is empty | No freshness check. `MAX()` is `NULL` over no rows. |
 | The table has rows but the timestamp column holds no value | A failed `freshness_not_evaluated` check. Its reason gives the row count. |
 | The query fails, or returns a cell Rocky cannot read as a timestamp or a count | The same failed `freshness_not_evaluated` check. |
+| The newest timestamp is more than 60 seconds in the future | A failed `freshness_not_evaluated` check at warning severity, so it does not fail the run. Up to 60 seconds ahead counts as fresh (clock skew). |
 | `prune_unchanged` is on, the adapter reports a source change-marker, and the source has not changed | No query. The table skips its data checks, freshness included. The check is absent from the JSON. [Schema drift](/concepts/schema-drift/) covers pruning. |
 
 `prune_unchanged` is off by default. An absent check looks the same as a table with no `freshness` configured: it is absent, not failing.

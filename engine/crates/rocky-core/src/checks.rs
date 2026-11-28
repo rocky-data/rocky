@@ -683,9 +683,11 @@ pub fn grade_freshness(lag_seconds: u64, levels: &FreshnessThresholds) -> CheckR
     check
 }
 
-/// A freshness check the engine could not evaluate: the `MAX(timestamp)`
-/// query failed, or its cell did not read as a timestamp. Always fails;
-/// `lag_seconds` is a placeholder.
+/// A freshness check the engine could not evaluate, with `reason` saying
+/// why: for example, the `MAX(timestamp)` query failed, its cell did not
+/// read as a timestamp, or the newest timestamp is in the future. Always
+/// fails, at Error severity unless the caller lowers it; `lag_seconds` is a
+/// placeholder.
 pub fn freshness_not_evaluated(threshold_seconds: u64, reason: impl Into<String>) -> CheckResult {
     CheckResult {
         name: "freshness".to_string(),

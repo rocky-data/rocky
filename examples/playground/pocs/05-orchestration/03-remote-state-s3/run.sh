@@ -27,8 +27,6 @@ if $HAVE_DOCKER; then
         echo "the S3 bucket was not created; see: docker compose logs bucket" >&2
         exit 1
     fi
-else
-    echo "docker not installed; showing config-only demo."
 fi
 
 # --- Seed the source database ---
@@ -46,6 +44,11 @@ export AWS_ALLOW_HTTP="true"
 
 rocky validate
 echo
+
+if ! $HAVE_DOCKER; then
+    echo "docker not installed; the config validated, but the pipeline runs need the S3 store. Skipping them."
+    exit 0
+fi
 
 # --- state_rw probe: confirm the S3 bucket is writable before any pipeline
 #     work (fails fast at cold start on IAM / reachability issues instead of

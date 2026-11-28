@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Adaptive concurrency — AIMD demo with 20 tables
+# Concurrency config demo — fixed concurrency = 16 over 20 tables
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,18 +13,14 @@ echo "=== Seeded 20 tables in raw__orders ==="
 rocky validate
 
 echo
-echo "=== AIMD adaptive concurrency ==="
-echo "  concurrency = 16       (starting ceiling)"
+echo "=== Fixed concurrency (no AIMD throttle in this POC) ==="
+echo "  concurrency = 16       (fixed limit; an integer turns the throttle off)"
 echo "  error_rate_abort_pct = 50  (abort if >50% tables fail)"
 echo "  table_retries = 2      (retry failed tables twice)"
 echo
-echo "  On warehouse rate-limits (429/transient errors):"
-echo "    → Multiplicative decrease: current / 2 (floor: min_concurrency)"
-echo "  On N consecutive successes:"
-echo "    → Additive increase: current + 1 (cap: concurrency)"
+echo "  The AIMD throttle only runs with concurrency = \"adaptive\" (the default)."
+echo "  See the README for how it halves on rate limits and ramps back up."
 echo
-echo "  This prevents overwhelming the warehouse while maximizing throughput."
-
 echo
 echo "=== Running 20 tables with concurrency=16 ==="
 rocky -c rocky.toml -o json run --filter source=orders > expected/run.json 2>&1
@@ -34,4 +30,4 @@ echo "    Tables processed: $PROCESSED"
 test "$PROCESSED" -eq 20
 
 echo
-echo "POC complete: adaptive concurrency config validated; 20 tables processed in parallel."
+echo "POC complete: fixed concurrency config validated; 20 tables processed in parallel."

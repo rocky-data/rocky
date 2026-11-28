@@ -143,6 +143,10 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::fulfill::FulfillStateRecord::new",
     "rocky_core::fulfill::ProductApprovalRecord",
     "rocky_core::state::StateStore",
+    // DELIBERATE addition (#2621): the freshness budget compares the lag
+    // rounded up, with the same helper `rocky freshness` uses, so a lag
+    // half a second past the budget is over it.
+    "rocky_core::source_freshness::whole_seconds_rounded_up",
     // The process start-time probe (#1493). DELIBERATE addition: it used
     // to live in this crate, and moved DOWN to rocky-core because
     // `rocky-cli` needs the same answer to tell whether a product
