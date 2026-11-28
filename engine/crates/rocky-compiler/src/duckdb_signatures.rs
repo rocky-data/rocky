@@ -295,6 +295,49 @@ mod tests {
         std::fs::write(path, generate(&conn)).unwrap();
     }
 
+    /// Every refusal in the file still holds with the `httpfs`, `iceberg`,
+    /// `ducklake` and `spatial` extensions loaded (#2752). An extension that
+    /// adds an overload to a checked name would turn its refusal false. It
+    /// needs the network to install the extensions, so it is ignored by
+    /// default. Run with `ROCKY_REPLAY_DUCKDB_EXTENSIONS=1 cargo test -p
+    /// rocky-compiler --lib extension_functions_keep_every_refusal --
+    /// --ignored` after a DuckDB bump.
+    #[test]
+    #[ignore = "installs DuckDB extensions from the network"]
+    fn extension_functions_keep_every_refusal() {
+        if std::env::var("ROCKY_REPLAY_DUCKDB_EXTENSIONS").as_deref() != Ok("1") {
+            return;
+        }
+        let conn = connection();
+        for ext in ["icu", "json", "parquet"] {
+            conn.execute_batch(&format!("LOAD {ext}"))
+                .unwrap_or_else(|e| panic!("the replay needs the {ext} extension: {e}"));
+        }
+        for ext in ["httpfs", "iceberg", "ducklake", "spatial"] {
+            conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext}"))
+                .unwrap_or_else(|e| panic!("the replay needs the {ext} extension: {e}"));
+        }
+        let sigs = &*SIGNATURES;
+        let mut accepted: Vec<String> = Vec::new();
+        for (name, k) in &sigs.arity {
+            if !refuses_every_count_probe(&conn, name, *k) {
+                accepted.push(format!("{name} with {k} arguments"));
+            }
+        }
+        for (name, n) in &sigs.above {
+            for k in n + 1..=n + 3 {
+                if !refuses_every_count_probe(&conn, name, k) {
+                    accepted.push(format!("{name} with {k} arguments (above)"));
+                }
+            }
+        }
+        accepted.sort();
+        assert!(
+            accepted.is_empty(),
+            "with the extensions loaded DuckDB accepts calls the file refuses: {accepted:?}"
+        );
+    }
+
     /// Every refusal in the file is a refusal of the bundled DuckDB, and the
     /// file was generated from the bundled version. The file is written with
     /// more extensions loaded than the bundled build has, so the bundled

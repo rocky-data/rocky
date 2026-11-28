@@ -306,6 +306,12 @@ pub const W068: &str = "W068";
 /// commands that run the seed (`rocky compile --with-seed`, `rocky ci`,
 /// `rocky test`) refuse the whole run instead, naming the seed file.
 pub const E073: &str = "E073";
+/// A model is refused because its SQL does not parse, or because it reads a
+/// model whose SQL does not parse, to any depth (#2618). Emitted only by
+/// `rocky compile` and `rocky lsp`, which compile the rest of the project.
+/// Every command that runs or plans models (`rocky run`, `rocky plan`, the
+/// policy plane) still refuses the whole project instead.
+pub const E074: &str = "E074";
 /// The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different
 /// numbers of columns (#2661). SQL requires the same number in every branch,
 /// so it is checked whatever the warehouse. Emitted by
@@ -317,6 +323,14 @@ pub const E071: &str = "E071";
 /// skip: a CTE body, a named `WINDOW` or any place not on the bound list in
 /// [`crate::set_operation`]. It never fails a compile on its own.
 pub const W071: &str = "W071";
+/// A column of a `UNION`, `INTERSECT` or `EXCEPT` whose branch types have no
+/// common supertype, such as `INTEGER` with `VARCHAR` (#2661). DuckDB casts
+/// the branches and runs the query; another warehouse may refuse it or fail
+/// on a value. A warning on every dialect. A branch of unknown type, or a
+/// set of numeric types, is not reported. Emitted by `rocky compile` from
+/// `typecheck.rs` for the model's own query body; a set operation inside a
+/// CTE or a subquery is not checked.
+pub const W072: &str = "W072";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
@@ -772,7 +786,7 @@ pub const W058: &str = "W058";
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W068, W071, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W068, W071, W072, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so
