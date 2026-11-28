@@ -56315,8 +56315,10 @@ timestamp_column = "ts"
     /// `table_retries` arm's decision (`classify_table_error`, then
     /// `auto_retry_indices`), then the retry it allows. No watermark
     /// recovery, as on an adapter without it or while the first copy still
-    /// runs. Returns the first attempt's error entry, the copy's `INSERT`
-    /// count and the target's row count.
+    /// runs. With recovery, the retry would read the new target `MAX` and add
+    /// no rows, so the `INSERT` count is the guard that holds either way.
+    /// Returns the first attempt's error entry, the copy's `INSERT` count and
+    /// the target's row count.
     #[cfg(feature = "duckdb")]
     async fn lost_answer_case(mode: LostAnswer) -> (TableError, u32, String) {
         use chrono::TimeZone;
@@ -56454,14 +56456,17 @@ timestamp_column = "ts"
     }
 
     /// #2800: which connector errors at a copy's write leave its outcome
-    /// unknown. A rejection, a 4xx (401 and 429 among them), a failed
-    /// connect and an open breaker are known not to have applied the write;
-    /// a 5xx and a spent retry budget are not.
+    /// unknown, for each of the four adapters. A rejection, a 4xx (401 and
+    /// 429 among them), a failed connect and an open breaker are known not to
+    /// have applied the write. A 5xx, a spent retry budget, a status that does
+    /// not parse and a result Rocky could not read are not.
     #[test]
     fn copy_write_outcome_is_unknown_only_without_a_definite_answer() {
+        use rocky_bigquery::connector::BigQueryError as BqE;
         use rocky_core::traits::AdapterError;
         use rocky_databricks::connector::ConnectorError as DbE;
         use rocky_snowflake::connector::ConnectorError as SnE;
+        use rocky_trino::connector::TrinoError as TrE;
 
         let table = TableRef {
             catalog: "c".into(),
@@ -56476,36 +56481,86 @@ timestamp_column = "ts"
             status,
             body: String::new(),
         };
-        for status in [500, 502, 503, 504] {
-            let class = at_write(AdapterError::new(sf_api(status)));
-            assert!(class.may_still_run, "{status}");
-            assert_eq!(class.failure_kind, FailureKind::Unknown, "{status}");
-        }
-        let budget = at_write(AdapterError::new(DbE::RetryBudgetExhausted { limit: 3 }));
-        assert!(budget.may_still_run);
-        assert_eq!(budget.failure_kind, FailureKind::Unknown);
+        let db_api = |status| DbE::ApiError {
+            status,
+            body: String::new(),
+        };
+        let bq_api = |status: &str| BqE::ApiError {
+            status: status.into(),
+            message: String::new(),
+        };
+        let trino_status = |status| TrE::HttpStatus {
+            status,
+            message: String::new(),
+        };
 
-        for (name, err, kind) in [
+        let unknown = [
+            ("snowflake 500", AdapterError::new(sf_api(500))),
+            ("snowflake 502", AdapterError::new(sf_api(502))),
+            ("snowflake 503", AdapterError::new(sf_api(503))),
+            ("snowflake 504", AdapterError::new(sf_api(504))),
             (
-                "429",
+                "snowflake budget",
+                AdapterError::new(SnE::RetryBudgetExhausted { limit: 3 }),
+            ),
+            ("databricks 503", AdapterError::new(db_api(503))),
+            (
+                "databricks budget",
+                AdapterError::new(DbE::RetryBudgetExhausted { limit: 3 }),
+            ),
+            (
+                "databricks unexpected state",
+                AdapterError::new(DbE::UnexpectedState {
+                    id: "s".into(),
+                    state: "WEIRD".into(),
+                }),
+            ),
+            (
+                "databricks no arrow chunks",
+                AdapterError::new(DbE::NoArrowChunks { id: "s".into() }),
+            ),
+            (
+                "databricks arrow",
+                AdapterError::new(DbE::Arrow("bad ipc".into())),
+            ),
+            (
+                "bigquery 503",
+                AdapterError::new(bq_api("503 Service Unavailable")),
+            ),
+            (
+                "bigquery unparsed status",
+                AdapterError::new(bq_api("incomplete query result")),
+            ),
+            (
+                "bigquery budget",
+                AdapterError::new(BqE::RetryBudgetExhausted { limit: 3 }),
+            ),
+            ("trino 503", AdapterError::new(trino_status(503))),
+            (
+                "trino malformed",
+                AdapterError::new(TrE::MalformedResponse("no id".into())),
+            ),
+        ];
+        for (name, err) in unknown {
+            let class = at_write(err);
+            assert!(class.may_still_run, "{name}");
+            assert_eq!(class.failure_kind, FailureKind::Unknown, "{name}");
+            assert_eq!(class.cooldown_seconds, None, "{name}");
+        }
+
+        let definite = [
+            (
+                "snowflake 429",
                 AdapterError::new(sf_api(429)),
                 FailureKind::QuotaExceeded,
             ),
             (
-                "401",
+                "snowflake 401",
                 AdapterError::new(sf_api(401)),
                 FailureKind::AuthFailed,
             ),
             (
-                "rejected",
-                AdapterError::new(DbE::StatementFailed {
-                    id: "s".into(),
-                    message: "syntax error".into(),
-                }),
-                FailureKind::QueryRejected,
-            ),
-            (
-                "breaker",
+                "snowflake breaker",
                 AdapterError::new(SnE::CircuitBreakerOpen {
                     consecutive_failures: 5,
                     cooldown_seconds: Some(30),
@@ -56513,11 +56568,63 @@ timestamp_column = "ts"
                 FailureKind::QuotaExceeded,
             ),
             (
+                "databricks rejected",
+                AdapterError::new(DbE::StatementFailed {
+                    id: "s".into(),
+                    message: "syntax error".into(),
+                }),
+                FailureKind::QueryRejected,
+            ),
+            (
+                "databricks 404",
+                AdapterError::new(db_api(404)),
+                FailureKind::NotFound,
+            ),
+            (
+                "databricks canceled",
+                AdapterError::new(DbE::Canceled { id: "s".into() }),
+                FailureKind::Unknown,
+            ),
+            (
+                "bigquery 429",
+                AdapterError::new(bq_api("429 Too Many Requests")),
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                "bigquery 404",
+                AdapterError::new(bq_api("404 Not Found")),
+                FailureKind::NotFound,
+            ),
+            (
+                "bigquery job error",
+                AdapterError::new(BqE::JobError {
+                    reason: "invalidQuery".into(),
+                    message: "syntax error".into(),
+                }),
+                FailureKind::QueryRejected,
+            ),
+            (
+                "trino 400",
+                AdapterError::new(trino_status(400)),
+                FailureKind::QueryRejected,
+            ),
+            (
+                "trino query failed",
+                AdapterError::new(TrE::QueryFailed {
+                    state: "FAILED".into(),
+                    error_code: 1,
+                    error_name: "SYNTAX_ERROR".into(),
+                    message: "syntax error".into(),
+                }),
+                FailureKind::QueryRejected,
+            ),
+            (
                 "no connector error",
                 AdapterError::msg("IO Error: Could not set lock on file"),
                 FailureKind::Unknown,
             ),
-        ] {
+        ];
+        for (name, err, kind) in definite {
             let class = at_write(err);
             assert!(!class.may_still_run, "{name}");
             assert_eq!(class.failure_kind, kind, "{name}");
