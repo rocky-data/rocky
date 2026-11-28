@@ -679,8 +679,12 @@ fn evaluate_artifact(
         });
     }
 
-    let age_seconds = (now - artifact.signed_at).num_seconds();
-    if age_seconds < 0 {
+    // Truncated toward zero for the future check, so a signing up to one
+    // second ahead (clock skew) is still honoured. Rounded up for the
+    // expiry check, so an approval half a second past its age limit is
+    // expired (#2621).
+    let age = now - artifact.signed_at;
+    if age.num_seconds() < 0 {
         return Err(RejectedApproval {
             approval_id: artifact.approval_id.clone(),
             reason: "expired".to_string(),
@@ -690,7 +694,8 @@ fn evaluate_artifact(
             ),
         });
     }
-    if (age_seconds as u64) > cfg.max_age_seconds {
+    let age_seconds = rocky_core::source_freshness::whole_seconds_rounded_up(age);
+    if age_seconds.unsigned_abs() > cfg.max_age_seconds {
         return Err(RejectedApproval {
             approval_id: artifact.approval_id.clone(),
             reason: "expired".to_string(),
@@ -2525,7 +2530,8 @@ pub(crate) fn base_compile_gate_action(
         }
         BaseCompileError::BadRef { .. }
         | BaseCompileError::DidNotCompile { .. }
-        | BaseCompileError::Unreadable(_) => BaseCompileGateAction::Refuse,
+        | BaseCompileError::Unreadable(_)
+        | BaseCompileError::PartialCloneObjectMissing(_) => BaseCompileGateAction::Refuse,
     }
 }
 
@@ -2547,7 +2553,8 @@ pub(crate) fn base_compile_gate_action_for(
         | BaseCompileError::BadRef { .. }
         | BaseCompileError::NoModelsAtBase(_)
         | BaseCompileError::DidNotCompile { .. }
-        | BaseCompileError::Unreadable(_) => base_compile_gate_action(error),
+        | BaseCompileError::Unreadable(_)
+        | BaseCompileError::PartialCloneObjectMissing(_) => base_compile_gate_action(error),
     }
 }
 
@@ -3427,6 +3434,44 @@ mod tests {
         };
         let rejected = evaluate_artifact(&artifact, "h", &cfg, Utc::now()).unwrap_err();
         assert_eq!(rejected.reason, "expired");
+    }
+
+    /// #2621: an approval half a second past `max_age_seconds` is expired.
+    /// The age used to be truncated to whole seconds, so it was honoured.
+    #[test]
+    fn evaluate_artifact_rejects_an_approval_just_past_its_age_limit() {
+        let now = Utc::now();
+        let signed_at = now - chrono::Duration::seconds(60) - chrono::Duration::milliseconds(500);
+        let mut artifact = ApprovalArtifact {
+            approval_id: "20260503T120000000000-aaaaaaaa".to_string(),
+            branch: "fix_price".to_string(),
+            branch_state_hash: "h".to_string(),
+            approver: ApproverIdentity {
+                email: "alice@example.com".to_string(),
+                name: None,
+                host: "host-1".to_string(),
+                source: ApproverSource::Local,
+            },
+            signed_at,
+            message: None,
+            signature: ApprovalSignature {
+                algorithm: SignatureAlgorithm::Blake3CanonicalJson,
+                digest: String::new(),
+            },
+        };
+        artifact.signature = sign_artifact(&artifact).unwrap();
+        let cfg = BranchApprovalConfig {
+            max_age_seconds: 60,
+            ..Default::default()
+        };
+        let rejected = evaluate_artifact(&artifact, "h", &cfg, now).unwrap_err();
+        assert_eq!(rejected.reason, "expired");
+
+        // Exactly at the limit is still honoured.
+        let at_limit = now - chrono::Duration::seconds(60);
+        artifact.signed_at = at_limit;
+        artifact.signature = sign_artifact(&artifact).unwrap();
+        assert!(evaluate_artifact(&artifact, "h", &cfg, now).is_ok());
     }
 
     /// When `allowed_signers` is set, only artifacts from listed emails

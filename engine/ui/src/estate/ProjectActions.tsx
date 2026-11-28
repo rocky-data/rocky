@@ -61,10 +61,11 @@ export function ProjectActions({
   /** Why Plan cannot help here ([`planUnavailable`]). */
   planDisabledReason?: string;
 }) {
-  const run = useJob("run", jobs, onDone);
-  const plan = useJob("plan", jobs, onDone);
-  const test = useJob("test", jobs, onDone);
-  const ci = useJob("ci", jobs, onDone);
+  const subject = model ?? "";
+  const run = useJob("run", jobs, onDone, { subject, label: `Run ${model ?? "the project"}` });
+  const plan = useJob("plan", jobs, onDone, { subject, label: `Plan a change to ${model ?? "the project"}` });
+  const test = useJob("test", jobs, onDone, { subject, label: `Test ${model ?? "the project"}` });
+  const ci = useJob("ci", jobs, onDone, { label: "CI" });
   const body = model === undefined ? {} : { model };
   const scope = model === undefined ? "the project" : model;
   const planned = plan.view.kind === "done" ? planIdOf(plan.view.job) : null;
@@ -72,7 +73,7 @@ export function ProjectActions({
     <div className="space-y-1">
       <div className="flex flex-wrap items-start gap-2">
         <WriteButton
-          label={model === undefined ? "Plan" : "Plan this model"}
+          label={model === undefined ? "Plan a change" : "Plan a change to this model"}
           busy={jobBusy(plan.view)}
           disabledReason={planDisabledReason}
           onClick={() => plan.start(body)}
@@ -92,10 +93,10 @@ export function ProjectActions({
           <WriteButton label="CI" busy={jobBusy(ci.view)} onClick={() => ci.start({})} />
         )}
       </div>
-      <JobLine label={`Plan ${scope}`} view={plan.view} cancel={plan.cancel} />
+      <JobLine label={`Plan a change to ${scope}`} view={plan.view} cancel={plan.cancel} />
       {planned !== null && (
         <p className="text-xs text-zinc-600 dark:text-zinc-300">
-          Plan written:{" "}
+          Change written:{" "}
           <a
             href={reviewPath(planned)}
             onClick={(event) => {

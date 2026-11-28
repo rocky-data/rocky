@@ -55,7 +55,7 @@ describe("QueuePanel", () => {
     const load = vi.fn(async () => QUEUE);
     render(<QueuePanel load={load} now={NOW} />);
 
-    await screen.findByText("2 waiting for review");
+    await screen.findByText("2 waiting for approval");
     expect(screen.getByText(/ranked by blast_radius/)).toBeTruthy();
 
     // The order on screen is the order the engine sent, never re-sorted here.
@@ -70,7 +70,7 @@ describe("QueuePanel", () => {
 
     // The excluded rows are explained, not hidden: "2 waiting" beside a ledger
     // holding five rows is otherwise a question the screen leaves open.
-    expect(screen.getByText(/3 further rows in the ledger/)).toBeTruthy();
+    expect(screen.getByText(/3 further rows in the audit log/)).toBeTruthy();
   });
 
   /// On a plan-level row `model` is a label — "backfill: 3 model(s)" — and
@@ -92,7 +92,7 @@ describe("QueuePanel", () => {
     }));
     render(<QueuePanel load={load} now={NOW} />);
 
-    await screen.findByText("2 waiting for review");
+    await screen.findByText("2 waiting for approval");
     const [ordinary, planLevel] = screen.getAllByRole("listitem");
     expect(within(planLevel).getByText("models")).toBeTruthy();
     expect(within(planLevel).getByText("orders, customers, payments")).toBeTruthy();
@@ -108,15 +108,15 @@ describe("QueuePanel", () => {
     }));
     render(<QueuePanel load={load} now={NOW} />);
 
-    await screen.findByText("Nothing is waiting for review");
-    expect(screen.getByText(/No escalation is outstanding/)).toBeTruthy();
-    expect(screen.queryByText(/further rows in the ledger/)).toBeNull();
+    await screen.findByText("Nothing is waiting for approval");
+    expect(screen.getByText(/No approval request is outstanding/)).toBeTruthy();
+    expect(screen.queryByText(/further rows in the audit log/)).toBeNull();
   });
 
   it("says what fills the queue: a command, its prerequisite, and who it is for", async () => {
     const load = vi.fn(async () => ({ ...QUEUE, total: 0, excluded_non_plan_rows: 0, pending: [] }));
     const { container } = render(<QueuePanel load={load} now={NOW} />);
-    await screen.findByText("Nothing is waiting for review");
+    await screen.findByText("Nothing is waiting for approval");
     const copy = container.textContent ?? "";
 
     // The command. Reproduced live before this copy was written: on a fresh

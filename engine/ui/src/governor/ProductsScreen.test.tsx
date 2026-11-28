@@ -167,7 +167,7 @@ describe("ProductsScreen", () => {
         loaders={loaders({ list: vi.fn(async () => ({ ...LIST, products: [], count: 0 })) })}
       />,
     );
-    await screen.findByText("This project declares no products");
+    await screen.findByText("This project declares no data products");
     const copy = container.textContent ?? "";
 
     // Both routes. Verified: `rocky product --help` lists verify, compile,
@@ -199,7 +199,7 @@ describe("ProductsScreen", () => {
   it("lists every product, including one whose spec file is gone", async () => {
     render(<ProductsScreen name={null} loaders={loaders()} />);
 
-    await screen.findByText("2 products");
+    await screen.findByText("2 data products");
     expect(screen.getByText("revenue_daily")).toBeTruthy();
     // A deleted spec still lists, with the loader's own reason — hiding it
     // would make a removed product look like one that never existed.
@@ -245,16 +245,16 @@ describe("ProductsScreen", () => {
     expect(screen.getAllByRole("row")).toHaveLength(many.length + 1);
   });
 
-  it("links a row that names a plan to that plan's review page", async () => {
+  it("links a row that names a change to that change's review page", async () => {
     render(<ProductsScreen name="revenue_daily" loaders={loaders()} />);
-    const link = await screen.findByRole("link", { name: /^plan / });
+    const link = await screen.findByRole("link", { name: /^change / });
     expect(link.getAttribute("href")).toBe(`/ui/review/${PLAN}`);
   });
 
   it("opens the product-scoped audit view instead of an unresolved custody subject (#2003)", async () => {
     render(<ProductsScreen name="revenue_daily" loaders={loaders()} />);
 
-    const link = await screen.findByRole("link", { name: "the ledger, scoped to this product" });
+    const link = await screen.findByRole("link", { name: "the audit log, scoped to this product" });
     expect(link).toHaveAttribute("href", "/ui/governor/audit/revenue_daily");
     expect(screen.queryByRole("link", { name: "product:revenue_daily" })).toBeNull();
 
@@ -349,7 +349,7 @@ describe("ProductsScreen", () => {
     // The name now rides in the ledger link's href rather than its text
     // (#2003), so encodeURIComponent is what has to hold — assert the escaped
     // form is there and the raw one is not.
-    const ledger = screen.getByRole("link", { name: /the ledger, scoped to this product/ });
+    const ledger = screen.getByRole("link", { name: /the audit log, scoped to this product/ });
     expect(ledger.getAttribute("href")).toBe(
       `/ui/governor/audit/${encodeURIComponent(hostile)}`,
     );

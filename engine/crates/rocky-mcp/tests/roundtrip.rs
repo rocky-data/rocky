@@ -9242,3 +9242,126 @@ async fn schedule_status_errors_on_an_unreadable_spool() {
 
     client.cancel().await.unwrap();
 }
+
+/// A Snowflake project whose `orders` model has one passing fixture `[[test]]`.
+/// Nothing connects to Snowflake: fixture tests run on in-memory DuckDB.
+fn write_snowflake_project_with_fixture_test(dir: &Path) {
+    std::fs::create_dir_all(dir.join("models")).unwrap();
+    std::fs::write(
+        dir.join("rocky.toml"),
+        "[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+         [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+         [pipeline.trans.target]\nadapter = \"snow\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("models").join("orders.sql"),
+        "SELECT 1 AS id, 'COMPLETE' AS status\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("models").join("orders.toml"),
+        "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+         [[test]]\nname = \"one_row\"\n\n\
+         [test.expect]\nrows = [ { id = 1, status = \"COMPLETE\" } ]\n",
+    )
+    .unwrap();
+}
+
+/// The `test` tool carries the dialect notice `rocky test` carries: a fixture
+/// test for a Snowflake model says it ran on DuckDB, and `strict_dialect`
+/// refuses it. A DuckDB project's result has neither field.
+#[tokio::test]
+async fn the_test_tool_discloses_a_non_duckdb_target_and_strict_refuses_it() {
+    let dir = TempDir::new().unwrap();
+    write_snowflake_project_with_fixture_test(dir.path());
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("test"))
+        .await
+        .expect("test call");
+    let sc = result.structured_content.expect("test result");
+    assert_eq!(sc["all_passed"], serde_json::json!(true), "{sc:?}");
+    let warning = sc["dialect_warning"].as_str().expect("warning present");
+    assert!(warning.contains("ran on DuckDB"), "{sc:?}");
+    assert!(warning.contains("Snowflake"), "{sc:?}");
+    let dialects = sc["unit_dialects"].as_array().expect("unit_dialects");
+    assert_eq!(dialects.len(), 1, "{sc:?}");
+    assert_eq!(dialects[0]["test"], serde_json::json!("one_row"), "{sc:?}");
+    assert_eq!(
+        dialects[0]["dialect"]["status"],
+        serde_json::json!("non_duckdb_target"),
+        "{sc:?}"
+    );
+    assert_eq!(
+        dialects[0]["dialect"]["ran_on_duckdb"],
+        serde_json::json!(true),
+        "{sc:?}"
+    );
+
+    let strict = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({ "strict_dialect": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("strict test call");
+    let sc = strict.structured_content.expect("strict result");
+    assert_eq!(sc["all_passed"], serde_json::json!(false), "{sc:?}");
+    assert_eq!(sc["unit_tests"]["failed"], serde_json::json!(1), "{sc:?}");
+    assert_eq!(
+        sc["unit_dialects"][0]["dialect"]["refused"],
+        serde_json::json!(true),
+        "{sc:?}"
+    );
+    assert_eq!(
+        sc["unit_dialects"][0]["dialect"]["ran_on_duckdb"],
+        serde_json::json!(false),
+        "{sc:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// A DuckDB project's `test` result is unchanged: no dialect keys, and
+/// `strict_dialect` does not fail it.
+#[tokio::test]
+async fn the_test_tool_adds_no_dialect_keys_for_a_duckdb_project() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let mut toml = std::fs::read_to_string(&sidecar).unwrap();
+    toml.push_str(
+        "\n[[test]]\nname = \"one_row\"\n\n\
+         [test.expect]\nrows = [ { id = 1, status = \"COMPLETE\" } ]\n",
+    );
+    std::fs::write(&sidecar, toml).unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    for args in [
+        serde_json::json!({}),
+        serde_json::json!({ "strict_dialect": true }),
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("test")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .expect("test call");
+        let sc = result.structured_content.expect("test result");
+        assert_eq!(sc["unit_tests"]["passed"], serde_json::json!(1), "{sc:?}");
+        assert_eq!(sc["all_passed"], serde_json::json!(true), "{sc:?}");
+        assert!(sc.get("dialect_warning").is_none(), "{sc:?}");
+        assert!(sc.get("unit_dialects").is_none(), "{sc:?}");
+    }
+
+    client.cancel().await.unwrap();
+}

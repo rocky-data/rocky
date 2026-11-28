@@ -101,17 +101,17 @@ export function ProductList({ load }: { load: () => Promise<ProductListOutput> }
   const products = useResource(load, [load]);
   if (products.kind !== "ready") {
     return (
-      <section aria-label="Products" className="space-y-3">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Products</h2>
-        <ResourceState resource={products} loadingLine="reading the products…" />
+      <section aria-label="Data products" className="space-y-3">
+        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Data products</h2>
+        <ResourceState resource={products} loadingLine="reading the data products…" />
       </section>
     );
   }
   const { products: rows, count } = products.value;
   return (
-    <section aria-label="Products" className="space-y-3">
+    <section aria-label="Data products" className="space-y-3">
       <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-        {count === 0 ? "This project declares no products" : `${count} products`}
+        {count === 0 ? "This project declares no data products" : `${count} ${count === 1 ? "data product" : "data products"}`}
       </h2>
       {rows.length === 0 ? (
         <p className="text-sm text-zinc-600 dark:text-zinc-300">
@@ -179,7 +179,7 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
               }}
               className="font-mono text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
             >
-              plan <Clip value={entry.plan_id} />
+              change <Clip value={entry.plan_id} />
             </a>
           )}
         </div>
@@ -234,7 +234,7 @@ function JournalTable({ rows }: { rows: ProductJournalEntry[] }) {
               when
             </th>
             <th scope="col" className="px-2 py-1.5 font-medium">
-              what happened
+              event
             </th>
             <th scope="col" className="px-2 py-1.5 font-medium">
               state
@@ -274,9 +274,9 @@ function Standing({ status }: { status: ProductStatusOutput }) {
   return (
     <section aria-label="Where it stands" className="space-y-2">
       <div className="grid gap-2 sm:grid-cols-3">
-        <StatusCard label="loop state" value={status.fulfill_state ?? "the loop has not run"} />
+        <StatusCard label="status" value={status.fulfill_state ?? "the loop has not run"} />
         <StatusCard
-          label="working spec"
+          label="current spec"
           value={
             status.spec_digest ? (
               <Clip value={status.spec_digest} />
@@ -292,7 +292,7 @@ function Standing({ status }: { status: ProductStatusOutput }) {
           value={status.approval ? "recorded" : "none"}
           sub={
             status.spec_matches_approval === false
-              ? "the working spec differs from the approved one"
+              ? "the current spec differs from the approved one"
               : undefined
           }
         />
@@ -356,7 +356,7 @@ export function ProductTimeline({
         <h2 className="font-mono text-sm font-semibold text-zinc-900 dark:text-zinc-100">{name}</h2>
         <span className="text-xs text-zinc-600 dark:text-zinc-300">
           decisions about its output model:{" "}
-          <AuditProductLink product={name} label="the ledger, scoped to this product" />
+          <AuditProductLink product={name} label="the audit log, scoped to this product" />
         </span>
       </div>
 
@@ -385,8 +385,8 @@ export function ProductTimeline({
         </section>
       )}
 
-      <section aria-label="What happened" className="space-y-2">
-        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">What happened</h3>
+      <section aria-label="History" className="space-y-2">
+        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">History</h3>
         {journal.kind !== "ready" ? (
           <ResourceState resource={journal} loadingLine="reading the journal…" />
         ) : journal.value.count === 0 ? (

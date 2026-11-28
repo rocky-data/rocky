@@ -20,7 +20,8 @@ export type JobKind =
   | "preview"
   | "promote"
   | "product_approve"
-  | "compact";
+  | "compact"
+  | "diff";
 /**
  * Lifecycle state of a job.
  */

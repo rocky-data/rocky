@@ -1,21 +1,11 @@
 # 03-fivetran-discover — Fivetran metadata discovery
 
-> **Category:** 07-adapters
 > **Credentials:** `FIVETRAN_API_KEY` + `FIVETRAN_API_SECRET` + `FIVETRAN_DESTINATION_ID` (read-only)
 > **Runtime:** depends on Fivetran API
-> **Rocky features:** Fivetran source adapter, `rocky discover`
 
 ## What it shows
 
-`rocky discover` against the Fivetran source adapter: calls Fivetran's
-REST API to list connectors and their enabled tables, with no warehouse
-write. The API key only needs read access.
-
-## Why it's distinctive
-
-- **Discovery without execution** — find what data exists before writing
-  any pipeline code.
-- API-call-only POC: no warehouse adapter required, no SQL executed.
+`rocky discover` calls Fivetran's REST API to list connectors and their enabled tables. No SQL runs and no warehouse is written; the API key only needs read access.
 
 ## Run
 
@@ -28,15 +18,10 @@ export FIVETRAN_DESTINATION_ID="..."
 
 ## Expected output
 
-`run.sh` validates the config, then runs `rocky -c rocky.toml -o json discover`,
-writing the discovered connectors to `expected/discover.json` (gitignored) and
-printing a summary line:
+`run.sh` validates the config, runs `rocky -c rocky.toml -o json discover` into `expected/discover.json` (gitignored; a `sources` array, one entry per connector with its `tables`), and prints:
 
 ```
 POC complete: discovered <N> Fivetran connectors.
 ```
 
-`<N>` is the number of connectors reported for your `FIVETRAN_DESTINATION_ID`,
-so the exact count depends on your Fivetran account. `discover.json` follows the
-`rocky discover` JSON schema: a `sources` array with one entry per discovered
-connector, each listing its `tables`. No warehouse is written.
+`<N>` depends on your `FIVETRAN_DESTINATION_ID`.

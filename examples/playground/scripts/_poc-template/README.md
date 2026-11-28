@@ -7,24 +7,7 @@
 
 ## What it shows
 
-<One paragraph: what feature this POC demonstrates and what it produces.>
-
-## Why it's distinctive
-
-- <One bullet: what dbt can't do here, or what no other POC covers>
-- <Optional second bullet>
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        pipeline config
-├── run.sh            end-to-end demo
-├── models/           SQL / .rocky models + .toml sidecars
-├── contracts/        (if applicable)
-└── data/             seed.sql — sample data (≤1000 rows)
-```
+<1-3 sentences: the feature this POC shows and what it produces. Keep the README short.>
 
 ## Prerequisites
 
@@ -44,11 +27,9 @@
 <excerpted JSON or stdout — keep < 30 lines>
 ```
 
-## What happened
+## Limitations
 
-1. <Step 1 — what Rocky did>
-2. <Step 2>
-3. ...
+<Caveats a user needs. Delete this section if there are none.>
 
 ## Related
 

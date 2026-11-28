@@ -8,17 +8,9 @@
 
 ## What it shows
 
-Multi-tenant schema patterns: Rocky parses source schema names like
-`src__acme__us_west__shopify` into structured components and routes them
-to per-tenant target catalogs/schemas. Components support a variadic
-`...` suffix for collecting regions.
-
-## Why it's distinctive
-
-- **Multi-tenant data platform pattern** that dbt struggles to express
-  declaratively.
-- The variadic `regions...` component matches one-or-more values without
-  needing per-tenant duplication.
+Rocky parses source schema names like `src__acme__us_west__shopify` into
+components and routes them to per-tenant target catalogs/schemas. The variadic
+`regions...` component matches one or more values.
 
 ## Run
 
@@ -34,13 +26,9 @@ export FIVETRAN_DESTINATION_ID="..."
 
 ## Expected output
 
-`run.sh` validates the config, then writes golden JSON to `expected/`:
-
-- `expected/discover.json` — the connectors and tables discovered via the
-  Fivetran adapter, with each source schema parsed into its
-  `{tenant}__{regions...}__{source}` components.
-- `expected/plan_acme.json` — the replication plan (dry-run) filtered to
-  `--filter tenant=acme`, showing how `acme` sources route to the
-  `acme_warehouse` catalog and `staging__{regions}__{source}` schemas.
+- `expected/discover.json`: Fivetran connectors and tables, each source schema
+  parsed into `{tenant}__{regions...}__{source}`.
+- `expected/plan_acme.json`: dry-run plan for `--filter tenant=acme`, routing to
+  the `acme_warehouse` catalog and `staging__{regions}__{source}` schemas.
 
 The final line prints `POC complete: discovered + planned for tenant=acme.`

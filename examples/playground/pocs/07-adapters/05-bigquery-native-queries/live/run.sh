@@ -7,14 +7,14 @@
 #
 # Required env:
 #   GCP_PROJECT_ID                  — GCP project to run against
-#   GOOGLE_APPLICATION_CREDENTIALS  — path to SA JSON key (or set BIGQUERY_TOKEN)
+#   GOOGLE_APPLICATION_CREDENTIALS  — path to SA JSON key
 # Optional:
 #   BQ_LOCATION                     — dataset location (default: EU)
 
 set -euo pipefail
 
 : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before running this live smoke test}"
-: "${GOOGLE_APPLICATION_CREDENTIALS:?Set GOOGLE_APPLICATION_CREDENTIALS or BIGQUERY_TOKEN}"
+: "${GOOGLE_APPLICATION_CREDENTIALS:?Set GOOGLE_APPLICATION_CREDENTIALS}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
@@ -34,17 +34,17 @@ trap drop_dataset EXIT
 
 echo "==> dataset: $GCP_PROJECT_ID.$DATASET (location: $LOCATION)"
 
-# Pre-create the target dataset. `run_transformation` in the engine
-# does not honor `auto_create_schemas` (only the replication path
-# does), so the dataset must exist before `CREATE TABLE` runs.
+# Pre-create the target dataset. Transformation runs honor
+# `auto_create_schemas`, but it defaults to false and live.rocky.toml does
+# not set it, so the dataset must exist before `CREATE TABLE` runs.
 bq --location="$LOCATION" --project_id="$GCP_PROJECT_ID" \
    mk --dataset "$DATASET"
 
 # Stage live.rocky.toml + model files into a temp dir with the
 # `__GCP_PROJECT__` placeholder substituted to the user's project.
-# Model-sidecar TOMLs and model SQL don't honor ${VAR} env-substitution
-# today (only the top-level rocky.toml does), so we materialize the
-# resolved files at runtime instead of committing the user's project ID.
+# Model-sidecar TOMLs do substitute ${VAR}, but model SQL bodies do not, so
+# we materialize the resolved files at runtime instead of committing the
+# user's project ID.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"; drop_dataset' EXIT
 cp live.rocky.toml "$STAGE/"

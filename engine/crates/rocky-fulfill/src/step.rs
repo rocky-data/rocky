@@ -349,6 +349,160 @@ pub async fn run_fulfill(
     }
 }
 
+/// Run one model's local tests and note what the verify bundle must say
+/// about them. `true` when the model executed and no unit test
+/// (`[[test]]`) failed or was refused.
+#[cfg(feature = "duckdb")]
+fn scoped_tests(
+    models_dir: &Path,
+    model: &str,
+    config_path: &Path,
+    detail: &mut Vec<String>,
+) -> bool {
+    match fulfill_api::test_output(models_dir, None, Some(model), config_path, false) {
+        Ok(output) => {
+            // A unit test that ran on DuckDB for a non-DuckDB target is a
+            // DuckDB pass, not a warehouse pass: say so in the bundle.
+            if let Some(summary) = &output.unit_tests
+                && let Some(warning) = fulfill_api::dialect_warning(&summary.results)
+            {
+                detail.push(warning);
+            }
+            if output.failed > 0 {
+                let rendered: Vec<String> = output
+                    .failures
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, f.error))
+                    .collect();
+                detail.push(format!("test failures: {}", rendered.join("; ")));
+            }
+            // `output.failed` counts model execution only. The fixture
+            // `[[test]]` run is in its own summary, so a failing or refused
+            // unit test has to be read from there, or it reads as green.
+            let unit_failures: Vec<String> = output
+                .unit_tests
+                .iter()
+                .flat_map(|summary| summary.results.iter())
+                .filter(|result| !result.passed)
+                .map(|result| {
+                    let reason = result.error.clone().unwrap_or_else(|| {
+                        format!("{} row(s) did not match `expect`", result.mismatches.len())
+                    });
+                    format!("{}::{}: {reason}", result.model, result.test)
+                })
+                .collect();
+            if !unit_failures.is_empty() {
+                detail.push(format!("unit test failures: {}", unit_failures.join("; ")));
+            }
+            output.failed == 0 && unit_failures.is_empty()
+        }
+        Err(err) => {
+            detail.push(format!("tests failed to run: {err:#}"));
+            false
+        }
+    }
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod unit_test_dialect_notice {
+    use super::scoped_tests;
+
+    fn project(rocky_toml: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 0 AS id, 0 AS amount").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"wh\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("flagged.sql"),
+            "SELECT id, amount FROM orders WHERE amount > 100",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("flagged.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[test]]\nname = \"keeps_high\"\n\n\
+             [[test.given]]\nref = \"orders\"\n\
+             rows = [ { id = 1, amount = 150 }, { id = 2, amount = 50 } ]\n\n\
+             [test.expect]\nrows = [ { id = 1, amount = 150 } ]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("rocky.toml"), rocky_toml).unwrap();
+        tmp
+    }
+
+    fn detail_of(tmp: &tempfile::TempDir) -> (bool, Vec<String>) {
+        let mut detail = Vec::new();
+        let green = scoped_tests(
+            &tmp.path().join("models"),
+            "flagged",
+            &tmp.path().join("rocky.toml"),
+            &mut detail,
+        );
+        (green, detail)
+    }
+
+    #[test]
+    fn a_non_duckdb_target_is_disclosed_in_the_bundle() {
+        let tmp = project(
+            "[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+             [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.trans.target]\nadapter = \"snow\"\n",
+        );
+        let (green, detail) = detail_of(&tmp);
+        assert!(green, "{detail:?}");
+        assert_eq!(detail.len(), 1, "{detail:?}");
+        assert!(detail[0].contains("ran on DuckDB"), "{detail:?}");
+        assert!(detail[0].contains("Snowflake"), "{detail:?}");
+    }
+
+    #[test]
+    fn a_duckdb_project_adds_no_notice() {
+        let tmp = project(
+            "[adapter]\ntype = \"duckdb\"\n\
+             [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.trans.target]\n",
+        );
+        let (green, detail) = detail_of(&tmp);
+        assert!(green, "{detail:?}");
+        assert!(detail.is_empty(), "{detail:?}");
+    }
+
+    /// #2778: the model executes, so `output.failed` is 0, but its
+    /// `[[test]]` expects a row the model never returns. The bundle must
+    /// be red and name the failing test.
+    #[test]
+    fn a_failing_unit_test_turns_the_bundle_red() {
+        let tmp = project(
+            "[adapter]\ntype = \"duckdb\"\n\
+             [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.trans.target]\n",
+        );
+        let sidecar = tmp.path().join("models").join("flagged.toml");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        let wrong = text.replace(
+            "rows = [ { id = 1, amount = 150 } ]",
+            "rows = [ { id = 2, amount = 50 } ]",
+        );
+        assert_ne!(text, wrong, "the fixture's expect line moved");
+        std::fs::write(&sidecar, wrong).unwrap();
+
+        let (green, detail) = detail_of(&tmp);
+        assert!(!green, "{detail:?}");
+        assert!(
+            detail
+                .iter()
+                .any(|d| d.starts_with("unit test failures: flagged::keeps_high")),
+            "{detail:?}"
+        );
+    }
+}
+
 struct Runner {
     root: PathBuf,
     config_path: PathBuf,
@@ -826,23 +980,7 @@ impl Runner {
 
     #[cfg(feature = "duckdb")]
     fn scoped_tests_green(&self, model: &str, detail: &mut Vec<String>) -> bool {
-        match fulfill_api::test_output(&self.models_dir, None, Some(model), &self.config_path) {
-            Ok(output) => {
-                if output.failed > 0 {
-                    let rendered: Vec<String> = output
-                        .failures
-                        .iter()
-                        .map(|f| format!("{}: {}", f.name, f.error))
-                        .collect();
-                    detail.push(format!("test failures: {}", rendered.join("; ")));
-                }
-                output.failed == 0
-            }
-            Err(err) => {
-                detail.push(format!("tests failed to run: {err:#}"));
-                false
-            }
-        }
+        scoped_tests(&self.models_dir, model, &self.config_path, detail)
     }
 
     #[cfg(not(feature = "duckdb"))]
@@ -1199,8 +1337,7 @@ impl Runner {
         // table; the adapter is resolved from whatever `rocky.toml`
         // names right now. Re-routing the config after the apply and
         // before the observation therefore certifies a different
-        // warehouse. That gap is open, reported, and Hugo's call — see
-        // the F3 review notes.
+        // warehouse. That gap is open, reported, and a maintainer's call.
         let bound = fulfill_api::LoadedCheckSet::bind(
             &self.models_dir,
             &model,
@@ -1547,12 +1684,15 @@ impl Runner {
                             Some(false)
                         }
                         Some(max) => {
-                            let lag = Utc::now() - max;
-                            let ok = lag.num_seconds() <= budget_seconds as i64;
+                            // Rounded up, so a lag half a second past
+                            // the budget is over it (#2621).
+                            let lag = rocky_core::source_freshness::whole_seconds_rounded_up(
+                                Utc::now() - max,
+                            );
+                            let ok = lag <= i64::try_from(budget_seconds).unwrap_or(i64::MAX);
                             detail.push(format!(
-                                "MAX({}) = {max}, lag {}s, budget {budget_seconds}s",
+                                "MAX({}) = {max}, lag {lag}s, budget {budget_seconds}s",
                                 freshness.time_column,
-                                lag.num_seconds()
                             ));
                             Some(ok)
                         }

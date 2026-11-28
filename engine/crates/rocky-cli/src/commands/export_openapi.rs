@@ -396,6 +396,12 @@ fn route_table() -> Vec<Route> {
              The holder's id is carried in `running_job_id`.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const DIFF_IN_PROGRESS: Resp = Resp {
+        status: "409",
+        description: "Another diff job is already running (`mutation_in_progress`). Its id is \
+             carried in `running_job_id`.",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const APPLY_REFUSED: Resp = Resp {
         status: "409",
         description: "Another run/apply job already holds the single-mutating-job permit \
@@ -1001,6 +1007,36 @@ fn route_table() -> Vec<Route> {
             auth_exempt: false,
         },
         Route {
+            method: "post",
+            path: "/api/v1/jobs/diff",
+            operation_id: "submitDiffJob",
+            tag: "jobs",
+            summary: "Submit a model diff job",
+            description: "Submit a `diff` job: `rocky ci-diff`, the structural model diff \
+                 between a git ref and `HEAD`, with the column lineage it moves. The result \
+                 is the `ci-diff` output. It is read-only: the job writes nothing itself, except \
+                 its job record, which the server keeps in its state store (by default \
+                 `models/.rocky-state.redb`, inside the project). It reads `data/seed.sql` \
+                 from `HEAD`, never from the working tree; a seed committed there runs as it \
+                 does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still \
+                 writes where it says. Its git commands set `GIT_OPTIONAL_LOCKS=0` and \
+                 `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job \
+                 with a message that names the partial clone, and nothing is fetched. It \
+                 takes no mutation \
+                 permit, so it never blocks a run. At most one diff runs at a time: \
+                 a second submission answers `409 mutation_in_progress` with the running \
+                 job's id. Body fields, both optional: `base` (a git ref, default `main`, \
+                 validated before the job starts) and `semantic` (also run the \
+                 breaking-change classifier). Any other field is `400 bad_request`. It diffs the \
+                 `HEAD` commit: uncommitted edits are not compared.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &["X-Rocky-Principal"],
+            request_body: Some("JobRequest"),
+            responses: &[JOB_ACCEPTED, BAD_REQUEST, DIFF_IN_PROGRESS],
+            auth_exempt: false,
+        },
+        Route {
             method: "get",
             path: "/api/v1/branches",
             operation_id: "listBranches",
@@ -1450,6 +1486,307 @@ fn route_table() -> Vec<Route> {
                 GOVERNOR_READ_FAILED,
                 STATE_NEEDS_MIGRATION,
             ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/compliance",
+            operation_id: "getCompliance",
+            tag: "governor",
+            summary: "Classification versus masking",
+            description: "The classification-versus-masking rollup for the project: every \
+                 classified column, whether each environment masks it, and the exceptions. \
+                 The same bytes as `rocky compliance --output json`. Reads `rocky.toml` and \
+                 the models directory only: no state store, no warehouse.",
+            path_params: &[],
+            query_params: &[
+                QueryParam {
+                    name: "env",
+                    description: "Evaluate this environment only. Default: every environment.",
+                    allowed: &[],
+                },
+                QueryParam {
+                    name: "exceptions_only",
+                    description: "List only the exceptions. Default: false.",
+                    allowed: &["true", "false"],
+                },
+            ],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The compliance rollup.",
+                    body: Body::Component("ComplianceOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` or the models directory could not \
+                         be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/runs/{id}/replay-check",
+            operation_id: "getRunReplayCheck",
+            tag: "history",
+            summary: "Replayability audit of one run",
+            description: "Whether each model of a recorded run could be re-executed from its \
+                 recording alone: provenance present, embedded IR parses, inputs resolvable, \
+                 plus a static non-determinism flag. The same bytes as `rocky replay <id> \
+                 --check --output json`. `id` may be `latest`. Nothing is executed or \
+                 written.",
+            path_params: &["id"],
+            query_params: &[QueryParam {
+                name: "model",
+                description: "Check this model of the run only.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The replayability verdicts.",
+                    body: Body::Component("ReplayCheckOutput"),
+                },
+                Resp {
+                    status: "404",
+                    description: "No run has this id (or `latest` and no run is recorded), \
+                         or the run did not execute `model`.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/recipes/{hash}/history",
+            operation_id: "getRecipeHistory",
+            tag: "history",
+            summary: "Every execution of one recipe",
+            description: "Every recorded execution of one exact program (a recipe hash) \
+                 across the 500 newest runs, newest run first. The same bytes as `rocky \
+                 history --recipe <hash> --output json`. An unknown hash is `200` with no \
+                 executions. Reads only.",
+            path_params: &["hash"],
+            query_params: &[QueryParam {
+                name: "since",
+                description: "Only runs that started at or after this: RFC 3339 or \
+                     `YYYY-MM-DD`.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The executions of the recipe.",
+                    body: Body::Component("RecipeHistoryOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/catalog",
+            operation_id: "getCatalog",
+            tag: "lineage",
+            summary: "Project-wide column lineage",
+            description: "The column-level lineage snapshot: every asset with its typed columns, every edge, and each asset's last successful run. The same bytes as `rocky catalog --output json`, except `generated_at` and `duration_ms`. Built from the project the server already compiled: it compiles nothing, queries no warehouse and writes none of the CLI's `.rocky/catalog` files. Run history is read from the state store; a busy store is `503`, never a catalog with unknown run fields.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The catalog.",
+                    body: Body::Component("CatalogOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                STATE_NEEDS_MIGRATION,
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` or the state store could not be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/packages",
+            operation_id: "getPackages",
+            tag: "project",
+            summary: "Vendored packages",
+            description: "The packages recorded in `packages.lock` and how each one's files compare with the lockfile hashes. The same bytes as `rocky package list --output json`, except `lockfile`, which is the lockfile's name relative to the project root. Reads only.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The vendored packages.",
+                    body: Body::Component("PackageListOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                Resp {
+                    status: "500",
+                    description: "The lockfile could not be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/hooks",
+            operation_id: "getHooks",
+            tag: "project",
+            summary: "Configured hooks",
+            description: "The shell hooks and the webhooks `rocky.toml` configures. The payload of `rocky hooks list --output json`, except that each command is cut to its program (`curl …`) and never shows its arguments. A webhook URL is cut to its scheme and host. With no `rocky.toml` the list is empty. Runs no hook and calls no endpoint.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The hooks.",
+                    body: Body::Component("HooksListOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` could not be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/retention",
+            operation_id: "getRetention",
+            tag: "project",
+            summary: "Declared retention per model",
+            description: "Each model's declared retention. The same bytes as `rocky retention-status --output json` without `--drift`. It never probes the warehouse.",
+            path_params: &[],
+            query_params: &[QueryParam {
+                name: "model",
+                description: "Report this model only.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The declared retention.",
+                    body: Body::Component("RetentionStatusOutput"),
+                },
+                Resp {
+                    status: "404",
+                    description: "`model` names no model of the project.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/gc/derivable",
+            operation_id: "getGcDerivable",
+            tag: "governor",
+            summary: "Derivable-artifact inventory",
+            description: "The derivability inventory: which content-addressed artifacts a recorded recipe could rebuild. The same bytes as `rocky gc --derivable --dry-run --output json`. Reads the artifact ledger and writes nothing: no plan file, no review row, no eviction.",
+            path_params: &[],
+            query_params: &[QueryParam {
+                name: "min_age_days",
+                description: "Minimum written-age in days. Default: 7.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The inventory.",
+                    body: Body::Component("GcReportOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/lint",
+            operation_id: "getLint",
+            tag: "project",
+            summary: "SQL style findings",
+            description: "The style findings for every `.sql` file under the models directory, with the `[lint]` section of `rocky.toml` applied. The same findings as `rocky lint --output json` without `--fix`, with file paths relative to the project root. Rewrites nothing.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The findings.",
+                    body: Body::Component("LintOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` or the models directory could not be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/doctor",
+            operation_id: "getDoctor",
+            tag: "project",
+            summary: "Local health checks",
+            description: "The local health checks: the same report as `rocky doctor \
+                 --check-set local --output json`. It covers `config`, `state`, \
+                 `state_schema`, `adapters`, `pipelines`, `state_sync`, `scheduler` and \
+                 `spool`. It skips `state_rw`, `state_concurrency` and `auth`, so it makes \
+                 no network call, no warehouse call and no write to a remote state \
+                 backend. A state store another process holds is a `warning` check, not an \
+                 error response. A critical check, such as an invalid `rocky.toml`, still \
+                 answers `200`: read `overall`. Read-only.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[Resp {
+                status: "200",
+                description: "The health report.",
+                body: Body::Component("DoctorOutput"),
+            }],
             auth_exempt: false,
         },
         Route {
@@ -2045,6 +2382,16 @@ mod tests {
             "AuditScorecardOutput",
             "AuditForOutput",
             "AuditOutput",
+            "ComplianceOutput",
+            "ReplayCheckOutput",
+            "RecipeHistoryOutput",
+            "CatalogOutput",
+            "PackageListOutput",
+            "HooksListOutput",
+            "RetentionStatusOutput",
+            "GcReportOutput",
+            "LintOutput",
+            "DoctorOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -2117,6 +2464,16 @@ mod tests {
             ("/api/v1/audit/scorecard", "AuditScorecardOutput"),
             ("/api/v1/custody/{subject}", "AuditForOutput"),
             ("/api/v1/audit", "AuditOutput"),
+            ("/api/v1/compliance", "ComplianceOutput"),
+            ("/api/v1/runs/{id}/replay-check", "ReplayCheckOutput"),
+            ("/api/v1/recipes/{hash}/history", "RecipeHistoryOutput"),
+            ("/api/v1/catalog", "CatalogOutput"),
+            ("/api/v1/packages", "PackageListOutput"),
+            ("/api/v1/hooks", "HooksListOutput"),
+            ("/api/v1/retention", "RetentionStatusOutput"),
+            ("/api/v1/gc/derivable", "GcReportOutput"),
+            ("/api/v1/lint", "LintOutput"),
+            ("/api/v1/doctor", "DoctorOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

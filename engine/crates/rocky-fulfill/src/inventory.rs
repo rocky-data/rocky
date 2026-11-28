@@ -92,6 +92,9 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // between them let the bundle report a deferred check the digest never
     // pinned (#1804). One route, one load, both answers.
     "rocky_cli::commands::fulfill_api::declarative_check_snapshot",
+    // The non-DuckDB target notice `rocky test` prints, reused so the verify
+    // bundle discloses a DuckDB-only unit-test pass (#2765). DELIBERATE.
+    "rocky_cli::commands::fulfill_api::dialect_warning",
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
     "rocky_cli::commands::fulfill_api::observe_declarative_checks",
     "rocky_cli::commands::fulfill_api::observe_max_time_column",
@@ -140,6 +143,10 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::fulfill::FulfillStateRecord::new",
     "rocky_core::fulfill::ProductApprovalRecord",
     "rocky_core::state::StateStore",
+    // DELIBERATE addition (#2621): the freshness budget compares the lag
+    // rounded up, with the same helper `rocky freshness` uses, so a lag
+    // half a second past the budget is over it.
+    "rocky_core::source_freshness::whole_seconds_rounded_up",
     // The process start-time probe (#1493). DELIBERATE addition: it used
     // to live in this crate, and moved DOWN to rocky-core because
     // `rocky-cli` needs the same answer to tell whether a product

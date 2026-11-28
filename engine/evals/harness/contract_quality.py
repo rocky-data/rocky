@@ -308,7 +308,7 @@ def is_key_omission(item: dict) -> bool:
     """A key column the draft left out of ``required`` / ``protected``.
 
     The contract then no longer stops that column being dropped, so this is
-    the one underclaim that counts against the pass line (Fable ruling 2026-11-13).
+    the one underclaim that counts against the pass line (a maintainer decision).
     A missing draft omits every key column too.
     """
     return (

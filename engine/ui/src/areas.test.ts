@@ -1,20 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { AREAS, areaFromPath } from "./areas";
+import { AREAS, AREA_GROUPS, areaFromPath } from "./areas";
 import { auditPath, custodyPath } from "./router";
 import { reviewPath } from "./review/paths";
 
 describe("AREAS", () => {
   it("names the design brief's eleven areas, in its order", () => {
     expect(AREAS.map((area) => area.label)).toEqual([
-      "Needs you",
+      "Inbox",
       "Projects",
-      "Estate",
+      "Project",
       "Runs",
       "Scheduler",
-      "Review",
+      "Changes",
       "Policies",
-      "Products",
-      "Governance",
+      "Data products",
+      "Oversight",
       "Agents & Clusters",
       "Settings",
     ]);
@@ -29,6 +29,16 @@ describe("AREAS", () => {
       products: "/ui/governor/products",
       governance: "/ui/governor/scorecard",
     });
+  });
+
+  it("groups only areas that open a screen, each once", () => {
+    const grouped = AREA_GROUPS.flatMap((group) => group.areas);
+    expect(AREA_GROUPS.map((group) => group.label)).toEqual(["Work", "Data", "Govern"]);
+    expect(new Set(grouped).size).toBe(grouped.length);
+    for (const id of grouped) expect(AREAS.find((area) => area.id === id)?.kind).toBe("link");
+    // Every link is in a group, so none is lost.
+    const links = AREAS.filter((area) => area.kind === "link").map((area) => area.id);
+    expect([...grouped].sort()).toEqual([...links].sort());
   });
 
   it("gives every disabled area a reason", () => {
@@ -46,13 +56,13 @@ describe("AREAS", () => {
 
 describe("areaFromPath", () => {
   it.each([
-    // The lane router's own fallbacks survive: the root and anything unknown are Estate.
+    // The lane router's own fallbacks survive: the root and anything unknown are Project.
     ["/ui/", "estate"],
     ["/ui", "estate"],
     ["/ui/nope", "estate"],
     ["/ui/estate", "estate"],
     ["/ui/review", "review"],
-    // A bare governor path opens the brief, so it is Needs you, not Governance.
+    // A bare governor path opens the brief, so it is Inbox, not Oversight.
     ["/ui/governor", "needs-you"],
     ["/ui/governor/brief", "needs-you"],
     // An unknown governor tab also opens the brief.

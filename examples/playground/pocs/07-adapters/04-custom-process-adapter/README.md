@@ -1,38 +1,13 @@
 # 04-custom-process-adapter — Custom warehouse adapter via stdio JSON-RPC
 
-> **Category:** 07-adapters
 > **Credentials:** none (Python stdlib only)
 > **Runtime:** < 5s
-> **Rocky features:** process adapter protocol, JSON-RPC over stdio, `rocky adapter list` / `rocky adapter info`, `rocky-<name>` PATH discovery
 
 ## What it shows
 
-A custom warehouse adapter implemented in **Python** that Rocky talks to over
-stdin/stdout using a JSON-RPC line protocol. Adapters can be written in any
-language as long as they implement the required methods (`initialize`,
-`execute_statement`, `execute_query`, `describe_table`, `table_exists`,
-`shutdown`). This POC ships an ~130-line Python adapter wrapping SQLite (stdlib
-`sqlite3`, zero deps), then **discovers it through the engine**: dropped on
-`$PATH` as an executable named `rocky-sqlite`, Rocky registers it as the adapter
-`sqlite`, following the same cargo-subcommand convention `cargo-foo` uses.
+A Python adapter wrapping SQLite that Rocky talks to over a stdin/stdout JSON-RPC line protocol. Any language works if it implements `initialize`, `execute_statement`, `execute_query`, `describe_table`, `table_exists` and `shutdown`.
 
-## Why it's distinctive
-
-- **Adapters in any language**, not just Rust: the adapter SDK is language-agnostic.
-- **Zero-config discovery.** No registry edit, no recompile: name your executable
-  `rocky-<x>`, put it on `$PATH`, and `rocky adapter list` finds it. `rocky
-  adapter info <x>` prints its manifest; `rocky test-adapter --adapter <x>` runs
-  the conformance suite against it.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml          DuckDB config so `rocky validate` is happy (the adapter is PATH-discovered, not configured here)
-├── adapter.py          ~130-line stdio JSON-RPC adapter wrapping SQLite
-└── run.sh              (1) exercises the adapter raw, (2) installs it as rocky-sqlite and discovers it
-```
+An executable named `rocky-<x>` on `$PATH` is registered as adapter `<x>`, with no registry edit or recompile. `rocky adapter info <x>` prints its manifest; `rocky test-adapter --adapter <x>` runs the conformance suite. `rocky.toml` is only a DuckDB config for `rocky validate`.
 
 ## Run
 
@@ -40,9 +15,7 @@ language as long as they implement the required methods (`initialize`,
 ./run.sh
 ```
 
-`run.sh` copies `adapter.py` to a throwaway temp dir as `rocky-sqlite`, prepends
-that dir to `$PATH`, and lets the engine find it; nothing is installed on your
-real `$PATH`.
+It exercises the adapter raw, then copies `adapter.py` to a temp dir as `rocky-sqlite` and prepends that dir to `$PATH`. Nothing is installed on your real `$PATH`.
 
 ## Expected output
 
@@ -67,5 +40,5 @@ capabilities:
 
 ## Related
 
-- Wire protocol reference + bundled reference adapter: `engine/examples/process-adapter-echo/` (`PROTOCOL.md` + `rocky-echo`)
-- Source: `engine/crates/rocky-adapter-sdk/src/process.rs` (`ProcessAdapter`), `engine/crates/rocky-cli` (`rocky adapter list/info`)
+- Wire protocol + reference adapter: `engine/examples/process-adapter-echo/` (`PROTOCOL.md` + `rocky-echo`)
+- Source: `engine/crates/rocky-adapter-sdk/src/process.rs` (`ProcessAdapter`), `engine/crates/rocky-cli`

@@ -62,6 +62,8 @@ async fn describe_table_happy_path() {
         .and(header("Authorization", "Bearer test-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "name": "hcv2_orders",
+            "table_type": "MANAGED",
+            "data_source_format": "DELTA",
             "columns": [
                 {"name": "id", "type_text": "bigint", "type_name": "LONG", "nullable": false},
                 {"name": "amount", "type_text": "decimal(10,2)", "type_name": "DECIMAL", "nullable": true}

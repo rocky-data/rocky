@@ -7,55 +7,19 @@
 
 ## What it shows
 
-A two-stage pipeline that takes a single Parquet file with rows for many
-accounts and routes each account's rows into its own DuckDB schema:
+A two-stage pipeline that splits one Parquet file of rows for three accounts into per-account DuckDB schemas:
 
-1. **Ingest** (`type = "load"`) reads `data/events.parquet` into a single
-   staging table at `main.events` (20 rows mixing 3 accounts: `acme`, `beta`,
-   `ceres`).
-2. **Route** (`type = "transformation"`, `depends_on = ["ingest"]`) runs three
-   SQL models (one per account) that filter `WHERE account_id = '<id>'` and
-   each materialize to its own schema: `account_acme.events`,
-   `account_beta.events`, `account_ceres.events`.
+1. **Ingest** (`type = "load"`) reads `data/events.parquet` (20 rows: `acme`, `beta`, `ceres`) into `main.events`.
+2. **Route** (`type = "transformation"`, `depends_on = ["ingest"]`) runs one SQL model per account, filtering `WHERE account_id = '<id>'` into `account_acme.events`, `account_beta.events`, `account_ceres.events`.
 
-The per-tenant target is set in each model's sidecar `.toml` (`target.schema =
-"account_<id>"`), not in `rocky.toml`. The transformation pipeline doesn't
-know or care how many tenants exist; it just runs every model under
-`models/`.
+Each target is set by `target.schema = "account_<id>"` in the model's sidecar, not in `rocky.toml`. Add tenants by adding `models/events_<id>.{sql,toml}` files (generate them from a tenant registry if the set is dynamic). `rocky dag` shows the connected graph.
 
-## Why it's distinctive
-
-- **One config, two pipelines, three outputs.** `pipeline.depends_on` makes the
-  ordering explicit; `rocky dag` shows the connected graph end-to-end
-  (`load → events_acme + events_beta + events_ceres`).
-- **Per-model `target.schema` override** is just two lines of TOML next to the
-  SQL, no Jinja, no `{% if tenant == ... %}` branching.
-- The same shape extends to N tenants by adding more `models/events_<id>.{sql,toml}`
-  files (each ~5 lines). For dynamic-N production, generate the model files
-  from a tenant registry as a build step.
-
-## Layout
-
-```
-.
-├── README.md                       this file
-├── rocky.toml                      ingest (load) + route (transformation) pipelines
-├── run.sh                          mint Parquet → load → run → query
-├── models/
-│   ├── _defaults.toml              shared `[strategy]` + `target.catalog`
-│   ├── events_acme.sql + .toml     WHERE account_id = 'acme'  → account_acme.events
-│   ├── events_beta.sql  + .toml    WHERE account_id = 'beta'  → account_beta.events
-│   └── events_ceres.sql + .toml    WHERE account_id = 'ceres' → account_ceres.events
-├── seeds/events.csv                20 rows, 3 accounts mixed
-└── data/                           staged at run time (events.parquet)
-```
+`run.sh` pre-creates the three account schemas. This POC does not set `auto_create_schemas = true` (see [`04-governance/07-auto-create-schemas`](../../04-governance/07-auto-create-schemas)).
 
 ## Prerequisites
 
 - `rocky` on PATH
-- `duckdb` CLI (`brew install duckdb`) — mints `events.parquet` from the seed
-  CSV, pre-creates the per-tenant schemas, and runs the final verification
-  query
+- `duckdb` CLI (`brew install duckdb`)
 
 ## Run
 
@@ -85,23 +49,7 @@ know or care how many tenants exist; it just runs every model under
 └──────────────────────┴───────────┘
 ```
 
-## What happened
-
-1. `duckdb :memory:` mints `data/events.parquet` from the seed CSV.
-2. `rocky load --pipeline ingest` writes all 20 rows into `main.events` via the
-   DuckDB adapter's native `read_parquet()` + `CREATE TABLE`.
-3. `run.sh` pre-creates the `account_acme`, `account_beta` and `account_ceres`
-   schemas. This POC does not set `auto_create_schemas = true` (see
-   [`04-governance/07-auto-create-schemas`](../../04-governance/07-auto-create-schemas)).
-4. `rocky run --pipeline route` compiles the three models, resolves their
-   `[target]` from the sidecar `.toml`, and executes a per-model
-   `CREATE OR REPLACE TABLE poc.account_<id>.events AS SELECT ... WHERE
-   account_id = '<id>'`.
-5. The final DuckDB query proves the row counts add up (8 + 6 + 6 = 20).
-
 ## Related
 
-- `rocky load` source: [`engine/crates/rocky-cli/src/commands/load.rs`](../../../../../engine/crates/rocky-cli/src/commands/load.rs)
-- `execute_models` (transformation runtime): [`engine/crates/rocky-cli/src/commands/run.rs`](../../../../../engine/crates/rocky-cli/src/commands/run.rs)
-- Sibling: [`09-files-to-duckdb`](../09-files-to-duckdb) — Parquet/CSV/JSONL
-  ingest in one `rocky load` (no fan-out).
+- Source: [`load.rs`](../../../../../engine/crates/rocky-cli/src/commands/load.rs), [`run.rs`](../../../../../engine/crates/rocky-cli/src/commands/run.rs) (`execute_models`)
+- [`09-files-to-duckdb`](../09-files-to-duckdb): multi-format ingest without fan-out.

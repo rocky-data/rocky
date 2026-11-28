@@ -415,6 +415,8 @@ fn a_populated_estimate_carries_no_empty_message() {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let models = scaffold(temp.path());
     write_model(&models, "alpha", true);
+    // `estimate` opens an existing database read-only and never creates one.
+    drop(duckdb::Connection::open(temp.path().join("test.duckdb")).expect("create database"));
 
     let output = cmd(temp.path(), &models, "estimate", &[]);
     let json: serde_json::Value =

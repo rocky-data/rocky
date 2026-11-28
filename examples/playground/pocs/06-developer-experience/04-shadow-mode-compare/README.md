@@ -7,14 +7,7 @@
 
 ## What it shows
 
-`rocky run --shadow` writes to `<table>_rocky_shadow` and compares it with
-production before cleanup. The first run drops its table. The next run reuses
-the name with `--keep-shadow` so `rocky compare` can inspect the table.
-
-## Why it's distinctive
-
-- **Safe to run on prod data** — no overwriting of the real tables.
-- The diff is structured (row count delta and schema delta, with a verdict per table).
+`rocky run --shadow` writes to `<table>_rocky_shadow`, leaving the real table untouched, and compares it with production before cleanup. The diff reports row count delta, schema delta and a verdict per table.
 
 ## Run
 
@@ -22,17 +15,11 @@ the name with `--keep-shadow` so `rocky compare` can inspect the table.
 ./run.sh
 ```
 
-## Status
+## What to expect
 
-The POC runs end to end on the local DuckDB path, and `run.sh` exits 0:
+`run.sh` exits 0 on the local DuckDB path:
 
-- **The prod run works.** `rocky run --filter source=orders` creates the
-  real target `poc.staging__orders.orders` (100 rows).
-- **The `--shadow` run works.** It reads the unsuffixed source
-  `raw__orders.orders` and writes `poc.staging__orders.orders_rocky_shadow`.
-  The real target is not touched. `expected/run_shadow_once.json` records the
-  first verdict. The second run succeeds without manual cleanup and keeps its
-  table. Its verdict is in `expected/run_shadow.json`.
-- **Both comparisons pass.** `expected/run_shadow.json` contains the in-run
-  verdict. `expected/compare.json` reports 100 rows in
-  both tables, `schema_match: true` and `overall_verdict: "pass"`.
+- `rocky run --filter source=orders` creates the target `poc.staging__orders.orders` (100 rows).
+- The first `--shadow` run reads the unsuffixed source `raw__orders.orders`, writes `poc.staging__orders.orders_rocky_shadow`, then drops it. Its verdict is in `expected/run_shadow_once.json`.
+- The second run reuses the name with `--keep-shadow`, so `rocky compare` can inspect the table. It succeeds without manual cleanup; its in-run verdict is in `expected/run_shadow.json`.
+- `expected/compare.json` reports 100 rows in both tables, `schema_match: true` and `overall_verdict: "pass"`.

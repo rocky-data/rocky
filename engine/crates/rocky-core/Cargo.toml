@@ -1,6 +1,6 @@
 [package]
 name = "rocky-core"
-version = "1.94.0"
+version = "1.95.0"
 description = "Core SQL transformation engine for Rocky"
 edition.workspace = true
 license.workspace = true
@@ -59,7 +59,11 @@ tempfile = "3"
 # (`fault_store`), the cross-pod harness (`test_harness`), and the public
 # provider-override seam (`state_sync::remote_testing`). Test-target-only —
 # the `rocky` binary never enables it, so release artifacts are unchanged.
-test-support = []
+#
+# Also turns on redb's `cache_metrics` and the public `cache_evictions`
+# accessor, so another crate's tests can prove a request-local cache budget
+# binds.
+test-support = ["redb/cache_metrics"]
 
 [dev-dependencies]
 # `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's

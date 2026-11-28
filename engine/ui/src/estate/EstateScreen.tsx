@@ -13,6 +13,12 @@ import type { JobClient } from "../operator";
 import { CompactControls } from "./CompactControls";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
+import {
+  type RecipeHistoryLoader,
+  type ReplayCheckLoader,
+  defaultRecipeHistoryLoader,
+  defaultReplayCheckLoader,
+} from "./RebuildCheck";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
 import { PreviewControls } from "./PreviewControls";
 import { PromoteControls } from "./PromoteControls";
@@ -33,6 +39,9 @@ export interface EstateLoaders {
   /** The webhook demands waiting in the spool, which `schedule` cannot see. */
   spool: () => Promise<ScheduleSpoolOutput>;
   detail: (name: string) => Promise<ModelDetailOutput>;
+  /** One model's rebuild check, read once with its detail. */
+  replayCheck: ReplayCheckLoader;
+  recipeHistory: RecipeHistoryLoader;
 }
 
 export const defaultLoaders: EstateLoaders = {
@@ -43,6 +52,8 @@ export const defaultLoaders: EstateLoaders = {
   schedule: () => apiGet<ScheduleStatusOutput>("schedule"),
   spool: () => apiGet<ScheduleSpoolOutput>("schedule/spool"),
   detail: (name) => apiGet<ModelDetailOutput>(`models/${encodeURIComponent(name)}`),
+  replayCheck: defaultReplayCheckLoader,
+  recipeHistory: defaultRecipeHistoryLoader,
 };
 
 /** Runs and the schedule are ledger reads and refresh on their own; the DAG composes per request and refreshes on demand. */
@@ -135,7 +146,7 @@ export function EstateScreen({
 
   return (
     <div className="space-y-8">
-      <ScreenHeader title="Estate" detail="The project, its models, and what ran.">
+      <ScreenHeader title="Project" detail="Its models, their lineage, and what ran.">
         <ProjectActions jobs={jobs} onDone={refreshAll} planDisabledReason={planReason} />
         <button type="button" onClick={refreshAll} className={READ_BUTTON}>
           <ArrowPathIcon aria-hidden="true" className="size-4" />
@@ -143,11 +154,11 @@ export function EstateScreen({
         </button>
       </ScreenHeader>
 
-      <Panel title="Project" producer="GET /api/v1/project">
+      <Panel title="Overview" producer="GET /api/v1/project">
         <Loaded resource={project}>{(value) => <ProjectStrip project={value} now={now} />}</Loaded>
       </Panel>
 
-      <Panel title="DAG" producer="GET /api/v1/dag + GET /api/v1/models">
+      <Panel title="Lineage" producer="GET /api/v1/dag + GET /api/v1/models">
         <Loaded resource={dag}>
           {(value) => (
             <div className={shown ? "grid gap-4 lg:grid-cols-[1fr_360px]" : ""}>
@@ -160,6 +171,9 @@ export function EstateScreen({
                   key={generation}
                   name={shown}
                   load={loaders.detail}
+                  runs={runs}
+                  replayCheck={loaders.replayCheck}
+                  recipeHistory={loaders.recipeHistory}
                   onClose={() => setSelected(null)}
                   actions={
                     <ProjectActions
@@ -176,11 +190,11 @@ export function EstateScreen({
         </Loaded>
       </Panel>
 
-      <Panel title="Preview" producer="POST /api/v1/jobs/preview">
+      <Panel title="Create branch" producer="POST /api/v1/jobs/preview">
         <PreviewControls jobs={jobs} onDone={refreshAll} />
       </Panel>
 
-      <Panel title="Promote" producer="GET /api/v1/branches + POST /api/v1/jobs/promote">
+      <Panel title="Promote branch" producer="GET /api/v1/branches + POST /api/v1/jobs/promote">
         <PromoteControls
           approvalRequired={
             project.kind === "loading" ? undefined : project.kind === "ready" ? (project.value.branch_approval_required ?? null) : null
@@ -190,7 +204,7 @@ export function EstateScreen({
         />
       </Panel>
 
-      <Panel title="Compact" producer="POST /api/v1/jobs/compact">
+      <Panel title="Optimize tables" producer="POST /api/v1/jobs/compact">
         <CompactControls jobs={jobs} onDone={refreshAll} />
       </Panel>
 

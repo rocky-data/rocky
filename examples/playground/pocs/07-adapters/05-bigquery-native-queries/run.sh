@@ -89,9 +89,10 @@ trap drop_dataset EXIT
 echo
 echo "==> live demo: full-refresh against $GCP_PROJECT_ID.$DATASET (location: $LOCATION)"
 
-# Pre-create the target dataset. `run_transformation` does not honor
-# auto_create_schemas (only the replication path does), so the dataset
-# must exist before CREATE TABLE runs. See live/README.md finding 3.
+# Pre-create the target dataset. Transformation runs honor
+# auto_create_schemas, but it defaults to false and live.rocky.toml does not
+# set it, so the dataset must exist before CREATE TABLE runs. See
+# live/README.md finding 3.
 bq --location="$LOCATION" --project_id="$GCP_PROJECT_ID" \
    mk --dataset "$DATASET" > /dev/null
 

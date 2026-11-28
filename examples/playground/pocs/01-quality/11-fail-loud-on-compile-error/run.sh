@@ -10,7 +10,7 @@
 # This script PROVES that `rocky run` over that project fails loudly instead of
 # reporting a green run:
 #   1. the run exits NON-ZERO
-#   2. `--output json` reports status `partial_failure`
+#   2. `--output json` reports status `PartialFailure`
 #   3. the broken model is recorded with failure_kind `compile-error` (E020)
 #   4. the broken model's target table is ABSENT (it never reached the warehouse)
 #   5. the clean model's table EXISTS and is fully populated — good data lands
@@ -123,7 +123,7 @@ fi
 echo "OK: with the compile error fixed, the same pipeline runs green and builds daily_revenue"
 
 echo
-echo "PASS: rocky run failed loud on the compile error (non-zero exit, partial_failure,"
+echo "PASS: rocky run failed loud on the compile error (non-zero exit, PartialFailure,"
 echo "      compile-error on daily_revenue), the broken table was never built, the clean"
 echo "      model's data still landed, and the fixed pipeline then ran green."
 exit 0

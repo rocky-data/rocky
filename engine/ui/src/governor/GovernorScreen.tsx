@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 import { navigateTo, pathForLane, useSegments } from "../router";
+import { AgentsScreen } from "./AgentsScreen";
 import { AuditScreen } from "./AuditScreen";
 import { BriefScreen } from "./BriefScreen";
+import { ComplianceScreen } from "./ComplianceScreen";
 import { CustodyScreen } from "./CustodyScreen";
 import { ProductsScreen } from "./ProductsScreen";
 import { ScorecardScreen } from "./ScorecardScreen";
@@ -23,12 +25,16 @@ import { GOVERNOR_TABS, governorAreaOf, governorTabFromSegment } from "./tabs";
 export function GovernorScreen({
   brief,
   scorecard,
+  agents,
+  compliance,
   custody,
   audit,
   products,
 }: {
   brief?: ReactNode;
   scorecard?: ReactNode;
+  agents?: ReactNode;
+  compliance?: ReactNode;
   custody?: (subject: string | null) => ReactNode;
   audit?: (product: string | null) => ReactNode;
   products?: (name: string | null) => ReactNode;
@@ -48,6 +54,12 @@ export function GovernorScreen({
       break;
     case "scorecard":
       screen = scorecard ?? <ScorecardScreen />;
+      break;
+    case "agents":
+      screen = agents ?? <AgentsScreen />;
+      break;
+    case "compliance":
+      screen = compliance ?? <ComplianceScreen />;
       break;
     case "custody":
       screen = custody ? custody(subject) : <CustodyScreen subject={subject} />;
@@ -70,7 +82,7 @@ export function GovernorScreen({
       */}
       {tabs.length > 1 && (
         <nav
-          aria-label="Governor screens"
+          aria-label="Oversight screens"
           className="flex flex-wrap gap-x-4 gap-y-1 border-b border-zinc-200 text-sm dark:border-zinc-800"
         >
           {tabs.map((entry) => (

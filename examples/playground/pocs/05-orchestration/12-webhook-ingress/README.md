@@ -11,8 +11,8 @@ tick.
 ./run.sh
 ```
 
-The script starts the server, signs a webhook body with HMAC-SHA256, POSTs it,
-and confirms the pipeline ran with `trigger: "Webhook"` in `rocky history`.
+The script starts the server, POSTs an HMAC-signed body, and confirms the
+pipeline ran with `trigger: "Webhook"` in `rocky history`.
 
 Point it at a freshly built binary with `ROCKY_BIN=/path/to/rocky ./run.sh`.
 If the binary predates webhook ingress (no `webhooks` capability at
@@ -20,16 +20,14 @@ If the binary predates webhook ingress (no `webhooks` capability at
 
 ## What it demonstrates
 
-- **HMAC auth, not the Bearer token.** The webhook route is authenticated by an
-  `X-Rocky-Signature` HMAC-SHA256 (hex) over the raw body, keyed on
-  `ROCKY_WEBHOOK_SECRET`. An unsigned request is `401`.
-- **Durable, at-most-once delivery.** The demand is `fsync`'d to
-  `.rocky/pending-demands/` before the `202`, so a crash never loses an accepted
-  webhook. The reconciler consumes it exactly once — one attempt, no retry on
-  the delivery side.
-- **Idempotent redelivery.** An `X-Rocky-Delivery` id deduplicates a redelivery
-  for 24 hours after consumption, so a sender that retries the same event does
-  not double-fire the pipeline.
+- **HMAC auth, not the Bearer token.** `X-Rocky-Signature` is an HMAC-SHA256
+  (hex) over the raw body, keyed on `ROCKY_WEBHOOK_SECRET`. An unsigned request
+  is `401`.
+- **Durable, at-most-once.** The demand is `fsync`'d to `.rocky/pending-demands/`
+  before the `202`, so a crash never loses an accepted webhook. It gets one
+  attempt, with no delivery-side retry.
+- **Idempotent redelivery.** An `X-Rocky-Delivery` id deduplicates redeliveries
+  for 24 hours after consumption.
 
 ## The signature
 
@@ -42,8 +40,7 @@ curl -X POST http://127.0.0.1:8091/api/v1/hooks/trigger/hello \
 
 ## Note on delivery semantics
 
-Webhook delivery is at-most-once: the one loss window is a reconciler crash
-*after* it has claimed a demand *and* the child run also dying before it records
-an outcome. For a webhook-only pipeline, pair the trigger with a `freshness`
-schedule as a backstop. See
+The one loss window: the reconciler crashes *after* claiming a demand *and* the
+child run dies before recording an outcome. For a webhook-only pipeline, add a
+`freshness` schedule as a backstop. See
 [Running without an orchestrator](../../../../../docs/src/content/docs/guides/running-without-an-orchestrator.md).

@@ -74,7 +74,9 @@ fn sample_ir_ref() -> TableRef {
 
 /// REST and SQL paths return the same `Vec<ColumnInfo>` shape for the
 /// same logical table. Mocks both endpoints and asserts the adapter's
-/// output is field-equal regardless of which path was taken.
+/// column names and data types are equal regardless of which path was
+/// taken. Nullability is not compared: the two paths differ on it (see
+/// the `rest_id_nullable` tests below).
 #[tokio::test]
 async fn describe_table_rest_and_sql_paths_project_identically() {
     let server = MockServer::start().await;
@@ -151,6 +153,80 @@ async fn describe_table_rest_and_sql_paths_project_identically() {
     assert_eq!(rest_cols[0].data_type, "bigint");
     assert_eq!(rest_cols[1].name, "amount");
     assert_eq!(rest_cols[1].data_type, "decimal(10,2)");
+}
+
+/// Describes, through the REST-routed adapter, a table of the given kind
+/// whose `id` column Unity reports NOT NULL. Returns `id`'s nullability.
+/// A JSON `null` kind field is left out of the response body.
+async fn rest_id_nullable(table_type: serde_json::Value, format: serde_json::Value) -> bool {
+    let server = MockServer::start().await;
+    let mut body = json!({
+        "name": "hcv2_orders",
+        "columns": [
+            {"name": "id", "type_text": "bigint", "type_name": "LONG", "nullable": false}
+        ]
+    });
+    if !table_type.is_null() {
+        body["table_type"] = table_type;
+    }
+    if !format.is_null() {
+        body["data_source_format"] = format;
+    }
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/2.1/unity-catalog/tables/hcv2_cat.hcv2_sch.hcv2_orders",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The REST path must serve the describe; a SQL fallback would report
+    // nullable for every kind and hide the rule under test.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let adapter = DatabricksWarehouseAdapter::new(sql_connector(&server))
+        .with_catalog_client(unity_client(&server));
+    let cols = adapter
+        .describe_table(&sample_ir_ref())
+        .await
+        .expect("REST describe_table");
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].name, "id");
+    cols[0].nullable
+}
+
+/// #2635: a managed Delta table enforces NOT NULL, so the adapter keeps it.
+#[tokio::test]
+async fn describe_table_managed_delta_keeps_not_null() {
+    assert!(!rest_id_nullable(json!("MANAGED"), json!("DELTA")).await);
+}
+
+/// #2635: a foreign table reports the source's NOT NULL but does not
+/// enforce it, so the adapter reports the column nullable.
+#[tokio::test]
+async fn describe_table_foreign_table_reports_nullable() {
+    assert!(rest_id_nullable(json!("FOREIGN"), json!("MYSQL_FORMAT")).await);
+    assert!(rest_id_nullable(json!("FOREIGN"), serde_json::Value::Null).await);
+}
+
+/// #2635: a non-Delta external table does not enforce NOT NULL.
+#[tokio::test]
+async fn describe_table_non_delta_external_table_reports_nullable() {
+    assert!(rest_id_nullable(json!("EXTERNAL"), json!("PARQUET")).await);
+    assert!(rest_id_nullable(json!("EXTERNAL"), json!("CSV")).await);
+}
+
+/// Only a confirmed managed Delta table is trusted. An external Delta
+/// table, or a response with no table kind, fails closed to nullable.
+#[tokio::test]
+async fn describe_table_unconfirmed_kind_reports_nullable() {
+    assert!(rest_id_nullable(json!("EXTERNAL"), json!("DELTA")).await);
+    assert!(rest_id_nullable(serde_json::Value::Null, serde_json::Value::Null).await);
 }
 
 /// REST path returns 401 → `CatalogError::AuthFailed` → propagated as

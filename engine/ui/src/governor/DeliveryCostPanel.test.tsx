@@ -122,7 +122,7 @@ function renderPanel(
 }
 
 function chargedCard(): HTMLElement {
-  return screen.getByText("charged, in USD").closest("[data-tone]") as HTMLElement;
+  return screen.getByText("total cost, in USD").closest("[data-tone]") as HTMLElement;
 }
 
 describe("the five states of a cost figure", () => {
@@ -160,7 +160,7 @@ describe("the five states of a cost figure", () => {
     expect(within(upstream).getByText("rows only")).toBeInTheDocument();
     // The charged model time includes the rows-only share, so it is not "measured".
     const charged = screen
-      .getAllByText("charged")
+      .getAllByText("total cost")
       .map((label) => label.closest("[data-tone]"))
       .find((card) => card !== null) as HTMLElement;
     expect(charged.querySelector("[data-figure-state]")?.getAttribute("data-figure-state")).toBe(
@@ -216,7 +216,7 @@ describe("the five states of a cost figure", () => {
     expect(
       document.querySelectorAll('[data-figure-state="partial"]').length,
     ).toBeGreaterThanOrEqual(4);
-    expect(screen.getByText("charged (partial)")).toBeInTheDocument();
+    expect(screen.getByText("cost (partial)")).toBeInTheDocument();
   });
 
   it("a partial month with a budget does not claim 'no breach'", () => {
@@ -374,7 +374,7 @@ describe("budget and breaches", () => {
 });
 
 function chargedCardOrNull(): HTMLElement | null {
-  return screen.queryByText("charged, in USD");
+  return screen.queryByText("total cost, in USD");
 }
 
 describe("delivery", () => {

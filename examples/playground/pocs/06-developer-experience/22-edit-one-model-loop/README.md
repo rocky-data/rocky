@@ -7,31 +7,13 @@
 
 ## What it shows
 
-The fast inner loop. You edit one model. Rocky rebuilds that model and the models downstream of it. It skips every model that is not affected. `run.sh` checks steps 1 to 4 against the `model_decisions` array in the JSON output. It checks steps 5 and 6 against the `materializations` array. It exits 1 when a claim does not hold.
+Edit one model, and Rocky rebuilds only that model and its downstream, skipping the rest. It combines the skip gate ([`02-performance/14-skip-unchanged`](../../02-performance/14-skip-unchanged)), watch mode ([`13-run-watch-inner-loop`](../13-run-watch-inner-loop)) and defer ([`20-defer-against-prod`](../20-defer-against-prod)), all in `rocky run`.
 
 ```
 raw__shop.orders ──► stg_orders ──┬──► daily_revenue
                                   └──► customer_orders ◄── stg_customers ◄── raw__shop.customers
                                                                 │
                                                                 └──► region_summary
-```
-
-## Why it's distinctive
-
-- It combines three flags that other POCs show one at a time: the skip gate ([`02-performance/14-skip-unchanged`](../../02-performance/14-skip-unchanged)), watch mode ([`13-run-watch-inner-loop`](../13-run-watch-inner-loop)) and defer ([`20-defer-against-prod`](../20-defer-against-prod)).
-- It checks the exact set of models built and skipped, not only a count.
-- No new command. Everything is in `rocky run`.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml        DuckDB transformation pipeline, [run] skip_unchanged = true
-├── expected/         run output (gitignored JSON)
-├── run.sh            seed, edit, rebuild, watch, defer; fails loudly
-├── data/seed.sql     50 customers, 500 orders (byte-stable)
-└── models/           5 models: 2 staging, 3 downstream
 ```
 
 ## Prerequisites
@@ -46,7 +28,7 @@ raw__shop.orders ──► stg_orders ──┬──► daily_revenue
 ./run.sh
 ```
 
-`run.sh` edits two model files during the run. It restores both on exit.
+`run.sh` edits two model files during the run and restores both on exit. It checks the exact set of models built and skipped (steps 1 to 4 against `model_decisions` in the JSON output, steps 5 and 6 against `materializations`) and exits 1 when a claim does not hold.
 
 ## Expected output
 
@@ -59,7 +41,7 @@ raw__shop.orders ──► stg_orders ──┬──► daily_revenue
     built|skipped = customer_orders,daily_revenue,stg_orders|region_summary,stg_customers
 === 4. watch mode: save a model file, Rocky re-runs by itself ===
     after the save: built|skipped = daily_revenue|customer_orders,region_summary,stg_customers,stg_orders
-=== 5. --defer: build one model, read its upstream from a base copy ===
+=== 5. --defer --defer-to: build one model, read its upstream from another schema ===
     with --defer --defer-to prod: built = daily_revenue
 === 6. --defer-to-state: find the upstream from a saved production state ===
     with --defer --defer-to-state: built = daily_revenue
@@ -68,11 +50,11 @@ raw__shop.orders ──► stg_orders ──┬──► daily_revenue
 ## What happened
 
 1. The first run builds all 5 models and records a logic hash for each.
-2. The second run changes nothing. All 5 models skip.
-3. The edit changes the SQL of `stg_orders`. Its hash differs, so it builds. `daily_revenue` and `customer_orders` read it, so they build too. `stg_customers` and `region_summary` do not depend on it, so they skip.
-4. `rocky run --watch --models models` re-runs when you save a file. `--watch` cannot be combined with `--model`. The skip gate does the narrowing.
-5. `--model daily_revenue` fails, because the local `stg_orders` is gone. `--model daily_revenue --defer --defer-to prod` builds one model. It reads `stg_orders` from the `prod` schema. The local `stg_orders` stays absent.
-6. The script builds a copy of the project into the `prod` schema and keeps its state file. The local `stg_orders` is still absent. `--model daily_revenue` fails. With `--defer --defer-to-state <file>` it builds only `daily_revenue`, and the state file says where to read `stg_orders`.
+2. With no change, all 5 skip.
+3. Editing the SQL of `stg_orders` changes its hash, so it builds, as do its readers `daily_revenue` and `customer_orders`. `stg_customers` and `region_summary` skip.
+4. `rocky run --watch --models models` re-runs on save. `--watch` cannot be combined with `--model`; the skip gate does the narrowing.
+5. With the local `stg_orders` gone, `--model daily_revenue` fails. `--model daily_revenue --defer --defer-to prod` builds one model, reading `stg_orders` from the `prod` schema. The local `stg_orders` stays absent.
+6. The script builds a copy of the project into the `prod` schema and keeps its state file. `--model daily_revenue --force-rebuild` fails. Adding `--defer --defer-to-state <file>` builds only `daily_revenue`; the state file says where to read `stg_orders`.
 
 ## Related
 

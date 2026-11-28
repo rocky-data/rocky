@@ -49,7 +49,7 @@ Entries on `contained[*]` are not failures. They name models Rocky withheld afte
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
 
-The compiler also emits `E010`-`E014`, `E029`-`E061`, `E062`, `E063`, `E064`, `E065`-`E068` and `E071`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all. `E010`-`E014`, `E062` and `E063` have their own section because the fix is contract-shaped.
+The compiler also emits `E010`-`E014`, `E029`-`E061`, `E062`, `E063`, `E064`, `E065`-`E068`, `E071` and `E073`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all. `E010`-`E014`, `E062` and `E063` have their own section because the fix is contract-shaped.
 
 **Recovery playbook.**
 
@@ -156,7 +156,7 @@ A `failure_kind: "transient"` entry in `errors[*]` has already been retried in t
 2. **Transient** (`failure_kind: "transient"` or `"connection-failed"`): the retry budget is exhausted. When the condition clears, run `rocky plan --resume-latest && rocky apply <plan-id>`. The single-step `rocky run --resume-latest` does the same.
 3. **Auth**: walk the adapter's auth order and check the env vars and `rocky.toml` against [Authentication](/reference/authentication/).
 4. **Quota**: check the warehouse's quota dashboard. Adaptive concurrency (AIMD: add one slot at a time, halve on a rate limit) backs off by itself, but a hard quota reset happens warehouse-side.
-5. **Statement timeout**: raise `timeout_secs` on the adapter. Better, check the [materialization strategy](/reference/glossary/#materialization-strategy). A multi-hour `FullRefresh` is often a missed `Merge` or `Incremental`; `rocky optimize` recommends one.
+5. **Statement timeout**: on Databricks, Snowflake, BigQuery and Trino it is `failure_kind: "unknown"`, and Rocky does not retry it, because the statement may still run. Rocky sends it a cancel first once it has the statement's id. Check the warehouse's query history first. Then raise `timeout_secs` on the adapter. Better, check the [materialization strategy](/reference/glossary/#materialization-strategy). A multi-hour `FullRefresh` is often a missed `Merge` or `Incremental`; `rocky optimize` recommends one.
 
 ---
 
@@ -186,7 +186,14 @@ This is the model graph only. Replicated tables use [`[execution] fail_fast`](/r
 
 **Guarantee scope.** Containment holds for a `depends_on` entry and for a physical read Rocky can resolve statically (`schema.table` or `catalog.schema.table`, quoted or not). Rocky folds both into the withholding closure and the execution order, so under `--parallel` a reader runs after every producer it reads.
 
-Rocky cannot enumerate reads in a CTE, sub-query or set operation. Such a model is still withheld when a known upstream failed, but its reads add no ordering edge. Under `--parallel`, a same-layer reader of a failing producer can then materialize on stale data, as in a fail-fast run. **List the dependency in `depends_on` when you need a hard guarantee.**
+Rocky cannot enumerate reads in a CTE, sub-query or set operation, or in SQL it cannot parse. A physical read that matches producers in more than one catalog is ambiguous. Rocky cannot prove such a model is clear of a failure, so it fails closed: once **any** model in the run has failed, the model is withheld, even when it has no path to the failure. A project built mostly on CTEs therefore gets close to fail-fast behaviour from containment.
+
+```
+a fails      b  (SELECT ... FROM raw.x)                         builds
+             c  (WITH t AS (SELECT ... FROM raw.y) SELECT ...)  withheld, no path to a
+```
+
+These reads also add no ordering edge. Under `--parallel`, a same-layer reader of a failing producer can start before the failure and materialize on stale data, as in a fail-fast run. **List the dependency in `depends_on` when you need a hard guarantee.**
 
 ---
 
