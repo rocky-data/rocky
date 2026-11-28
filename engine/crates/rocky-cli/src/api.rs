@@ -5867,10 +5867,14 @@ mod tests {
     /// over the request limit is `413` before any parse.
     #[test]
     fn parse_job_request_bounds_and_refusals() {
-        let request = parse_job_request(b"").unwrap();
+        let Ok(request) = parse_job_request(b"") else {
+            panic!("an empty body parses");
+        };
         assert_eq!(request.plan_id, None);
 
-        let request = parse_job_request(br#"{"pipeline": "p", "semantic": true}"#).unwrap();
+        let Ok(request) = parse_job_request(br#"{"pipeline": "p", "semantic": true}"#) else {
+            panic!("a valid body parses");
+        };
         assert_eq!(request.pipeline.as_deref(), Some("p"));
         assert_eq!(request.semantic, Some(true));
 

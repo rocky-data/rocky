@@ -242,7 +242,7 @@ impl Auth {
         // Every mode's requests go to `https://<account>.snowflakecomputing.com`:
         // refuse an account that would name another host before any credential
         // is stored or sent.
-        crate::connector::account_host(&config.account)?;
+        crate::connector::host_label(&config.account)?;
 
         // PAT takes highest priority — distinct token-type header from OAuth.
         if let Some(token) = config.pat.filter(|t| !t.is_empty()) {
@@ -414,7 +414,7 @@ impl Auth {
                     return Ok(ct.token.expose().to_string());
                 }
 
-                let host = crate::connector::account_host(account)?;
+                let host = crate::connector::host_label(account)?;
                 let url = format!("https://{host}.snowflakecomputing.com/session/v1/login-request");
 
                 let body = serde_json::json!({
@@ -590,7 +590,9 @@ mod tests {
             pat: None,
         };
         for config in [config(Some("t"), None), config(None, Some("pass"))] {
-            let err = Auth::from_config(config).err().expect("refused");
+            let Err(err) = Auth::from_config(config) else {
+                panic!("an account that names another host is refused");
+            };
             assert!(matches!(err, AuthError::InvalidAccount { .. }), "{err}");
             assert!(
                 err.to_string()
