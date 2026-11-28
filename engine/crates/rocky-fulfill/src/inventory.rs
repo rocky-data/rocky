@@ -145,7 +145,10 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::state::StateStore",
     // DELIBERATE addition (#2621): the freshness budget compares the lag
     // rounded up, with the same helper `rocky freshness` uses, so a lag
-    // half a second past the budget is over it.
+    // half a second past the budget is over it. DELIBERATE addition
+    // (#2806): a newest timestamp past the same future skew `rocky
+    // freshness` allows is not counted as fresh.
+    "rocky_core::source_freshness::FUTURE_SKEW_TOLERANCE_SECONDS",
     "rocky_core::source_freshness::whole_seconds_rounded_up",
     // The process start-time probe (#1493). DELIBERATE addition: it used
     // to live in this crate, and moved DOWN to rocky-core because
