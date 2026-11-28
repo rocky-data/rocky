@@ -280,6 +280,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ModelRunStatusOutput": ("run_schema", "ModelRunStatusOutput"),
     "RunTestResultOutput": ("run_schema", "RunTestResultOutput"),
     "ModelDetail": ("compile_schema", "ModelDetail"),
+    "EstimateGap": ("estimate_schema", "EstimateGap"),
     "ModelEstimate": ("estimate_schema", "ModelEstimate"),
     "ModelExecutionRecord": ("model_history_schema", "ModelExecutionRecord"),
     "ModelFreshnessConfig": ("compile_schema", "ModelFreshnessConfig"),
@@ -933,6 +934,7 @@ if TYPE_CHECKING:
     )
     from .estimate_schema import (
         EstimateOutput,
+        EstimateGap,
         ModelEstimate,
     )
     from .profile_schema import (
@@ -1322,6 +1324,7 @@ __all__ = [
     "ContractResult",
     "ContractViolation",
     "EstimateOutput",
+    "EstimateGap",
     "ModelEstimate",
     "ProfileOutput",
     "ProfileColumnStats",

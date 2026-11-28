@@ -283,9 +283,11 @@ pub(crate) async fn compute_plan_cost_preview(ctx: PlanCostContext<'_>) -> PlanC
             .await
             {
                 Ok(report) => {
-                    for (model, reason) in report.skipped.iter().chain(&report.explain_failed) {
+                    let gaps = report.output.skipped.iter();
+                    for gap in gaps.chain(&report.output.explain_failed) {
                         notes.push(format!(
-                            "model '{model}': adapter estimate failed: {reason}"
+                            "model '{}': adapter estimate failed: {}",
+                            gap.model_name, gap.reason
                         ));
                     }
                     let (estimates, empty): (Vec<_>, Vec<_>) =
