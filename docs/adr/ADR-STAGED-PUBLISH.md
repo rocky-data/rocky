@@ -1,6 +1,6 @@
 # ADR-STAGED-PUBLISH — Opt-in staged publish for transformation runs
 
-**Status:** Proposed. Ruled 2026-11-21: opt-in; the default stays in place.
+**Status:** Proposed. Ruled 2026-11-21: opt-in; the default stays in place. Ruled 2026-11-28: v1 scope is option A, local state on one host, with manual recovery (D3).
 
 **Scope:** Issue #2612.
 
@@ -52,7 +52,7 @@ A new opt-in mode, `publish = "staged"`. The default, `"in_place"`, is unchanged
 ### D1 — Stage, test, then swap
 
 ```
-recover  an open publish record of this pipeline?  ->  D3 first
+check    an open publish record of this pipeline?  ->  refuse (D3)
 build    every selected model  ->  <target>__rocky_stage  (production untouched)
 test     per model, on its stage: volume check, then [[tests]]
 gate     any failure?  ->  drop this run's stages, clear the record
@@ -63,10 +63,10 @@ clean    drop the old tables the swap moved aside, clear the record
 
 - **Build.** Downstream models read upstream stages. This needs new routing: `apply_shadow_rewrite` routes to `shadow_target`, not to the `SwapNames` stage. An upstream this run does not build (not selected) has no stage, so its readers read its production table, which this run does not change. The skip gate is off under staged, as it is for shadow and branch runs (`SkipGateConfig::is_active`). The rewrite runs before the gate decides, so a skipped upstream would leave its readers pointing at a stage that does not exist.
 - **Test.** Today's per-model checks, on the stage. Under the default `tests_on_run = "enforce"`, the gate sees model failures, volume breaches and error-severity test failures.
-- **Gate.** On any failure Rocky publishes nothing. It drops each stage whose identity (D3) is this run, then clears the record. So no `LeftoverStage` and no open record blocks the next run. If a drop fails, the record stays and the next run finishes it (D3, rows 1 and 2).
+- **Gate.** On any failure Rocky publishes nothing. It drops each stage whose identity (D3) is this run, then clears the record. So no `LeftoverStage` and no open record blocks the next run. If a drop fails, the record stays, and runs refuse until `rocky publish restore` finishes it (D3, rows 1 and 2).
 - **Containment.** `[resilience] contain_failures` (default `true`, #2617) still decides what builds: a failed model withholds its downstream closure, and unrelated models still build and test. Under staged, the gate then publishes none of them. Containment only makes the report complete.
 - **Swap.** A table's swap never runs model SQL again. Views do: they are re-created against production after the tables, so a view can still fail here. Tables reuse `StagedSwap` renames, which need `rename_table_sql` on every adapter but Trino. DuckDB over Iceberg overwrites in place (D3).
-- **Restore at once.** When a swap step fails, the same run restores every target it swapped, in reverse order, then exits non-zero. A restore needs no new data and no rebuild, so there is no reason to wait. The next staged run recovers only what a crash or a failed restore left.
+- **Restore at once.** When a swap step fails, the same run restores every target it swapped, in reverse order, then exits non-zero. A restore needs no new data and no rebuild, so there is no reason to wait. A crash or a failed restore leaves the record open; a person then runs `rocky publish restore` or `rocky publish abandon` (D3).
 - **Clean.** Moved-aside tables are dropped only after every swap succeeded.
 
 Where the warehouse allows it, the swap and clean steps run in one transaction.
@@ -110,9 +110,11 @@ Where no transaction spans the swap, a failure during it leaves a mix until the 
 
 ### D3 — Recovery after a partial swap
 
-This section says what the run records, who may act on it, and what recovery does in each state.
+This section says what the run records, who may act on it, and what a person runs after a crash.
 
-**The record.** Before the build, Rocky writes a publish record for the pipeline. It holds the run id, an owner (host, process, lease expiry) and one entry per target. An entry holds the target kind (table, view, or Iceberg table), whether the target existed before the run, a phase, and for a view its old and new definitions. The phases are:
+**Scope (ruled 2026-11-28, option A).** v1 runs on local state on one host. After a crash, no run recovers on its own: every run refuses until a person runs `rocky publish restore` or `rocky publish abandon`. No step drops a production table by its production name.
+
+**The record.** Before the build, Rocky writes a publish record for the pipeline. It holds the run id and one entry per target. An entry holds the target kind (table, view, or Iceberg table), whether the target existed before the run, a phase, and for a view its old and new definitions. The phases are:
 
 ```
 built ──► swapping ──► swapped ──► cleaning ──► cleaned      (published)
@@ -120,33 +122,34 @@ built ──► swapping ──► swapped ──► cleaning ──► cleaned 
                └────────────┴──► restoring ──► restored      (not published)
 ```
 
-Rocky writes `swapping`, `cleaning` and `restoring` as intents before the step starts, and the next phase after the step ends. The run is **published** once every entry is `swapped`. The record is cleared when every entry is `cleaned`, when the gate has dropped every stage, or when every swapped entry is `restored`.
+Rocky writes `swapping`, `cleaning` and `restoring` as intents before the step starts, and the next phase after the step ends. The run is **published** once every entry is `swapped`. The run clears the record when every entry is `cleaned`, when the gate has dropped every stage, or when every swapped entry is `restored`.
 
-**Where the record lives, and when it is durable.** A step starts only after its intent is durable. A failed record write stops the run before the step.
+**Where the record lives, and when it is durable.** The record is a state-store table. Each write is one redb commit, which returns only when durable. A step starts only after its intent is durable. A failed record write stops the run before the step.
 
-- Local state: a state-store table. Each write is one redb commit, which returns only when durable.
-- Remote state: the state object changes only at the end of a run, and not at all if the process dies. So the record is a separate object beside the state object, written with a conditional put at every phase change (the create-once pattern of the freeze markers, `freeze_marker.rs`). The end-of-run upload is not relied on. A backend where the startup CAS probe (ADR-CONCURRENCY D6a) finds no working conditional put refuses `publish = "staged"`. That includes `valkey`, which has none wired.
+`publish = "staged"` refuses on remote state (`[state] backend` other than `local`). The remote state object changes only at the end of a run, so it cannot hold a durable intent.
 
-**Who may act on a record.**
+**Who may act on a record.** A transformation run holds the state store's writer lock for its whole life. A second run, or a `rocky publish` command, cannot open the store while the first holds the lock. So only one process on the host can act on a record, and no stalled run can send a statement after another one has acted. One host and one local state path are what make this true.
 
-- Same host, same state path: a second run cannot open the state store while the first holds the writer lock. So it cannot act on a live run's record.
-- Across hosts, on remote state: the lock is per host. So the record carries a lease. The owner renews it with a conditional put on its own version. Another run treats an unexpired lease as live and refuses, naming the owner. After expiry, a run takes the lease with a conditional put. The old owner's next record write then fails, and it stops before its next step. Residual: a step the old owner started before expiry can still finish.
-- This lease covers only the publish record. It is not the state-blob lease that ADR-CONCURRENCY reserves as `concurrency_control = "lease"`; the state blob stays under CAS.
-
-**Table identity.** Working names carry no run id (decided below). So Rocky tags each stage with the run id, as a table property, or a comment where the warehouse has no properties. The tag moves with the table on rename. Before any drop or rename, recovery reads it:
+**Table identity.** Working names carry no run id (decided below). So Rocky tags each stage with the run id, as a table property, or a comment where the warehouse has no properties. The tag moves with the table on rename. Before any drop or rename, `restore` reads it:
 
 - a stage, or a target Rocky swapped in, is this record's only if its tag equals the record's run id;
 - a backup is the old table only if its tag is not the record's run id.
 
 Any other combination refuses and names the `DROP` or `ALTER` to run by hand. Existence probes alone cannot tell an old table from a new one; the tag can.
 
-**In-place runs while a record is open.** An `in_place` run of a pipeline with an open record refuses. It names the run id and the fix: run once with `--publish staged`, which recovers first. Model-only runs (`rocky run --model`), `rocky backfill` and `rocky branch promote` name no pipeline but can write the same targets. v1 makes each of them refuse when an open record lists one of its targets. The tag covers any writer Rocky cannot see.
+**Runs while a record is open.** Every run of a pipeline with an open record refuses, staged or in place. It names the run id and the two commands. Model-only runs (`rocky run --model`), `rocky backfill` and `rocky branch promote` name no pipeline but can write the same targets. v1 makes each of them refuse when an open record lists one of its targets. The tag covers any writer Rocky cannot see.
 
-**What recovery does.** Recovery uses its own probes, not `StagedSwap::execute`, which would refuse with `LeftoverStage`. Per entry, it probes target, stage and backup and reads their tags. "Run" means the tag equals the record's run id; "old" means it does not. It works in three passes:
+**Restore never drops by the production name.** A restore moves the run's table aside first: it renames the target to its stage name, renames the backup to the target, then drops the table under the stage name after its tag check. A target this run created is renamed to its stage name, then dropped. The production name only ever receives a rename.
+
+**`rocky publish restore`.** It takes the writer lock, then works per entry. It probes target, stage and backup and reads their tags. "Run" means the tag equals the record's run id; "old" means it does not. It works in three passes:
 
 1. Resolve each entry whose done-mark was lost. A `swapping` entry whose target carries the run's tag is `swapped` (rows 5 and 15). A `restoring` entry whose old table or view is back is `restored` (rows 12 and 20).
 2. Decide once, for the whole record, whether the run is published.
 3. Act on each entry by the rows below. Every state not listed refuses.
+
+A published record is not rolled back: `restore` only finishes the clean (row 7). When every entry is closed, it clears the record.
+
+**`rocky publish abandon`.** It clears the record and changes nothing in the warehouse. It prints each stage, backup and target with its tag, so a person can drop or rename what is left. It is the way out when `restore` refuses.
 
 Tables that existed before the run:
 
@@ -157,13 +160,13 @@ Tables that existed before the run:
 | 3 | `swapping` | target old, no backup, stage run | the step never ran, or its transaction rolled back: drop the stage |
 | 4 | `swapping` | no target, backup old, stage run | rename the backup to target, drop the stage |
 | 5 | `swapping` | target run, backup old, no stage | the swap ran and its done-mark was lost: it is `swapped` |
-| 6 | `swapped`, not published | target run, backup old | restore: write `restoring`, drop the target, rename the backup to target |
+| 6 | `swapped`, not published | target run, backup old | restore: write `restoring`, rename the target to stage, rename the backup to target, drop the stage |
 | 7 | `swapped` or `cleaning`, published | target run, backup old or gone | finish the clean: drop the backup; no restore |
 | 8 | `cleaned` | target run, nothing beside it | nothing |
 | 9 | `swapped`, not published | target old, no backup, stage run | the record ran ahead of a rolled-back transaction: drop the stage |
-| 10 | `restoring` | target run, backup old | the restore never ran: as row 6 |
-| 11 | `restoring` | no target, backup old | the drop ran: rename the backup to target |
-| 12 | `restoring` | target old, nothing beside it | the restore ran and its done-mark was lost: it is `restored` |
+| 10 | `restoring` | target run, backup old, no stage | the restore never ran: as row 6 |
+| 11 | `restoring` | no target, backup old, stage run | the move-aside ran: rename the backup to target, drop the stage |
+| 12 | `restoring` | target old, stage run or none, no backup | the restore ran and its done-mark was lost: drop the stage if present; it is `restored` |
 | 13 | `restored` | target old, nothing beside it | nothing |
 
 Tables created by this run (no target before):
@@ -171,8 +174,8 @@ Tables created by this run (no target before):
 | # | Phase | Warehouse state | Action |
 |---|---|---|---|
 | 14 | `built` or `swapping` | no target, stage run or none | drop the stage if present |
-| 15 | `swapping` or `swapped`, not published | target run, no stage | restore: write `restoring`, drop the target (the pre-run state had no table) |
-| 16 | `restoring` or `restored` | no target, no stage | nothing |
+| 15 | `swapping` or `swapped`, not published | target run, no stage | restore: write `restoring`, rename the target to stage, drop the stage |
+| 16 | `restoring` or `restored` | no target, stage run or none | drop the stage if present; nothing else |
 | 17 | published | target run | nothing to clean |
 
 A one-statement swap (Snowflake `SWAP WITH`, ClickHouse `EXCHANGE TABLES`) leaves the old table under the stage name. Its rows wait for the D2 spike; until then, that state refuses.
@@ -186,9 +189,9 @@ A one-statement swap (Snowflake `SWAP WITH`, ClickHouse `EXCHANGE TABLES`) leave
 | 20 | `restoring` | view old, or no view when created by this run | the restore ran: it is `restored` |
 | 21 | published | view run | nothing |
 
-An adapter that cannot read a view's definition refuses `staged` for that view at plan time.
+A view holds no data, so re-creating or dropping it by its production name loses nothing. An adapter that cannot read a view's definition refuses `staged` for that view at plan time.
 
-**DuckDB over an Iceberg REST catalog.** DuckDB-Iceberg refuses a rename inside a write transaction, and its in-place overwrite keeps no backup (`recover_interrupted_swap` returns early for `InPlaceOverwrite`). So v1 stages an Iceberg pipeline only when every target of the pipeline is an existing table in one Iceberg catalog. One transaction then overwrites all of them from their stages. It either commits or rolls back, so there is nothing to restore, and recovery only drops stages. Any other pipeline with an Iceberg target refuses `staged` at plan time, including one that mixes Iceberg and other targets: its Iceberg commit could not be restored.
+**DuckDB over an Iceberg REST catalog.** DuckDB-Iceberg refuses a rename inside a write transaction, and its in-place overwrite keeps no backup (`recover_interrupted_swap` returns early for `InPlaceOverwrite`). So v1 stages an Iceberg pipeline only when every target of the pipeline is an existing table in one Iceberg catalog. One transaction then overwrites all of them from their stages. It either commits or rolls back, so there is nothing to restore, and `restore` only drops stages. Any other pipeline with an Iceberg target refuses `staged` at plan time, including one that mixes Iceberg and other targets: its Iceberg commit could not be restored.
 
 **Trace: staged, then in place, then staged.** This is the sequence that existence probes alone get wrong.
 
@@ -196,11 +199,11 @@ An adapter that cannot read a view's definition refuses `staged` for that view a
 S1 staged     A swapped, B built, dies   A = new(S1)   A__rocky_old = old A
                                          B = old B     B__rocky_stage = new(S1)
 in place      record open  ->  refused   nothing written
-S2 staged     recovers: row 6 for A,     A = old A, B = old B
-              row 1 for B                record cleared
+S2 staged     record open  ->  refused   nothing written
+restore       row 6 for A, row 1 for B   A = old A, B = old B, record cleared
 ```
 
-Without the refusal, the in-place run writes newer A. S2 would then drop it as "new(S1)". With the tag, that A carries no S1 tag, so S2 refuses instead. The tag also covers a write Rocky did not make: another tool, or an older binary.
+Without the refusal, the in-place run writes newer A. `restore` would then move it aside as "new(S1)". With the tag, that A carries no S1 tag, so `restore` refuses instead. The tag also covers a write Rocky did not make: another tool, or an older binary.
 
 **Trace: a crash mid-swap.** Targets A, B and C. A swaps. The process dies after B's move-aside, before its swap-in. C is never attempted.
 
@@ -210,16 +213,18 @@ B   swapping    B missing      B__rocky_old = old B   B__rocky_stage = new B
 C   built       C = old        C__rocky_stage = new C
 ```
 
-The next staged run first recovers: row 6 for A, row 4 for B, row 1 for C. A restore killed half-way resumes by rows 10 to 13. Production is then old A, B and C. It then rebuilds under a new record. If any recovery step fails, it stops.
+Every later run refuses. `rocky publish restore` applies row 6 for A, row 4 for B and row 1 for C. A restore killed half-way resumes by rows 10 to 13 on the next `restore`. Production is then old A, B and C, and the record is clear. If any step fails, `restore` stops and the record stays.
 
 If the run had not died, it would have done the same restore at once, before exiting non-zero.
 
-**Clean-step failure.** If every swap succeeded but a backup drop failed (the `drop_backup` warning), the run is published. The next run finishes the clean step and does not restore (row 7).
+**Clean-step failure.** If every swap succeeded but a backup drop failed (the `drop_backup` warning), the run is published. The record stays open, and `restore` finishes the clean step without a rollback (row 7).
 
 **Decided 2026-11-22:**
 
-- **Restore, not roll forward.** After a partial swap, Rocky restores each target from its backup. Cost: a reverse rename and a drop per swapped target, and the run's new data is thrown away.
+- **Restore, not roll forward.** After a partial swap, Rocky restores each target from its backup. Cost: two renames and a drop per swapped target, and the run's new data is thrown away.
 - **Refuse what does not match.** v1 refuses any table it cannot match to a recorded phase. Cost: a manual `DROP` after an unusual failure. A run id in working names would bind tables to runs, but it would change ADR-REPLACE's reserved names and need a schema listing; not in v1.
+
+**Decided 2026-11-28 (option A):** local state on one host; after a crash every run refuses until `restore` or `abandon`; no step drops a production table by its production name. Cost: a person must act after every crash, and remote-state pipelines cannot use `staged` in v1.
 
 ### D4 — Strategy scope (v1)
 
@@ -238,48 +243,57 @@ publish = "staged"     # default: "in_place"
 
 `rocky run --publish staged|in_place` overrides it. Other pipeline types share `ExecutionConfig` and refuse `"staged"`. Names are proposed.
 
+`rocky publish restore` and `rocky publish abandon` (D3) take the same `--config` and pipeline selection as `rocky run`. Names are proposed.
+
 ## Consequences
 
 For a user who opts in (nobody else sees a change):
 
 - A failed model or test leaves production as before the run, and the run exits non-zero.
-- A failed swap restores at once: production is as before the run, views included. A target this run created is dropped. If the process dies or a restore step fails, the next staged run recovers. If recovery cannot match a table, a person must act.
+- A failed swap restores at once: production is as before the run, views included. A target this run created is dropped.
+- After a crash or a failed restore, every run of the pipeline refuses until a person runs `rocky publish restore` or `rocky publish abandon`. A scheduled pipeline stops publishing until then.
+- `staged` needs local state on one host. A pipeline on remote state cannot use it in v1.
 - `--skip-unchanged` has no effect under staged.
-- While a record is open, `in_place` runs of that pipeline refuse, and so do model-only runs, backfills and promotes that write one of its targets.
+- While a record is open, model-only runs, backfills and promotes that write one of its targets also refuse.
 - Storage peaks at two copies per rebuilt table. It needs create and rename rights per target schema, and the right to set a table property or comment.
 - The run JSON gains a per-target publish section (`just codegen`).
 
 ### Open questions
 
-Proposed in this revision, for Hugo to confirm. None changes the two 2026-11-22 decisions.
+Proposed in this revision, for Hugo to confirm. None changes the 2026-11-22 or 2026-11-28 decisions.
 
 - **First-time targets.** A restore drops a table this run created, because the pre-run state had none. The alternative is to keep it and report it.
-- **New v1 refusals.** `staged` refuses on remote state with no working conditional put (`valkey`), on a view whose definition the adapter cannot read, and on any pipeline with an Iceberg target that one transaction cannot overwrite whole. Model-only runs, `rocky backfill` and `rocky branch promote` refuse while an open record lists their target.
+- **New v1 refusals.** `staged` refuses on remote state, on a view whose definition the adapter cannot read, and on any pipeline with an Iceberg target that one transaction cannot overwrite whole. Model-only runs, `rocky backfill` and `rocky branch promote` refuse while an open record lists their target.
+- **Command names.** `rocky publish restore` and `rocky publish abandon`.
 - **Skip gate off.** Turning it off is the simple answer. Running the gate before the rewrite would keep it, at the cost of routing decided per run.
 
 ## Alternatives considered
 
 - **Make staged the default.** Not chosen: the 2026-11-21 ruling keeps in place.
 - **Roll views forward.** Simpler than recording their definitions, but it breaks "production as before the run" for views. Not chosen: it would contradict the restore decision.
+- **B: full scope with fencing.** Remote state, a lease on the record across hosts, and automatic recovery by the next run. Rejected 2026-11-28: the warehouse cannot stop a late statement from a run that stalled past its lease, so that run could still drop a table another run had restored. Not sized.
+- **C: park #2612.** Rejected 2026-11-28: production keeps its mixed-version risk with no opt-in way out.
+- **Automatic recovery by the next run on one host.** Rejected with option A: a person decides between restore and abandon after each crash.
 
 ## Validation
 
 - DuckDB: the #2612 recipe under `publish = "staged"` leaves both production tables old.
 - A failing test under the default `tests_on_run = "enforce"` blocks the publish. The next staged run starts with no open record.
-- A scripted adapter killed after each intent write and after each step, restore steps included: recovery reaches the row the D3 tables name, and the crash trace restores.
-- Remote state: a run killed mid-swap, with no end-of-run upload, leaves a record that a run on another host recovers.
-- Staged, then in place, then staged: the in-place run refuses; a write by another tool makes S2 refuse, not drop.
+- A scripted adapter killed after each intent write and after each step, restore steps included: every later run refuses; `rocky publish restore` reaches the row the D3 tables name, and the crash trace restores.
+- No step issues a `DROP` on a production table name: a check over the scripted adapter's statements.
+- `rocky publish abandon` clears the record, changes no table and lists what is left.
+- Staged, then in place, then staged: both later runs refuse; a write by another tool makes `restore` refuse, not move it aside.
 - Restore with a view and with a first-time target: the old view definition is back, and the new table is gone.
-- Concurrent recovery: two hosts on one remote state; one takes the lease, the other refuses; a lease taken after expiry stops the old owner at its next step.
+- `publish = "staged"` on remote state refuses at plan time.
 - A model built but not published: its `ModelExecution` is not `success`, and `--retry-failed` reruns it.
 
 ## Least confident
 
 - Whether DuckDB native, PostgreSQL, Redshift and SQL Server commit several renames in one transaction.
 - Whether every warehouse can carry the identity tag through a rename, and clears it on any `CREATE OR REPLACE`. If one cannot, staged must refuse there.
-- Whether v1 is useful when one incremental model refuses the run, and `--skip-unchanged` is off.
-- The lease timings (renew interval, expiry), and the residual step an expired owner can still finish.
+- Whether v1 is useful when one incremental model refuses the run, `--skip-unchanged` is off, and a person must act after every crash.
 
 ## Missing
 
 A per-warehouse spike would settle the D2 tables: a two-table rename swap in one transaction, with a failure injected between the renames, plus dependent views, grants, tags and the identity tag across the rename.
+
