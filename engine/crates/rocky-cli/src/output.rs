@@ -3175,7 +3175,8 @@ impl TestOutput {
 }
 
 /// A warning for each `[budget]` limit the run could not check, because the
-/// adapter reported no figure for it (#2776).
+/// adapter reported no figure for it (#2776). Call it only for a run that
+/// built at least one model: with none, every figure is absent.
 ///
 /// Snowflake, for example, reports no bytes scanned, so `max_bytes_scanned`
 /// can never trip there. Saying so keeps a limit that is silently skipped
@@ -7114,8 +7115,12 @@ impl RunOutput {
             .cost_summary
             .as_ref()
             .and_then(|s| s.total_bytes_scanned);
-        for unchecked in unchecked_budget_limits(budget_cfg, observed_cost, observed_bytes) {
-            tracing::warn!("{unchecked}");
+        // A run that built nothing has no figures to report on any adapter,
+        // and nothing for a limit to catch, so it gets no warning.
+        if !self.materializations.is_empty() {
+            for unchecked in unchecked_budget_limits(budget_cfg, observed_cost, observed_bytes) {
+                tracing::warn!("{unchecked}");
+            }
         }
         let breaches = budget_cfg.check_breaches(observed_cost, self.duration_ms, observed_bytes);
         if breaches.is_empty() {

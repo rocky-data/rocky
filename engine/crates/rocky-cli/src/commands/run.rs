@@ -10221,25 +10221,26 @@ async fn run_batched_checks(
                     (Some(ts), _) => {
                         // Rounded up, so a lag half a second past a level
                         // trips it (#2621). A newest timestamp in the future
-                        // is not folded into the lag: within the clock-skew
-                        // tolerance it is fresh, past it the lag cannot be
-                        // measured, so the check is not evaluated (it used
-                        // to read the distance ahead as the lag).
+                        // is not folded into the lag (it used to read the
+                        // distance ahead as the lag). Within the clock-skew
+                        // tolerance it is fresh. Past it the lag cannot be
+                        // measured: the check is not evaluated, at Warning
+                        // severity, as `rocky freshness` grades the same
+                        // reading `warn`. So it never fails the run.
                         let gap = now - ts;
                         let skew = chrono::TimeDelta::seconds(
                             rocky_core::source_freshness::FUTURE_SKEW_TOLERANCE_SECONDS,
                         );
                         if gap < -skew {
-                            Some((
-                                key,
-                                checks::freshness_not_evaluated(
-                                    freshness_budget,
-                                    format!(
-                                        "the newest timestamp ({ts}) is more than {}s in the future, so there is no lag to measure",
-                                        skew.num_seconds()
-                                    ),
+                            let mut check = checks::freshness_not_evaluated(
+                                freshness_budget,
+                                format!(
+                                    "the newest timestamp ({ts}) is more than {}s in the future (clock skew, a future-dated row, or a local-time column read as UTC), so there is no lag to measure",
+                                    skew.num_seconds()
                                 ),
-                            ))
+                            );
+                            check.severity = rocky_core::tests::TestSeverity::Warning;
+                            Some((key, check))
                         } else {
                             let lag = rocky_core::source_freshness::whole_seconds_rounded_up(gap)
                                 .max(0)
@@ -52986,6 +52987,55 @@ threshold = 0
                 "age {age}: {result:?}"
             );
         }
+    }
+
+    /// #2621: a lag is rounded up, never toward zero, and a newest
+    /// timestamp in the future is not read as lag. Within the 60 s clock
+    /// skew it is fresh; past it the check is not evaluated, at Warning
+    /// severity, so it never fails the run.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn freshness_rounds_up_and_does_not_read_the_future_as_lag() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+        let at = |offset: chrono::Duration| LegFailingBatchCheck {
+            max_timestamp: Some(Utc::now() + offset),
+            ..LegFailingBatchCheck::healthy()
+        };
+
+        // Half a second past the limit: over it.
+        let leg = at(-chrono::Duration::milliseconds(3_600_500));
+        let (pending, _, _) = fx.try_run(&inner, Some(&leg), None).await.unwrap();
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert!(result.not_evaluated.is_none(), "{result:?}");
+
+        // 30 s ahead: within the skew, fresh.
+        let leg = at(chrono::Duration::seconds(30));
+        let (pending, _, _) = fx.try_run(&inner, Some(&leg), None).await.unwrap();
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(result.passed, "{result:?}");
+
+        // Two hours ahead: it used to read as two hours of lag and fail at
+        // Error. Now it is not evaluated, at Warning.
+        let leg = at(chrono::Duration::hours(2));
+        let (pending, _, _) = fx.try_run(&inner, Some(&leg), None).await.unwrap();
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.severity,
+            rocky_core::tests::TestSeverity::Warning,
+            "{result:?}"
+        );
+        assert!(
+            result
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.contains("in the future")),
+            "{result:?}"
+        );
     }
 
     /// The other half of a NULL maximum: rows exist and none carries a

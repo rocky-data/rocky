@@ -806,11 +806,11 @@ async fn valkey_check_and_claim(
     }
     let full_key = valkey_key(prefix, &entry.key);
     let value = serde_json::to_vec(entry)?;
-    // Rounded up, so the key lives at least as long as the entry (#2621).
-    let ttl_secs = crate::source_freshness::whole_seconds_rounded_up(
-        entry.expires_at.signed_duration_since(entry.stamped_at),
-    )
-    .max(1) as u64;
+    let ttl_secs = entry
+        .expires_at
+        .signed_duration_since(entry.stamped_at)
+        .num_seconds()
+        .max(1) as u64;
 
     let url = url.to_string();
     let key_for_task = full_key.clone();
@@ -972,11 +972,10 @@ async fn valkey_finalize(
     let run_id = run_id.to_string();
     let user_key = key.to_string();
     let dedup_on = config.dedup_on;
-    // Rounded up, so the key lives at least until `retention_until` (#2621).
-    let ttl_secs = crate::source_freshness::whole_seconds_rounded_up(
-        retention_until.signed_duration_since(now),
-    )
-    .max(1) as u64;
+    let ttl_secs = retention_until
+        .signed_duration_since(now)
+        .num_seconds()
+        .max(1) as u64;
 
     tokio::task::spawn_blocking(move || -> Result<bool, IdempotencyError> {
         let client =
