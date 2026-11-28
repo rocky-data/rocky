@@ -257,6 +257,27 @@ impl DuckDbWarehouseAdapter {
         })
     }
 
+    /// Create an adapter over an existing database opened read-only. See
+    /// [`DuckDbConnector::open_read_only_with`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DuckDbConnector::open_read_only_with`].
+    pub fn open_read_only_with(
+        path: &std::path::Path,
+        opts: &crate::ExtensionOptions,
+    ) -> Result<Self, crate::DuckDbError> {
+        let connector = DuckDbConnector::open_read_only_with(path, opts)?;
+        Ok(Self {
+            connector: Arc::new(Mutex::new(connector)),
+            dialect: DuckDbSqlDialect::plain(),
+            concurrent_for_test: false,
+            default_catalog: Some(crate::dialect::catalog_name_for_path(
+                &path.to_string_lossy(),
+            )),
+        })
+    }
+
     /// Create an adapter from an existing connector.
     pub fn new(connector: DuckDbConnector) -> Self {
         Self {
@@ -1546,5 +1567,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(view_kind, ObjectKind::View);
+    }
+
+    /// The second safety layer of `rocky estimate`, tested on its own: even a
+    /// statement that reaches this adapter cannot change the database.
+    #[tokio::test]
+    async fn the_read_only_adapter_refuses_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.duckdb");
+        drop(crate::DuckDbConnector::open(&path).unwrap());
+        let adapter =
+            DuckDbWarehouseAdapter::open_read_only_with(&path, &Default::default()).unwrap();
+        let refused = adapter.execute_statement("CREATE TABLE t (id INT)").await;
+        assert!(refused.is_err(), "a read-only database accepted a write");
     }
 }

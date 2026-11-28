@@ -230,6 +230,64 @@ pub fn is_single_select(sql: &str) -> bool {
     matches!(parse_single_statement(sql), Ok(Statement::Query(_)))
 }
 
+/// Why [`require_single_statement`] could not accept a string.
+#[derive(Debug, Error)]
+pub enum SingleStatementError {
+    #[error("the SQL holds {0} statements, not one")]
+    Several(usize),
+
+    #[error("the SQL could not be parsed to check that it is one statement: {0}")]
+    Unparseable(String),
+
+    #[error(
+        "the SQL holds a `;` that cannot be proven to be inside a string or comment on every warehouse: {0}"
+    )]
+    AmbiguousSemicolon(String),
+}
+
+/// Accept `sql` only when it is provably one statement, and return it without
+/// its trailing `;`.
+///
+/// Use it before handing a string to a call that runs every statement it
+/// finds but reports only one, such as `EXPLAIN {sql}`: DuckDB and the
+/// PostgreSQL simple query protocol both execute the statements after the
+/// first.
+///
+/// Two checks, and both must pass:
+///
+/// 1. The parser reads exactly one statement.
+/// 2. If a `;` remains, [`crate::validation::reject_statement_terminator`]
+///    shows it is inside a string or comment that every warehouse lexes the
+///    same way. The parser alone is not enough: a warehouse that lexes a
+///    string or comment differently would see a second statement. A `$` is
+///    refused too, because a dollar-quote tag can hide a quote.
+///
+/// A SQL text with no `;` cannot hold a second statement on any warehouse
+/// Rocky sends `EXPLAIN` to.
+///
+/// # Errors
+///
+/// [`SingleStatementError`] when the SQL holds several statements, cannot be
+/// parsed, or holds a `;` the lexical check cannot clear.
+pub fn require_single_statement(sql: &str) -> Result<&str, SingleStatementError> {
+    let sql = sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    match parse_sql(sql) {
+        Ok(statements) if statements.len() == 1 => {}
+        Ok(statements) => return Err(SingleStatementError::Several(statements.len())),
+        Err(error) => return Err(SingleStatementError::Unparseable(error.to_string())),
+    }
+    if sql.contains(';') {
+        if sql.contains('$') {
+            return Err(SingleStatementError::AmbiguousSemicolon(
+                "the SQL also holds a `$`".to_string(),
+            ));
+        }
+        crate::validation::reject_statement_terminator("the SQL", sql)
+            .map_err(|error| SingleStatementError::AmbiguousSemicolon(error.to_string()))?;
+    }
+    Ok(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +415,43 @@ mod tests {
     fn test_isolate_cte_rejects_multi_statement() {
         let sql = "WITH a AS (SELECT 1) SELECT * FROM a; SELECT 2";
         assert!(matches!(isolate_cte(sql, "a"), Err(CteError::Parse(_))));
+    }
+
+    #[test]
+    fn single_statement_accepts_one_statement() {
+        for sql in [
+            "SELECT 1",
+            "SELECT 1;",
+            "SELECT 1 ;\n;  ",
+            "SELECT ';' AS separator",
+            "SELECT 1 -- a note; with a semicolon\n",
+            "SELECT /* a; b */ 1",
+            "CREATE OR REPLACE TABLE c.s.t AS\nSELECT 1",
+        ] {
+            assert!(require_single_statement(sql).is_ok(), "{sql}");
+        }
+        assert_eq!(require_single_statement("SELECT 1;\n").unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn single_statement_refuses_what_it_cannot_prove() {
+        for sql in [
+            "SELECT 1; DROP TABLE t",
+            "SELECT 1;\nSELECT 2",
+            "DELETE FROM t WHERE 1;\nINSERT INTO t SELECT 1",
+            "SELECT 1) AS x; DROP TABLE t; SELECT (1",
+            "BEGIN TRANSACTION;\nDELETE FROM t;\nCOMMIT",
+            // A warehouse that nests block comments, or ends a line comment at
+            // a carriage return, reads these differently from one that does not.
+            "SELECT 1 /* /* */ ; DROP TABLE t; /* */ */",
+            "SELECT 1 -- x\r; DROP TABLE t",
+            "SELECT 'a\\' ; DROP TABLE t; --'",
+            "SELECT $$'$$; DROP TABLE t; --'",
+            "",
+            "SELEC 1",
+        ] {
+            assert!(require_single_statement(sql).is_err(), "{sql}");
+        }
     }
 
     #[test]
