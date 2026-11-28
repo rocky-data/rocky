@@ -588,9 +588,11 @@ impl RockyLsp {
                     tokio::task::spawn_blocking(move || {
                         let resolved = CastTargets::resolve(&config_for_blocking.models_dir);
                         config_for_blocking.target_dialects = resolved.targets.clone();
-                        rocky_compiler::compile::compile(&config_for_blocking)
-                            .ok()
-                            .map(|result| (result, Some(resolved)))
+                        rocky_compiler::compile::compile_refusing_unparseable_models(
+                            &config_for_blocking,
+                        )
+                        .ok()
+                        .map(|result| (result, Some(resolved)))
                     })
                     .await
                     .ok()
@@ -1055,7 +1057,7 @@ impl RockyLsp {
         // Read before the generation is taken (see `compile_failed`).
         let stores_at_start = self.published_files.stores();
         let generation = self.published_files.begin_compile();
-        match rocky_compiler::compile::compile(&config) {
+        match rocky_compiler::compile::compile_refusing_unparseable_models(&config) {
             Ok(mut result) => {
                 #[cfg(test)]
                 publish_gate::wait(&dir_path).await;
@@ -5394,6 +5396,13 @@ fn diagnostics_by_uri(result: &CompileResult) -> HashMap<Url, Vec<Diagnostic>> {
                 Some(path) => lexically_normalized(&path),
                 None => continue,
             }
+        } else if &*d.code == rocky_compiler::diagnostic::E074 {
+            // A refused model is not in the project: the diagnostic names
+            // its file in its span (#2618).
+            match d.span.as_ref().filter(|s| !s.file.is_empty()) {
+                Some(span) => lexically_normalized(std::path::Path::new(&span.file)),
+                None => continue,
+            }
         } else if rocky_compiler::consumers::is_consumer_diagnostic(d) {
             // A consumer record is not a model: the diagnostic names the
             // `consumers/<name>.toml` file in its span.
@@ -5704,7 +5713,18 @@ pub fn compile_incremental(
     previous: &CompileResult,
     config: &CompilerConfig,
 ) -> std::result::Result<CompileResult, rocky_compiler::compile::CompileError> {
-    rocky_compiler::compile::compile_incremental(config, changed_files, previous)
+    use rocky_compiler::compile::CompileError;
+    use rocky_compiler::project::ProjectError;
+    use rocky_compiler::resolve::ResolveError;
+    match rocky_compiler::compile::compile_incremental(config, changed_files, previous) {
+        // The incremental path refuses the project when a model does not
+        // parse. Compile in full then, refusing only that model and its
+        // readers, as the full LSP compile does (#2618).
+        Err(CompileError::Project(ProjectError::Resolve(
+            ResolveError::LineageExtractionMany { .. },
+        ))) => rocky_compiler::compile::compile_refusing_unparseable_models(config),
+        other => other,
+    }
 }
 
 // ── Server entry point ──────────────────────────────────────────────────────
@@ -5780,6 +5800,77 @@ pub async fn run_lsp() {
 
 #[cfg(test)]
 mod tests {
+    /// #2618: an edit that breaks a model's SQL gives the incremental LSP
+    /// compile the same result as a full one: `E074` on the model and its
+    /// reader, placed on their files, and the rest compiled. Fixing the file
+    /// again matches the full compile too.
+    #[test]
+    fn an_unparseable_model_compiles_the_same_incrementally_and_in_full() {
+        use rocky_compiler::compile::{CompilerConfig, compile_refusing_unparseable_models};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).expect("models dir");
+        std::fs::write(
+            models.join("_defaults.toml"),
+            "[target]\ncatalog = \"analytics\"\nschema = \"marts\"\n",
+        )
+        .expect("write _defaults.toml");
+        let write = |name: &str, sql: &str| {
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n"),
+            )
+            .expect("write sidecar");
+            std::fs::write(models.join(format!("{name}.sql")), sql).expect("write model");
+        };
+        write("up", "SELECT 1 AS id");
+        write("reader", "SELECT id FROM up");
+        write("other", "SELECT 2 AS id");
+        let config = CompilerConfig {
+            models_dir: models.clone(),
+            ..Default::default()
+        };
+        let rendered = |result: &CompileResult| {
+            let mut out: Vec<String> = result
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}:{}:{}", d.code, d.model, d.message))
+                .collect();
+            out.sort();
+            out
+        };
+        let healthy = compile_refusing_unparseable_models(&config).expect("compile");
+
+        write("up", "SELECT FROM WHERE (");
+        let changed = [models.join("up.sql")];
+        let broken = compile_incremental(&changed, &healthy, &config).expect("incremental");
+        let full = compile_refusing_unparseable_models(&config).expect("full");
+        assert_eq!(rendered(&broken), rendered(&full));
+        let refused: Vec<&str> = broken
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E074")
+            .map(|d| d.model.as_str())
+            .collect();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        let by_uri = diagnostics_by_uri(&broken);
+        for name in ["up", "reader"] {
+            let uri = Url::from_file_path(models.join(format!("{name}.sql"))).unwrap();
+            assert!(
+                by_uri.get(&uri).is_some_and(|d| d
+                    .iter()
+                    .any(|d| d.code == Some(NumberOrString::String("E074".to_string())))),
+                "{name} gets its E074 on its file: {by_uri:?}"
+            );
+        }
+
+        write("up", "SELECT 1 AS id");
+        let fixed = compile_incremental(&changed, &broken, &config).expect("incremental");
+        let full = compile_refusing_unparseable_models(&config).expect("full");
+        assert_eq!(rendered(&fixed), rendered(&full));
+        assert!(!fixed.has_errors, "{:?}", fixed.diagnostics);
+    }
+
     /// #1817 / #1822 round four: a startup compile that fails must reach the
     /// EDITOR, not only the server log. Driven at the protocol level — a real
     /// `LspService`, a real `initialize` + `initialized` exchange — so what is

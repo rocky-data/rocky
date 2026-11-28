@@ -277,6 +277,124 @@ pub fn compile(config: &CompilerConfig) -> Result<CompileResult, CompileError> {
     compile_with_db(&mut db, config)
 }
 
+/// What a compile does with a model whose SQL does not parse (#2618).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseFailures {
+    /// Refuse the whole project: [`compile`] and every command that runs or
+    /// plans models.
+    RefuseProject,
+    /// Refuse that model and every model that reads it, and compile the
+    /// rest: `rocky compile` and the LSP only.
+    RefuseModel,
+}
+
+/// [`compile`], but a model whose SQL does not parse is refused alone with
+/// [`E074`](crate::diagnostic::E074), with every model that reads it, and
+/// the rest of the project still compiles (#2618).
+///
+/// Only `rocky compile` and the LSP call this. `rocky run`, `rocky plan` and
+/// the policy plane keep [`compile`], which refuses the whole project. The
+/// result has `has_errors` set whenever a model was refused.
+pub fn compile_refusing_unparseable_models(
+    config: &CompilerConfig,
+) -> Result<CompileResult, CompileError> {
+    let mut db = crate::salsa_compile::RockyDatabase::default();
+    compile_with_db_inner(&mut db, config, None, ParseFailures::RefuseModel)
+}
+
+/// [`compile_preloaded_models`] with the parse-failure rule of
+/// [`compile_refusing_unparseable_models`].
+pub fn compile_preloaded_models_refusing_unparseable(
+    models: Vec<rocky_core::models::Model>,
+    config: &CompilerConfig,
+) -> Result<CompileResult, CompileError> {
+    let total_start = Instant::now();
+    let load_start = Instant::now();
+    compile_preloaded_models_inner(
+        models,
+        config,
+        total_start,
+        load_start,
+        ParseFailures::RefuseModel,
+    )
+}
+
+/// Split `models` into the models to compile and one `E074` error for each
+/// model refused: every model whose SQL does not parse (`failures`), and
+/// every model that reads one through a declared `depends_on` or a bare read
+/// that binds to it, to any depth.
+///
+/// A refused model is left out of the compile, so a reader gets no cascade
+/// of errors about a relation Rocky could not read. The diagnostic carries
+/// the model's file in its span, so the LSP can place it.
+fn split_unparseable_models(
+    models: Vec<rocky_core::models::Model>,
+    failures: &[(String, String)],
+) -> (Vec<rocky_core::models::Model>, Vec<Diagnostic>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let failed: BTreeMap<&str, &str> = failures
+        .iter()
+        .map(|(model, reason)| (model.as_str(), reason.as_str()))
+        .collect();
+    let mut readers: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for (consumer, producer) in crate::resolve::derived_model_edges(&models) {
+        readers.entry(producer).or_default().insert(consumer);
+    }
+    for model in &models {
+        for producer in &model.config.depends_on {
+            readers
+                .entry(producer.clone())
+                .or_default()
+                .insert(model.config.name.clone());
+        }
+    }
+    // Each refused model, with the unparseable model it is refused for.
+    let mut refused: BTreeMap<String, String> = BTreeMap::new();
+    let mut queue: Vec<(String, String)> = failed
+        .keys()
+        .map(|name| ((*name).to_string(), (*name).to_string()))
+        .collect();
+    while let Some((name, cause)) = queue.pop() {
+        if refused.contains_key(&name) {
+            continue;
+        }
+        for reader in readers.get(&name).into_iter().flatten() {
+            if !refused.contains_key(reader) && !failed.contains_key(reader.as_str()) {
+                queue.push((reader.clone(), cause.clone()));
+            }
+        }
+        refused.insert(name, cause);
+    }
+    let mut kept = Vec::with_capacity(models.len());
+    let mut diagnostics = Vec::new();
+    for model in models {
+        let name = model.config.name.clone();
+        let Some(cause) = refused.get(&name) else {
+            kept.push(model);
+            continue;
+        };
+        let message = match failed.get(name.as_str()) {
+            Some(reason) => {
+                format!("the SQL of this model does not parse, so the model is refused: {reason}")
+            }
+            None => format!(
+                "this model reads `{cause}`, whose SQL does not parse, so it is refused \
+                 and not checked"
+            ),
+        };
+        diagnostics.push(
+            Diagnostic::error(crate::diagnostic::E074, &name, message).with_span(
+                crate::diagnostic::SourceSpan {
+                    file: model.file_path.display().to_string(),
+                    line: 1,
+                    col: 1,
+                },
+            ),
+        );
+    }
+    (kept, diagnostics)
+}
+
 /// Compile only model source files matching `models_glob`.
 ///
 /// The glob must use the same path form as [`CompilerConfig::models_dir`].
@@ -310,7 +428,7 @@ pub fn compile_with_db(
     db: &mut crate::salsa_compile::RockyDatabase,
     config: &CompilerConfig,
 ) -> Result<CompileResult, CompileError> {
-    compile_with_db_inner(db, config, None)
+    compile_with_db_inner(db, config, None, ParseFailures::RefuseProject)
 }
 
 /// Compile only matching model source files using the caller's salsa database.
@@ -319,7 +437,7 @@ pub fn compile_with_db_matching(
     config: &CompilerConfig,
     models_glob: &str,
 ) -> Result<CompileResult, CompileError> {
-    compile_with_db_inner(db, config, Some(models_glob))
+    compile_with_db_inner(db, config, Some(models_glob), ParseFailures::RefuseProject)
 }
 
 /// Compile already-loaded models through the normal preprocessing pipeline.
@@ -333,13 +451,20 @@ pub fn compile_preloaded_models(
 ) -> Result<CompileResult, CompileError> {
     let total_start = Instant::now();
     let load_start = Instant::now();
-    compile_preloaded_models_inner(models, config, total_start, load_start)
+    compile_preloaded_models_inner(
+        models,
+        config,
+        total_start,
+        load_start,
+        ParseFailures::RefuseProject,
+    )
 }
 
 fn compile_with_db_inner(
     db: &mut crate::salsa_compile::RockyDatabase,
     config: &CompilerConfig,
     models_glob: Option<&str>,
+    parse_failures: ParseFailures,
 ) -> Result<CompileResult, CompileError> {
     let total_start = Instant::now();
 
@@ -364,7 +489,7 @@ fn compile_with_db_inner(
             Project::load_models_with_db(&config.models_dir, db, Some(&config.project_freshness))?
         }
     };
-    compile_preloaded_models_inner(models, config, total_start, load_start)
+    compile_preloaded_models_inner(models, config, total_start, load_start, parse_failures)
 }
 
 fn compile_preloaded_models_inner(
@@ -372,9 +497,30 @@ fn compile_preloaded_models_inner(
     config: &CompilerConfig,
     total_start: Instant,
     load_start: Instant,
+    parse_failures: ParseFailures,
 ) -> Result<CompileResult, CompileError> {
-    let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
-    let project = Project::from_models_with_externals(models, &config.external_dependencies)?;
+    let mut run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
+    let project = match parse_failures {
+        ParseFailures::RefuseProject => {
+            Project::from_models_with_externals(models, &config.external_dependencies)?
+        }
+        // Only a project with a model that does not parse is split and
+        // resolved a second time.
+        ParseFailures::RefuseModel => {
+            match Project::from_models_with_externals(models.clone(), &config.external_dependencies)
+            {
+                Ok(project) => project,
+                Err(ProjectError::Resolve(
+                    crate::resolve::ResolveError::LineageExtractionMany { failures },
+                )) => {
+                    let (kept, refusals) = split_unparseable_models(models, &failures);
+                    run_var_diagnostics.extend(refusals);
+                    Project::from_models_with_externals(kept, &config.external_dependencies)?
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let mut result = compile_project(project, config, run_var_diagnostics)?;
@@ -3592,6 +3738,94 @@ mod tests {
             kept.type_check.typed_models["orders_v1"], first.type_check.typed_models["orders_v1"],
             "orders_v1 was marked, so its cached result is not what this test checks"
         );
+    }
+
+    /// #2618: the compile `rocky compile` and the LSP use refuses a model
+    /// whose SQL does not parse, with every model that reads it (a bare read
+    /// or a declared `depends_on`, to any depth), and compiles the rest. The
+    /// strict [`compile`] still refuses the whole project.
+    #[test]
+    fn an_unparseable_model_is_refused_alone_with_its_readers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::write(
+            models_dir.join("_defaults.toml"),
+            "[target]\ncatalog = \"analytics\"\nschema = \"marts\"\n",
+        )
+        .expect("write _defaults.toml");
+        let write = |name: &str, sql: &str, extra: &str| {
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n{extra}"),
+            )
+            .expect("write sidecar");
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).expect("write model");
+        };
+        write("good", "SELECT 1 AS id", "");
+        write("bad", "SELECT FROM WHERE (", "");
+        write("reads_bad", "SELECT * FROM bad", "");
+        write("reads_reader", "SELECT * FROM reads_bad", "");
+        write("reads_good", "SELECT id FROM good", "");
+        write("declares_bad", "SELECT 2 AS id", "depends_on = [\"bad\"]\n");
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let strict = compile(&config).err().expect("the strict compile refuses");
+        assert!(
+            strict.to_string().contains("failed to parse"),
+            "refused for the parse failure: {strict}"
+        );
+
+        let result = compile_refusing_unparseable_models(&config).expect("compile");
+        assert!(result.has_errors, "a refused model fails the compile");
+        let mut refused: Vec<(String, String)> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::diagnostic::Severity::Error)
+            .map(|d| (d.code.to_string(), d.model.clone()))
+            .collect();
+        refused.sort();
+        let e074 = |m: &str| ("E074".to_string(), m.to_string());
+        assert_eq!(
+            refused,
+            vec![
+                e074("bad"),
+                e074("declares_bad"),
+                e074("reads_bad"),
+                e074("reads_reader"),
+            ],
+            "only E074, on the bad model and its readers: {:?}",
+            result.diagnostics
+        );
+        let bad = result
+            .diagnostics
+            .iter()
+            .find(|d| d.model == "bad")
+            .expect("bad is reported");
+        assert!(bad.message.contains("does not parse"), "{bad:?}");
+        assert!(
+            bad.span
+                .as_ref()
+                .is_some_and(|s| s.file.ends_with("bad.sql")),
+            "the span names the file: {bad:?}"
+        );
+        for kept in ["good", "reads_good"] {
+            assert!(
+                result.project.model(kept).is_some(),
+                "{kept} still compiles"
+            );
+        }
+        assert!(result.project.model("bad").is_none());
+
+        // Healthy project: the same result as the strict compile.
+        write("bad", "SELECT 3 AS id", "");
+        let tolerant = compile_refusing_unparseable_models(&config).expect("compile");
+        let strict = compile(&config).expect("compile");
+        assert_eq!(diagnostic_set(&tolerant), diagnostic_set(&strict));
+        assert!(!tolerant.has_errors);
     }
 
     /// The guard behind the rules above. `compile_incremental` keeps a

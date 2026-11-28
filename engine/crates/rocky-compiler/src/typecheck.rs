@@ -19,7 +19,7 @@ use sqlparser::parser::Parser;
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E046, I001, I002,
-    SourceSpan, W001, W002, W004, W005, W006, W046, W056,
+    SourceSpan, W001, W002, W004, W005, W006, W046, W056, W072,
 };
 use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
 use crate::semantic::{ModelSchema, NamedRead, SemanticGraph};
@@ -1064,6 +1064,13 @@ fn compute_model_typecheck(
         // E071: set-operation branches with different column counts.
         diagnostics.extend(crate::set_operation::check_set_operation_widths(
             model_name, &model.sql,
+        ));
+        // W072: set-operation branch types with no common supertype.
+        diagnostics.extend(check_set_branch_types(
+            model_name,
+            &model.sql,
+            &|name| relations.get(model_name, name),
+            target,
         ));
         // E029: a bare column name two joined relations both provably have.
         diagnostics.extend(crate::ambiguous::check_ambiguous_columns(
@@ -5265,6 +5272,66 @@ fn combine_set_operation(
 
 /// The branches behind column `index` of one side of a set operation: the
 /// side's own branches when it is a set operation, else the column alone.
+/// `W072`: a column of the model's set operation whose branch types have no
+/// common supertype (#2661), such as `INTEGER` with `VARCHAR`.
+///
+/// DuckDB casts such branches and runs the query; other warehouses may refuse
+/// it or fail on a value at run time. So it is a warning on every dialect.
+/// A branch of `Unknown` type leaves the column unchecked. A set of numeric
+/// types is not reported: every warehouse has a numeric type for it, even
+/// where [`common_supertype_of`] has none (a float with a decimal). Only the
+/// model's own query body is read, through nested set operations; a set
+/// operation inside a CTE or a subquery is not checked.
+fn check_set_branch_types<'a>(
+    model_name: &str,
+    sql: &str,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    target: &OperandTarget,
+) -> Vec<Diagnostic> {
+    let lower = sql.to_ascii_lowercase();
+    if !["union", "intersect", "except", "minus"]
+        .iter()
+        .any(|op| lower.contains(op))
+    {
+        return Vec::new();
+    }
+    let Ok(inferred) = infer_select_types_with_lookup(sql, lookup, target) else {
+        return Vec::new();
+    };
+    if !inferred.set_operation {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (column, branches) in inferred.columns.iter().zip(&inferred.set_branches) {
+        if !set_branch_types_conflict(&branches.types) {
+            continue;
+        }
+        let types: Vec<String> = branches.types.iter().map(ToString::to_string).collect();
+        out.push(Diagnostic::warning(
+            W072,
+            model_name,
+            format!(
+                "the branches of this set operation give column `{}` the types {}, \
+                 which have no common type. DuckDB casts them; another warehouse \
+                 may refuse the query or fail on a value. Cast the branches to one type",
+                column.name,
+                types.join(", ")
+            ),
+        ));
+    }
+    out
+}
+
+/// Whether a set-operation column's branch types have no common supertype,
+/// with every branch typed and not all of them numeric.
+fn set_branch_types_conflict(types: &[RockyType]) -> bool {
+    if types.contains(&RockyType::Unknown) || types.iter().all(RockyType::is_numeric) {
+        return false;
+    }
+    let inferred = common_supertype_of(types);
+    inferred.ty == RockyType::Unknown && !inferred.over_cap
+}
+
 fn set_branches_of(sides: &[SetBranches], index: usize, column: &TypedColumn) -> SetBranches {
     sides.get(index).cloned().unwrap_or_else(|| SetBranches {
         types: vec![column.data_type.clone()],
@@ -7861,6 +7928,76 @@ mod tests {
         let rows =
             typecheck_over_t_and_u("SELECT CAST(n AS INT) AS c FROM t UNION ALL SELECT x FROM u");
         assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+    }
+
+    /// #2661: set-operation branch types with no common supertype are the
+    /// warning `W072` on every dialect, one per column. Numeric sets, agreeing
+    /// branches and an unknown branch stay silent.
+    #[test]
+    fn set_operation_branch_types_with_no_common_type_warn() {
+        let w072 = |sql: &str, dialect: OperandTarget| -> Vec<Diagnostic> {
+            let schema = || {
+                source_schema(&[
+                    ("x", RockyType::Int32, false),
+                    ("n", RockyType::String, false),
+                    ("f", RockyType::Float64, false),
+                    ("d", RockyType::Date, false),
+                    ("ts", RockyType::Timestamp, false),
+                ])
+            };
+            let sources = HashMap::from([("t".to_string(), schema()), ("u".to_string(), schema())]);
+            let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            typecheck_project_for_targets(
+                &graph,
+                &sources,
+                &project.models,
+                None,
+                &TargetDialects::uniform(dialect),
+            )
+            .diagnostics
+            .into_iter()
+            .filter(|d| &*d.code == "W072")
+            .collect()
+        };
+        for dialect in [
+            OperandDialect::DuckDb,
+            OperandDialect::BigQuery,
+            OperandDialect::Snowflake,
+        ] {
+            let found = w072(
+                "SELECT x AS c FROM t UNION ALL SELECT n FROM u",
+                Some(dialect).into(),
+            );
+            assert_eq!(found.len(), 1, "{dialect:?}: {found:?}");
+            assert_eq!(
+                found[0].severity,
+                crate::diagnostic::Severity::Warning,
+                "{found:?}"
+            );
+            assert!(found[0].message.contains("`c`"), "{found:?}");
+        }
+        for sql in [
+            // A third branch, through a nested set operation.
+            "SELECT x AS c FROM t UNION ALL (SELECT x FROM u UNION ALL SELECT n FROM u)",
+            "SELECT x AS c, n AS d FROM t INTERSECT SELECT x, x FROM u",
+            // Rocky has no common type for DATE with TIMESTAMP. DuckDB casts
+            // the date; BigQuery coerces a DATE only to DATETIME.
+            "SELECT d AS c FROM t UNION ALL SELECT ts FROM u",
+        ] {
+            assert_eq!(w072(sql, duckdb()).len(), 1, "{sql}");
+        }
+        for sql in [
+            "SELECT x AS c FROM t UNION ALL SELECT x FROM u",
+            "SELECT x AS c FROM t UNION ALL SELECT f FROM u",
+            "SELECT x AS c FROM t UNION ALL SELECT NULL FROM u",
+            "SELECT x AS c FROM t UNION ALL SELECT missing FROM u",
+            "SELECT x AS c FROM t",
+            // Not the model's own body: not checked.
+            "WITH w AS (SELECT x AS c FROM t UNION ALL SELECT n FROM u) SELECT c FROM w",
+        ] {
+            assert!(w072(sql, duckdb()).is_empty(), "{sql}");
+        }
     }
 
     /// #2304: lineage reads a CTE column as the same-named column of a source

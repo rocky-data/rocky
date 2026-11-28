@@ -277,7 +277,28 @@ A branch is counted only when its select list states its width. A `*`, a `t.*`, 
 
 `E071` marks the places where tests show DuckDB checks the query, even a subquery that never runs. These places nest: a subquery in the `WHERE` of a derived table counts. `W071` marks places a warehouse can skip (a CTE nothing reads, a window nothing uses, an argument a DuckDB macro drops), so the model may still run.
 
-Rocky does not check column types across branches. DuckDB accepts every type mix at check time, though a mix can still fail on real rows (`Conversion Error`). The other warehouses are not checked yet.
+#### Set-operation branch types with no common type (`W072`)
+
+`W072` warns, on every warehouse, when the branches of a `UNION`, `INTERSECT` or `EXCEPT` give a column types with no common type:
+
+```sql
+-- W072: the branches give column `id` the types INT, STRING
+SELECT order_id AS id FROM orders UNION ALL SELECT name FROM customers
+```
+
+DuckDB casts the branches and runs the query, though a value can still fail to cast (`Conversion Error`). Another warehouse may refuse the query. Cast the branches to one type.
+
+These are not reported:
+
+- a branch whose type Rocky does not know;
+- a set of numeric types, even one Rocky has no common type for (a float with a decimal): every warehouse has a numeric type for it;
+- a set operation inside a CTE or a subquery. Only the model's own query is checked, nested set operations included.
+
+#### A model whose SQL does not parse (`E074`)
+
+`rocky compile` and the language server refuse a model whose SQL does not parse with `E074`, and compile the rest of the project. Every model that reads it is refused with `E074` too, through a bare read or a declared `depends_on`, to any depth. A refused model is not type-checked, so its readers get no other errors. `rocky compile` still exits non-zero.
+
+`rocky run`, `rocky plan` and every other command still refuse the whole project when one model does not parse.
 
 ### 5. Validate contracts
 
@@ -517,6 +538,7 @@ Every finding carries a code, a severity, a source span and sometimes a suggeste
 | `E068` / `W068` | A call to a DuckDB built-in passes a number of arguments it does not take, in a place tests show DuckDB checks. Only when the model runs on DuckDB. `W068` in a place DuckDB may skip, such as a CTE body, a named `WINDOW` or an argument of another call. See [Calls with an argument count DuckDB refuses](#calls-with-an-argument-count-duckdb-refuses-e068-w068) |
 | `E071` / `W071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns. `W071` in a place the warehouse may skip. See [Set operations](#set-operations-with-different-column-counts-e071-w071) |
 | `E073` | The project's `data/seed.sql` is there but cannot be read, and a DuckDB call would get `E057` or `E068`. The seed may create that name, so the call is refused. The message names the seed and the read failure. See [A seed file that cannot be read](#a-seed-file-that-cannot-be-read-e073) |
+| `E074` | `rocky compile` and the language server only: the model's SQL does not parse, or the model reads one whose SQL does not parse. The rest of the project still compiles. See [A model whose SQL does not parse](#a-model-whose-sql-does-not-parse-e074) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The output repeats a column name and the strategy rebuilds the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`): the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream with unknown schema |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -533,6 +555,7 @@ Every finding carries a code, a severity, a source span and sometimes a suggeste
 | `W051` | A user-defined function call could not be fully verified (an unknown argument type, or an implicit argument conversion) |
 | `W053` | A `[clickhouse]` `order_by` or `partition_by` column is not in the model's output |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this |
+| `W072` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` give a column types with no common type. Numeric sets and set operations inside a CTE or subquery are not checked. See [Set-operation branch types](#set-operation-branch-types-with-no-common-type-w072) |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, `severity`). It still works; the message names the `warn_after` / `error_after` replacement |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |

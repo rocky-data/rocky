@@ -137,6 +137,8 @@ pub fn run_compile_with_options(
         strict_sources,
         strict_contracts,
         selection,
+        // `rocky compile` refuses an unparseable model alone (#2618).
+        compile::ParseFailures::RefuseModel,
     )?;
 
     if deny_warnings(&mut output.diagnostics, deny_warning_codes) {
@@ -285,6 +287,7 @@ fn compile_inner(
     strict_sources: bool,
     strict_contracts: bool,
     selection: Option<&crate::selection::SelectionArgs>,
+    parse_failures: compile::ParseFailures,
 ) -> Result<(CompileOutput, CompileTextData)> {
     // Load the project config ONCE, and let a failure fail the command.
     //
@@ -464,9 +467,17 @@ fn compile_inner(
         }
         config.project = Some(context);
     }
-    let compiled = match whole_project {
-        Some(models) => compile::compile_preloaded_models(models, &config),
-        None => compile::compile(&config),
+    let compiled = match (whole_project, parse_failures) {
+        (Some(models), compile::ParseFailures::RefuseProject) => {
+            compile::compile_preloaded_models(models, &config)
+        }
+        (Some(models), compile::ParseFailures::RefuseModel) => {
+            compile::compile_preloaded_models_refusing_unparseable(models, &config)
+        }
+        (None, compile::ParseFailures::RefuseProject) => compile::compile(&config),
+        (None, compile::ParseFailures::RefuseModel) => {
+            compile::compile_refusing_unparseable_models(&config)
+        }
     };
     let mut result = match compiled {
         Ok(result) => result,
@@ -1547,6 +1558,9 @@ pub fn compile_output(
         // Likewise `[contracts] strict` still applies.
         false,
         None,
+        // These callers (MCP, ci, dag, fulfill) keep the whole-project
+        // refusal (#2618).
+        compile::ParseFailures::RefuseProject,
     )?;
     Ok(output)
 }
@@ -3673,6 +3687,7 @@ schema_template = "s"
             strict_sources,
             false,
             None,
+            compile::ParseFailures::RefuseProject,
         )
         .expect("compile should produce output")
         .0
@@ -3874,6 +3889,7 @@ schema_template = "s"
                 false,
                 false,
                 None,
+                compile::ParseFailures::RefuseProject,
             )
             .unwrap()
             .0
@@ -3958,6 +3974,7 @@ schema_template = "s"
             false,
             false,
             None,
+            compile::ParseFailures::RefuseProject,
         )
         .unwrap()
         .0
