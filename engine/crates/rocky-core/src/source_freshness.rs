@@ -404,17 +404,36 @@ pub fn evaluate(
         };
         return (status, None);
     };
-    let age = (now - max).num_seconds();
+    let gap = now - max;
+    // Rounded up, never toward zero: 12h and half a second is past a 12h
+    // limit (#2621). For whole-second limits this is the exact comparison.
+    let age = whole_seconds_rounded_up(gap);
     let exceeds =
         |limit: Option<u64>| limit.is_some_and(|l| age > i64::try_from(l).unwrap_or(i64::MAX));
+    let too_far_ahead = gap < -chrono::TimeDelta::seconds(FUTURE_SKEW_TOLERANCE_SECONDS);
     let status = if exceeds(thresholds.error_after_seconds) {
         FreshnessStatus::Error
-    } else if exceeds(thresholds.warn_after_seconds) || age < -FUTURE_SKEW_TOLERANCE_SECONDS {
+    } else if exceeds(thresholds.warn_after_seconds) || too_far_ahead {
         FreshnessStatus::Warn
     } else {
         FreshnessStatus::Pass
     };
     (status, Some(age))
+}
+
+/// `delta` in whole seconds, rounded up (toward positive infinity).
+///
+/// Use it where a measured gap is compared with a whole-second limit.
+/// `TimeDelta::num_seconds` rounds toward zero, so a gap of `N.9` seconds
+/// would read as `N` and pass a limit of `N` (#2621). Rounded up, `gap > N`
+/// holds exactly when the true gap is past `N`.
+pub fn whole_seconds_rounded_up(delta: chrono::TimeDelta) -> i64 {
+    let whole = delta.num_seconds();
+    if delta > chrono::TimeDelta::seconds(whole) {
+        whole.saturating_add(1)
+    } else {
+        whole
+    }
 }
 
 /// How far in the future the newest load time may be before [`evaluate`]
@@ -659,6 +678,34 @@ mod tests {
             evaluate(Some(drift), now(), &t),
             (FreshnessStatus::Pass, Some(-30))
         );
+    }
+
+    /// #2621: a gap half a second past the limit trips it. It used to be
+    /// read as the whole limit and pass.
+    #[test]
+    fn evaluate_trips_a_limit_passed_by_under_a_second() {
+        let t = cfg(Some("12h"), Some("24h")).validate().unwrap();
+        let just_past = now() - chrono::Duration::hours(12) - chrono::Duration::milliseconds(500);
+        assert_eq!(
+            evaluate(Some(just_past), now(), &t),
+            (FreshnessStatus::Warn, Some(12 * 3_600 + 1))
+        );
+        let far_ahead = now() + chrono::Duration::seconds(60) + chrono::Duration::milliseconds(500);
+        assert_eq!(
+            evaluate(Some(far_ahead), now(), &t).0,
+            FreshnessStatus::Warn
+        );
+    }
+
+    #[test]
+    fn whole_seconds_round_up_not_toward_zero() {
+        let ms = chrono::TimeDelta::milliseconds;
+        assert_eq!(whole_seconds_rounded_up(ms(0)), 0);
+        assert_eq!(whole_seconds_rounded_up(ms(1_000)), 1);
+        assert_eq!(whole_seconds_rounded_up(ms(1_001)), 2);
+        assert_eq!(whole_seconds_rounded_up(ms(999)), 1);
+        assert_eq!(whole_seconds_rounded_up(ms(-500)), 0);
+        assert_eq!(whole_seconds_rounded_up(ms(-1_500)), -1);
     }
 
     #[test]

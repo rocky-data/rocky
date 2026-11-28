@@ -10219,8 +10219,33 @@ async fn run_batched_checks(
             match readable {
                 Some(fr) => match (fr.max_timestamp, fr.row_count) {
                     (Some(ts), _) => {
-                        let lag = (now - ts).num_seconds().unsigned_abs();
-                        Some((key, checks::grade_freshness(lag, &freshness_levels)))
+                        // Rounded up, so a lag half a second past a level
+                        // trips it (#2621). A newest timestamp in the future
+                        // is not folded into the lag: within the clock-skew
+                        // tolerance it is fresh, past it the lag cannot be
+                        // measured, so the check is not evaluated (it used
+                        // to read the distance ahead as the lag).
+                        let gap = now - ts;
+                        let skew = chrono::TimeDelta::seconds(
+                            rocky_core::source_freshness::FUTURE_SKEW_TOLERANCE_SECONDS,
+                        );
+                        if gap < -skew {
+                            Some((
+                                key,
+                                checks::freshness_not_evaluated(
+                                    freshness_budget,
+                                    format!(
+                                        "the newest timestamp ({ts}) is more than {}s in the future, so there is no lag to measure",
+                                        skew.num_seconds()
+                                    ),
+                                ),
+                            ))
+                        } else {
+                            let lag = rocky_core::source_freshness::whole_seconds_rounded_up(gap)
+                                .max(0)
+                                .unsigned_abs();
+                            Some((key, checks::grade_freshness(lag, &freshness_levels)))
+                        }
                     }
                     (None, Some(rows)) if rows > 0 => Some((
                         key,

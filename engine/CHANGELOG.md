@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky fulfill`: a failing or refused unit test (`[[test]]`) now turns the verify bundle red, and the bundle's detail names each failing test (#2778). Before, the gate read only model execution failures, so a fixture test whose `expect` rows did not match passed and fulfill went on to propose.
+- Time limits are now compared at full precision, not truncated to whole seconds (#2621). A gap up to one second past a limit used to pass. This covers `rocky freshness`, the `[checks.freshness]` check in `rocky run`, the fulfill freshness budget, the `[branch.approval] max_age_seconds` expiry, and the Valkey idempotency key TTLs (now rounded up, so a key never expires early). In `rocky run`, a newest timestamp more than 60 seconds in the future is no longer read as lag: the freshness check reports it as not evaluated. Within 60 seconds it counts as fresh.
+- `rocky run` now warns when a `[budget]` limit cannot be checked because the adapter reported no figure for it: `max_bytes_scanned` with no bytes-scanned figure (Snowflake reports none), or `max_usd` with no cost figure (#2776). Before, the limit was skipped with no message.
+
 ## [1.95.0] — 2026-11-28
 
 ### Added

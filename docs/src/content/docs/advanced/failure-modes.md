@@ -186,7 +186,14 @@ This is the model graph only. Replicated tables use [`[execution] fail_fast`](/r
 
 **Guarantee scope.** Containment holds for a `depends_on` entry and for a physical read Rocky can resolve statically (`schema.table` or `catalog.schema.table`, quoted or not). Rocky folds both into the withholding closure and the execution order, so under `--parallel` a reader runs after every producer it reads.
 
-Rocky cannot enumerate reads in a CTE, sub-query or set operation. Such a model is still withheld when a known upstream failed, but its reads add no ordering edge. Under `--parallel`, a same-layer reader of a failing producer can then materialize on stale data, as in a fail-fast run. **List the dependency in `depends_on` when you need a hard guarantee.**
+Rocky cannot enumerate reads in a CTE, sub-query or set operation, or in SQL it cannot parse. Rocky cannot prove such a model is clear of a failure, so it fails closed: once **any** model in the run has failed, the model is withheld, even when it has no path to the failure. A project built mostly on CTEs therefore gets close to fail-fast behaviour from containment.
+
+```
+a fails      b  (SELECT ... FROM raw.x)                         builds
+             c  (WITH t AS (SELECT ... FROM raw.y) SELECT ...)  withheld, no path to a
+```
+
+These reads also add no ordering edge. Under `--parallel`, a same-layer reader of a failing producer can start before the failure and materialize on stale data, as in a fail-fast run. **List the dependency in `depends_on` when you need a hard guarantee.**
 
 ---
 
