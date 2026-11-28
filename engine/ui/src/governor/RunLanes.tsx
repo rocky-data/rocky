@@ -12,7 +12,7 @@ import {
   bucketCounts,
   groupLanes,
   laneHealth,
-  modelOk,
+  modelFill,
   runBucket,
   RUNS_ROUTE_CAP,
   windowPhrase,
@@ -54,6 +54,16 @@ function Tile({ label, value, sub }: { label: string; value: ReactNode; sub: str
 
 const TILE_BUCKETS: RunBucket[] = ["succeeded", "partly_failed", "failed"];
 
+/**
+ * The three outcome tiles always; skipped and other only when the read has
+ * some, so the tiles always add up to the runs read.
+ */
+function tileBuckets(list: RunHistoryRecord[] | null): RunBucket[] {
+  if (list === null) return TILE_BUCKETS;
+  const counts = bucketCounts(list);
+  return [...TILE_BUCKETS, ...(["skipped", "other"] as RunBucket[]).filter((bucket) => counts[bucket] > 0)];
+}
+
 function cellTitle(run: RunHistoryRecord): string {
   return `run ${run.run_id} · ${runStatusLabel(run.status)} · ${run.trigger} · started ${formatInstant(run.started_at)}`;
 }
@@ -81,7 +91,7 @@ function RunCell({ run }: { run: RunHistoryRecord }) {
 function laneName(pipeline: string | null): ReactNode {
   return pipeline ?? (
     <span className="text-muted">
-      no pipeline <Missing reason="these runs recorded no pipeline: a model-only or backfill run carries none" />
+      no pipeline <Missing reason="these runs recorded no pipeline (a model-only run, for example)" />
     </span>
   );
 }
@@ -119,7 +129,7 @@ export function RunLanes({ runs, now }: { runs: Resource<HistoryOutput>; now?: n
       ) : (
         <>
           <ul aria-label="Run health" className="grid gap-3 border-t border-divider px-5 py-4 sm:grid-cols-3">
-            {TILE_BUCKETS.map((bucket) => {
+            {tileBuckets(list).map((bucket) => {
               const counts = list === null ? null : bucketCounts(list);
               return (
                 <li key={bucket} aria-label={`${BUCKET_LABEL[bucket]} tile`}>
@@ -189,7 +199,13 @@ function Lanes({ runs, now }: { runs: RunHistoryRecord[]; now?: number }) {
             >
               <p className="flex items-baseline justify-between gap-2">
                 <span className="truncate font-mono text-sm font-semibold text-ink">{laneName(entry.pipeline)}</span>
-                <span className="text-xs text-muted">{runStatusLabel(entry.latest.status)}</span>
+                <span className="inline-flex items-center gap-1.5 text-xs text-muted">
+                  <span
+                    aria-hidden="true"
+                    className={`size-2 rounded-full ${BUCKET_FILL[runBucket(entry.latest.status)]}`}
+                  />
+                  {runStatusLabel(entry.latest.status)}
+                </span>
               </p>
               {entry.total > 0 && (
                 <div aria-hidden="true" className="mt-2 flex flex-wrap gap-1">
@@ -197,7 +213,7 @@ function Lanes({ runs, now }: { runs: RunHistoryRecord[]; now?: number }) {
                     <span
                       key={model.model_name}
                       title={`${model.model_name}: ${model.status}`}
-                      className={`size-3 rounded-sm ${modelOk(model.status) ? "bg-ok" : "bg-fail"}`}
+                      className={`size-3 rounded-sm ${modelFill(model.status)}`}
                     />
                   ))}
                 </div>
@@ -212,6 +228,7 @@ function Lanes({ runs, now }: { runs: RunHistoryRecord[]; now?: number }) {
               <p className="mt-1 text-xs text-muted">
                 run <CustodyLink subject={entry.latest.run_id} clip /> · {formatInstant(entry.latest.started_at, now)}
               </p>
+              <p className="mt-1 text-xs text-muted">newest run of this pipeline {span}</p>
             </li>
           ))}
         </ul>

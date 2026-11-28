@@ -96,6 +96,24 @@ export function modelOk(status: string): boolean {
   return status.toLowerCase() === "success";
 }
 
+/**
+ * A model square's fill. The run path writes `success` or `failed`; a status
+ * this does not know is grey, neither ok nor failed.
+ */
+export function modelFill(status: string): string {
+  switch (status.toLowerCase()) {
+    case "success":
+      return "bg-ok";
+    case "failed":
+    case "failure":
+    case "fail":
+    case "error":
+      return "bg-fail";
+    default:
+      return "bg-line";
+  }
+}
+
 export interface LaneHealth {
   pipeline: string | null;
   latest: RunHistoryRecord;

@@ -13,6 +13,15 @@ import {
 } from "../operator";
 import { BriefScreen } from "./BriefScreen";
 
+// The screen's default runs loader reads `GET /api/v1/runs`. These tests are
+// about the digest, so that read never reaches a network: it is refused here.
+vi.stubGlobal(
+  "fetch",
+  vi.fn(async () => {
+    throw new Error("no network in the BriefScreen tests");
+  }),
+);
+
 const NOW = Date.parse("2026-09-05T08:00:00Z");
 const PLAN = "a".repeat(64);
 

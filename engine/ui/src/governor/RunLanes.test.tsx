@@ -4,7 +4,7 @@ import type { BriefOutput } from "@rocky-types/brief";
 import type { HistoryOutput, RunHistoryRecord } from "@rocky-types/history";
 import { ApiError } from "../api";
 import { BriefScreen } from "./BriefScreen";
-import { bucketCounts, groupLanes, laneHealth, runBucket, windowPhrase } from "./runLaneModel";
+import { bucketCounts, groupLanes, laneHealth, modelFill, runBucket, windowPhrase } from "./runLaneModel";
 
 const NOW = Date.parse("2026-09-05T08:00:00Z");
 
@@ -87,6 +87,10 @@ describe("run lane mapping", () => {
     expect(runBucket("Failure")).toBe("failed");
     expect(runBucket("SkippedInFlight")).toBe("skipped");
     expect(runBucket("SomethingNew")).toBe("other");
+    expect(modelFill("success")).toBe("bg-ok");
+    expect(modelFill("failed")).toBe("bg-fail");
+    // A model status this does not know is neither ok nor failed.
+    expect(modelFill("pending")).toBe("bg-line");
     const counts = bucketCounts(RUNS);
     expect(counts).toEqual({ succeeded: 2, partly_failed: 1, failed: 1, skipped: 1, other: 0 });
     expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(RUNS.length);
@@ -111,14 +115,21 @@ describe("run lane mapping", () => {
 describe("Recent runs on the Inbox", () => {
   it("shows tiles with their window, one lane per pipeline, and each run links to its custody", async () => {
     render(<BriefScreen load={async () => QUIET} loadRuns={async () => HISTORY} now={NOW} />);
-    const tiles = (await screen.findByRole("list", { name: "Run lanes" }), screen.getByRole("list", { name: "Run health" }));
+    await screen.findByRole("list", { name: "Run lanes" });
+    const tiles = screen.getByRole("list", { name: "Run health" });
     const succeeded = within(tiles).getByRole("listitem", { name: "succeeded tile" });
     expect(succeeded).toHaveTextContent("2");
     expect(succeeded).toHaveTextContent("of the last 5 runs (all that are recorded)");
     expect(within(tiles).getByRole("listitem", { name: "failed tile" })).toHaveTextContent(/^Failed1of the last 5/);
+    // Skipped has a run, so it gets a tile; other has none, so it does not.
+    expect(within(tiles).getByRole("listitem", { name: "skipped tile" })).toHaveTextContent(/^Skipped1of/);
+    expect(within(tiles).queryByRole("listitem", { name: "other status tile" })).toBeNull();
+    let sum = 0;
     for (const item of within(tiles).getAllByRole("listitem")) {
       expect(item).toHaveTextContent(/of the last \d+ runs?/);
+      sum += Number(/^\D+(\d+)of/.exec(item.textContent ?? "")?.[1]);
     }
+    expect(sum).toBe(RUNS.length);
 
     const lanes = screen.getByRole("list", { name: "Run lanes" });
     const cell = within(lanes).getByRole("link", { name: /^run run-5 · Partly failed/ });
@@ -128,6 +139,10 @@ describe("Recent runs on the Inbox", () => {
 
     const health = screen.getByRole("listitem", { name: "ingest health" });
     expect(health).toHaveTextContent("1 of 2 models ok · products (failed)");
+    expect(health).toHaveTextContent("newest run of this pipeline of the last 5 runs");
+    for (const tile of within(screen.getByRole("list", { name: "Health by pipeline" })).getAllByRole("listitem")) {
+      expect(tile).toHaveTextContent(/of the last \d+ runs?/);
+    }
     expect(within(health).getByRole("link", { name: "run-5" })).toHaveAttribute(
       "href",
       "/ui/governor/custody/run-5",
