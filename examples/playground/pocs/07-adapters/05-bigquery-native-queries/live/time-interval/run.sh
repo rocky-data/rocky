@@ -9,14 +9,14 @@
 #
 # Required env:
 #   GCP_PROJECT_ID                  — GCP project to run against
-#   GOOGLE_APPLICATION_CREDENTIALS  — path to SA JSON key (or BIGQUERY_TOKEN)
+#   GOOGLE_APPLICATION_CREDENTIALS  — path to SA JSON key
 # Optional:
 #   BQ_LOCATION                     — dataset location (default: EU)
 
 set -euo pipefail
 
 : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before running this live smoke test}"
-: "${GOOGLE_APPLICATION_CREDENTIALS:?Set GOOGLE_APPLICATION_CREDENTIALS or BIGQUERY_TOKEN}"
+: "${GOOGLE_APPLICATION_CREDENTIALS:?Set GOOGLE_APPLICATION_CREDENTIALS}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
@@ -36,8 +36,8 @@ trap drop_dataset EXIT
 
 echo "==> dataset: $GCP_PROJECT_ID.$DATASET (location: $LOCATION)"
 
-# Pre-create the target dataset. `run_transformation` doesn't honor
-# `auto_create_schemas` today (see ../README.md), so the dataset must
+# Pre-create the target dataset. `auto_create_schemas` defaults to false
+# and the live config does not set it (see ../README.md), so the dataset must
 # exist before CREATE TABLE / DML transactions run.
 bq --location="$LOCATION" --project_id="$GCP_PROJECT_ID" \
    mk --dataset "$DATASET"

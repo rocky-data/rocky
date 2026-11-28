@@ -7,8 +7,9 @@ cd "$HERE"
 mkdir -p expected
 
 # ai-sync scans models with an `intent` field and proposes intent-guided
-# updates. Upstream schema-change detection is not yet wired in the engine
-# (see README) — proposals are driven by declared intent alone.
+# updates. It keeps a per-model baseline of upstream column types: the first
+# sync (as on a clean checkout) has no baseline and follows intent alone; later
+# syncs feed upstream changes into the prompt (see README).
 rocky ai-sync --models models 2>&1 | tee expected/sync.log
 
 echo
