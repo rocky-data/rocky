@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.95.0] — 2026-11-28
+
 ### Added
 
 - **rocky serve:** six more read routes: `GET /api/v1/catalog`, `/packages`, `/hooks`, `/retention`, `/gc/derivable` and `/lint`. Each route is pure. It writes no state, file, cache or lockfile. It calls no warehouse and no network. No response names an absolute local path: file and lockfile paths are relative to the project root. `/retention`, `/gc/derivable` and `/lint` print the same payload as their CLI command, and `/hooks` has the same shape with each command cut to its program name. `/catalog` differs in `generated_at` and `duration_ms`, and it uses the server's own compile and every pipeline's column descriptions. `/packages` differs in `lockfile`, which is relative. `/catalog` and `/gc/derivable` answer `503 engine_busy` for a busy state store, and read an absent store as empty without creating it. `/catalog`, `/packages` and `/hooks` work with no `rocky.toml`, as the CLI does. A bad config is `config_invalid`, and its message never quotes the TOML source line. `/gc/derivable` is the `--dry-run` report only and never reaches a plan or an apply. `/lint` never fixes, and lints every pipeline's models directory. `rocky hooks list --output json` and `/hooks` gain a `webhooks` field, and `total` now counts webhooks too. A webhook URL shows only its scheme and host. `/hooks` shows each hook command as its program only (`curl …`), because an argument often holds a secret. `rocky hooks list` still prints the full command. `env_keys` is sorted. `rocky gc` counts references to every artifact in one pass over the ledger, not one pass per artifact.
