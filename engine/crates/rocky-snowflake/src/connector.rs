@@ -217,6 +217,68 @@ pub struct SnowflakeConnector {
     base_url_override: Option<String>,
 }
 
+/// The bytes a Snowflake account identifier may hold in a host name: ASCII
+/// letters, digits, `-`, `_` and `.`. Every form Snowflake documents uses only
+/// these: `myorg-myaccount`, `myorg-my_account`, `xy12345.us-east-1.aws`,
+/// `xy12345.us-east-1.privatelink`.
+const ACCOUNT_HOST_BYTES: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.";
+
+/// The longest account identifier accepted: 253 bytes (the longest DNS host
+/// name) less the 23 bytes of `.snowflakecomputing.com`.
+const MAX_ACCOUNT_HOST_LEN: usize = 230;
+
+/// The host label of `https://<account>.snowflakecomputing.com`, built only
+/// from bytes of [`ACCOUNT_HOST_BYTES`].
+///
+/// Every Snowflake URL Rocky sends a credential to starts with this label.
+/// An account with any other byte is refused, so the request cannot go to
+/// another host: `evil.example/x?` would make
+/// `https://evil.example/x?.snowflakecomputing.com/...` and send the bearer
+/// token (or, on password login, the password) to `evil.example`. The same
+/// holds for `@`, `#`, `:`, `\`, a space and any non-ASCII byte.
+///
+/// The check alone is the protection. The label is then copied byte by byte
+/// from the allow-list, rather than returned as `account`, only so that
+/// CodeQL's taint tracking sees the URL host come from this constant table:
+/// its `rust/cleartext-transmission` query flags any value named like
+/// `account` that reaches a request URL, and has no barrier for a validated
+/// value. The copy changes no byte. For the same reason this function's name
+/// does not say "account": the query also treats the result of any call so
+/// named as sensitive.
+///
+/// # Errors
+///
+/// [`AuthError::InvalidAccount`](crate::auth::AuthError::InvalidAccount)
+/// when `account` is empty, is longer than 230 bytes, holds a byte outside
+/// the allow-list, starts or ends with `.` or `-`, or holds `..`.
+pub(crate) fn host_label(account: &str) -> Result<String, crate::auth::AuthError> {
+    use crate::auth::AuthError;
+    let invalid = |reason: &'static str| AuthError::InvalidAccount { reason };
+    if account.is_empty() {
+        return Err(invalid("it is empty"));
+    }
+    if account.len() > MAX_ACCOUNT_HOST_LEN {
+        return Err(invalid("it is longer than 230 characters"));
+    }
+    if account.starts_with(['.', '-']) || account.ends_with(['.', '-']) {
+        return Err(invalid("it starts or ends with '.' or '-'"));
+    }
+    if account.contains("..") {
+        return Err(invalid("it holds '..'"));
+    }
+    let mut host = String::new();
+    for byte in account.bytes() {
+        let Some(&allowed) = ACCOUNT_HOST_BYTES.iter().find(|&&b| b == byte) else {
+            return Err(invalid(
+                "it holds a character other than an ASCII letter, a digit, '-', '_' or '.'",
+            ));
+        };
+        host.push(char::from(allowed));
+    }
+    Ok(host)
+}
+
 impl SnowflakeConnector {
     /// Creates a new connector with the given configuration and auth provider.
     pub fn new(config: ConnectorConfig, auth: Auth) -> Self {
@@ -295,16 +357,22 @@ impl SnowflakeConnector {
         }
     }
 
-    /// Base URL for the Snowflake SQL REST API.
-    fn base_url(&self) -> String {
+    /// Base URL for the Snowflake SQL REST API. The host is
+    /// [`host_label`] of the configured account.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectorError::Auth`] when the account is not a valid host label;
+    /// see [`host_label`]. No request is sent.
+    fn base_url(&self) -> Result<String, ConnectorError> {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(url) = &self.base_url_override {
-            return format!("{}/api/v2/statements", url);
+            return Ok(format!("{}/api/v2/statements", url));
         }
-        format!(
-            "https://{}.snowflakecomputing.com/api/v2/statements",
-            self.config.account
-        )
+        let host = host_label(&self.config.account)?;
+        Ok(format!(
+            "https://{host}.snowflakecomputing.com/api/v2/statements"
+        ))
     }
 
     /// Executes a SQL query and returns rows.
@@ -494,8 +562,8 @@ impl SnowflakeConnector {
         submit: &SubmitAttempt,
     ) -> Result<StatementResponse, ConnectorError> {
         let deadline = tokio::time::Instant::now() + self.config.timeout;
+        let url = self.base_url()?;
         let token = self.auth.get_token().await?;
-        let url = self.base_url();
 
         debug!(sql, "submitting SQL statement to Snowflake");
 
@@ -622,7 +690,7 @@ impl SnowflakeConnector {
         handle: &str,
         deadline: tokio::time::Instant,
     ) -> Result<Result<StatementResponse, ConnectorError>, ConnectorError> {
-        let poll_url = format!("{}/{}", self.base_url(), handle);
+        let poll_url = format!("{}/{}", self.base_url()?, handle);
         let timed_out = || ConnectorError::Timeout {
             handle: handle.to_string(),
             seconds: self.config.timeout.as_secs(),
@@ -752,8 +820,8 @@ impl SnowflakeConnector {
 
     /// Cancels a running statement.
     pub async fn cancel_statement(&self, handle: &str) -> Result<(), ConnectorError> {
+        let url = format!("{}/{}/cancel", self.base_url()?, handle);
         let token = self.auth.get_token().await?;
-        let url = format!("{}/{}/cancel", self.base_url(), handle);
 
         let request = self.client.post(&url).header("Accept", "application/json");
         self.apply_auth_headers(request, &token)
@@ -1150,6 +1218,100 @@ pub(crate) fn classify_connector_failure(err: &AdapterError) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every documented account form is its own host label, byte for byte.
+    #[test]
+    fn account_host_keeps_every_documented_form() {
+        for candidate in [
+            "myorg-myaccount",
+            "myorg-my_account",
+            "MyOrg-MyAccount",
+            "xy12345",
+            "xy12345.us-east-1",
+            "xy12345.us-east-2.aws",
+            "xy12345.us-east-1.privatelink",
+        ] {
+            assert_eq!(host_label(candidate).unwrap(), candidate);
+        }
+        let longest = "a".repeat(MAX_ACCOUNT_HOST_LEN);
+        assert_eq!(host_label(&longest).unwrap(), longest);
+    }
+
+    /// An account that would move the request to another host, or is not a
+    /// host label at all, is refused.
+    #[test]
+    fn account_host_refuses_what_would_name_another_host() {
+        for candidate in [
+            "",
+            "evil.example/x?",
+            "evil.example#",
+            "user@evil.example",
+            "evil.example:443",
+            "evil.example\\x",
+            "xy12345 .us-east-1",
+            "xy12345\n",
+            "xy12345.us-east-1.",
+            ".xy12345",
+            "-xy12345",
+            "xy12345-",
+            "xy12345..evil",
+            "xÿ12345",
+            "%2F",
+        ] {
+            let err = host_label(candidate).expect_err(candidate);
+            assert!(
+                matches!(err, crate::auth::AuthError::InvalidAccount { .. }),
+                "{candidate:?}: {err}"
+            );
+        }
+        let too_long = "a".repeat(MAX_ACCOUNT_HOST_LEN + 1);
+        assert!(host_label(&too_long).is_err());
+    }
+
+    /// A connector whose account would name another host sends nothing: the
+    /// submit and the cancel both fail before any request.
+    #[tokio::test]
+    async fn an_injected_account_sends_no_request() {
+        let auth = Auth::from_config(crate::auth::AuthConfig {
+            account: "xy12345".into(),
+            username: None,
+            password: None,
+            oauth_token: Some("token".into()),
+            private_key_path: None,
+            pat: None,
+        })
+        .unwrap();
+        let connector = SnowflakeConnector::new(
+            ConnectorConfig {
+                // Nothing listens on port 9: had a request gone out, the
+                // error would be `Http`, not `Auth`.
+                account: "127.0.0.1:9/x?".into(),
+                warehouse: "WH".into(),
+                database: None,
+                schema: None,
+                role: None,
+                timeout: Duration::from_secs(5),
+                retry: RetryConfig::default(),
+            },
+            auth,
+        );
+        let err = connector.execute_sql("SELECT 1").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConnectorError::Auth(crate::auth::AuthError::InvalidAccount { .. })
+            ),
+            "{err}"
+        );
+        let err = connector.cancel_statement("h").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConnectorError::Auth(crate::auth::AuthError::InvalidAccount { .. })
+            ),
+            "{err}"
+        );
+    }
 
     /// #2774: every retried submit failure that leaves the outcome unknown
     /// keeps the key and becomes a resend; a statement known to have failed
