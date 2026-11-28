@@ -137,6 +137,7 @@ fn probe_path(path: &str) -> String {
         .replace("{pipeline}", "probe_pipeline")
         .replace("{plan_id}", "probe_plan")
         .replace("{subject}", "probe_subject")
+        .replace("{hash}", "probe_hash")
 }
 
 /// What a fixture is trying to make the server say.

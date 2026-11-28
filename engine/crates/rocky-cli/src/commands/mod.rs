@@ -147,11 +147,14 @@ pub use brief::{BriefSince, compute_brief, run_brief};
 pub use catalog::{
     CatalogFormat, compute_catalog_output, default_out_dir as catalog_default_out_dir, run_catalog,
 };
+pub(crate) use catalog::{catalog_output_from_compiled, read_run_facts_request_scoped};
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
 pub use ci_diff::{
-    CiDiffMode, ci_diff_mode, extract_base_compile, project_ir_from_compile, run_ci_diff,
+    CiDiffMode, SeedRead, ci_diff_mode, extract_base_compile, project_ir_from_compile, run_ci_diff,
+    seed_read,
 };
+pub(crate) use ci_diff::{GIT_OPTIONAL_LOCKS_ENV, GIT_OPTIONAL_LOCKS_VALUE};
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
 pub use compile::{
@@ -159,7 +162,10 @@ pub use compile::{
     run_compile_with_options,
 };
 pub use completions::run_completions;
-pub use compliance::{compute_compliance, run_compliance};
+pub use compliance::{
+    ComplianceRouteError, compute_compliance, compute_compliance_credential_tolerant,
+    run_compliance,
+};
 pub use connector_init::{
     ConnectorLang, HELPER_FILE_NAME, HELPER_PY, run_connector_init, scaffold_connector,
 };
@@ -175,7 +181,8 @@ pub use cost::{CostGroupBy, compute_cost, compute_month_cost, run_cost};
 pub use dag::{dag_output, run_dag};
 pub use discover::discover;
 pub use docs::{DocsFormat, run_docs};
-pub use doctor::doctor;
+pub use doctor::{DoctorCheckSet, doctor};
+pub(crate) use doctor::{DoctorOutput, doctor_output};
 pub use emit_sql::{run_emit_sql, run_emit_sql_with_selection};
 pub use estimate::{EstimateReport, compute_estimate, run_estimate};
 pub use export_openapi::export_openapi;
@@ -183,11 +190,22 @@ pub use export_schemas::{export_schemas, schemas_hash};
 pub use fmt::run_fmt;
 pub use freshness::run_freshness;
 pub use fulfill_api::propose_governed_run_plan;
+#[cfg(test)]
+pub(crate) use gc::gather_report as gather_gc_report;
+#[cfg(test)]
+pub(crate) use gc::tests::seed_one_derivable as seed_one_derivable_for_route_test;
+pub(crate) use gc::{
+    AdapterCost, adapter_cost_from_config, gc_report_from_facts, read_gc_facts_request_scoped,
+};
 pub use gc::{run_gc_derivable, run_gc_plan};
+pub(crate) use history::parse_since;
+#[cfg(test)]
+pub(crate) use history::{StoreBudget, open_probe};
 pub use history::{
     history_run_output, history_runs_output, history_runs_output_filtered, model_history_output,
-    recipe_history_output, run_history,
+    recipe_history_output, recipe_history_output_request_scoped, run_history,
 };
+pub(crate) use hooks::hooks_list_output_program_only;
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
 pub use imports_update::run_imports_update;
@@ -196,6 +214,7 @@ pub use init_adapter::run_init_adapter;
 pub use lineage::{column_lineage_output, lineage_output, run_lineage};
 pub use lineage_diff::run_lineage_diff;
 pub use lint::run_lint;
+pub(crate) use lint::{LintConfigError, lint_report, served_model_roots};
 pub use list::{
     list_adapters, list_adapters_output, list_consumers, list_deps, list_models,
     list_models_output, list_models_selected, list_pipelines, list_pipelines_output, list_sources,
@@ -233,10 +252,12 @@ pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
 pub use replay::{
-    compute_replay_check, run_replay, run_replay_check, run_replay_execute,
+    ReplayFacts, ReplayLookupError, classify_replay_facts, compute_replay_check,
+    read_replay_facts_request_scoped, run_replay, run_replay_check, run_replay_execute,
     run_replay_execute_warehouse,
 };
 pub use restore::run_restore_plan;
+pub(crate) use retention_status::retention_declared_output;
 pub use retention_status::run_retention_status;
 pub use review::{
     ApprovalContext, compute_review, compute_review_queue, compute_review_status,

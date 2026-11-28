@@ -7,18 +7,10 @@
 
 ## What it shows
 
-Set Databricks Unity Catalog catalogs to ISOLATED mode and bind them to
-specific workspace IDs. This is the standard Databricks security pattern
-for multi-tenant data platforms.
-
-## Why it's distinctive
-
-- **Declarative isolation** — the ISOLATED catalog mode and its
-  `[[governance.isolation.workspace_ids]]` bindings live in `rocky.toml`;
-  Rocky applies them as part of target setup on `rocky run`.
-- Each binding carries an access level (`binding_type = "READ_WRITE"` or
-  `"READ_ONLY"`), so a workspace can be granted read-only visibility into an
-  otherwise isolated catalog.
+Sets Unity Catalog catalogs to ISOLATED mode and binds them to workspace IDs.
+Each `[[governance.isolation.workspace_ids]]` binding has an access level
+(`binding_type = "READ_WRITE"` or `"READ_ONLY"`). Rocky applies both as part of
+target setup on `rocky run`.
 
 ## Run
 
@@ -29,15 +21,11 @@ export DATABRICKS_HTTP_PATH="/sql/1.0/warehouses/<warehouse-id>"
 ./run.sh
 ```
 
-The source table comes from the manual discovery adapter in `rocky.toml`,
-which lists `raw__orders.orders`. It must exist as `main.raw__orders.orders`
-in your workspace; edit `[[adapter.local_discovery.schemas]]` to point at a
-table you have.
+The source table `main.raw__orders.orders` must exist in your workspace. Edit
+`[[adapter.local_discovery.schemas]]` to point at a table you have.
 
 ## Expected output
 
-`run.sh` validates the config, then writes golden JSON to `expected/`:
-
-- `expected/run.json` — the executed result. The target catalog
-  (`isolated_demo`) is created in ISOLATED mode and bound to the workspace
-  ID declared under `[[pipeline.poc.target.governance.isolation.workspace_ids]]`.
+`expected/run.json`: the `isolated_demo` catalog is created in ISOLATED mode and
+bound to the workspace ID under
+`[[pipeline.poc.target.governance.isolation.workspace_ids]]`.

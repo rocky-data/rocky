@@ -19,7 +19,7 @@
 //! A wiremock test can't catch a misclassification that ships warehouse-
 //! rejected SQL — the `feedback_sql_dialect_live_execute_tests` discipline.
 //!
-//! Schemas use the `hc_drift_*` prefix per Hugo's Snowflake convention; the
+//! Schemas use the `hc_drift_*` prefix per the Rocky project's Snowflake convention; the
 //! per-run microsecond suffix isolates parallel runs.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -13,7 +13,7 @@
 min_matched = 64
 max_overclaims = 4
 max_unverified = 0
-# A key column left out of `required` / `protected` (Fable ruling 2026-11-13).
+# A key column left out of `required` / `protected` (a maintainer decision).
 max_key_omissions = 0
 
 [[models]]

@@ -6,7 +6,7 @@ use tracing::info;
 use rocky_core::config::load_rocky_config;
 use rocky_core::hooks::{HookContext, HookEvent, HookRegistry, HookResult};
 
-use crate::output::{HookEntry, HooksListOutput, HooksTestOutput};
+use crate::output::{HookEntry, HooksListOutput, HooksTestOutput, WebhookEntry};
 
 /// List all configured hooks from the pipeline config.
 pub fn run_hooks_list(config_path: &Path, json: bool) -> Result<()> {
@@ -16,11 +16,7 @@ pub fn run_hooks_list(config_path: &Path, json: bool) -> Result<()> {
     let registry = HookRegistry::from_config(&config.hooks);
 
     if json {
-        let entries = hook_entries(&registry);
-        let output = HooksListOutput {
-            total: entries.len(),
-            hooks: entries,
-        };
+        let output = hooks_list_output(&registry);
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let total = registry.total_hook_count();
@@ -143,6 +139,77 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
     Ok(())
 }
 
+/// The `rocky hooks list --output json` payload. Pure: reads the registry
+/// only, runs no hook and calls no endpoint.
+pub(crate) fn hooks_list_output(registry: &HookRegistry) -> HooksListOutput {
+    let hooks = hook_entries(registry);
+    let webhooks = webhook_entries(registry);
+    HooksListOutput {
+        // Shell hooks and webhooks together, as `rocky hooks list` counts.
+        total: hooks.len() + webhooks.len(),
+        hooks,
+        webhooks,
+    }
+}
+
+/// [`hooks_list_output`] for the HTTP route: each shell hook's `command` is
+/// cut to its program.
+///
+/// A command line often carries a secret in an argument, in a form no pattern
+/// list can promise to catch. The route therefore shows the program only: the
+/// basename of the first word that is not a `NAME=value` assignment, followed
+/// by ` …` when anything else was on the line. The CLI prints the full
+/// command, because it reads the user's own file.
+pub(crate) fn hooks_list_output_program_only(registry: &HookRegistry) -> HooksListOutput {
+    let mut output = hooks_list_output(registry);
+    for hook in &mut output.hooks {
+        hook.command = command_program(&hook.command);
+    }
+    output
+}
+
+/// The program of a command line, with ` …` when arguments were dropped.
+fn command_program(command: &str) -> String {
+    let is_assignment = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let mut words = command.split_whitespace().peekable();
+    let mut dropped = false;
+    while let Some(word) = words.next_if(|word| is_assignment(word)) {
+        // Splitting on whitespace cannot see a quoted or escaped value, so
+        // `AUTH='Bearer S1' curl` would serve `S1' curl`. A value that could
+        // hide whitespace shows nothing.
+        if word.contains(['"', '\'', '\\', '$', '`', '(', ')']) {
+            return "…".to_string();
+        }
+        dropped = true;
+    }
+    let Some(first) = words.next() else {
+        return "…".to_string();
+    };
+    dropped |= words.next().is_some();
+    let first = first.trim_matches(|c| matches!(c, '"' | '\''));
+    // Only a plain path is a program name. Anything else (a URL, a quoted
+    // blob, non-ASCII text) shows nothing.
+    let plain = !first.contains("://")
+        && first.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '~' | '/' | '\\' | ':' | '-')
+        });
+    let program = first.rsplit(['/', '\\']).next().unwrap_or_default();
+    if !plain || program.is_empty() {
+        return "…".to_string();
+    }
+    if dropped {
+        format!("{program} …")
+    } else {
+        program.to_string()
+    }
+}
+
 /// The `rocky hooks list --output json` rows.
 fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
     let mut entries: Vec<HookEntry> = Vec::new();
@@ -154,11 +221,87 @@ fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
                 command: rocky_core::secret_registry::render_placeholders(&hook.command),
                 timeout_ms: hook.timeout_ms,
                 on_failure: format!("{:?}", hook.on_failure),
-                env_keys: hook.env.keys().cloned().collect(),
+                env_keys: {
+                    let mut keys: Vec<String> = hook.env.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                },
             });
         }
     }
     entries
+}
+
+/// The configured webhooks, in event order, each with a redacted URL.
+fn webhook_entries(registry: &HookRegistry) -> Vec<WebhookEntry> {
+    let mut entries: Vec<WebhookEntry> = Vec::new();
+    for event in HookEvent::all() {
+        for webhook in registry.webhooks_for(event) {
+            let mut header_keys: Vec<String> = webhook.headers.keys().cloned().collect();
+            header_keys.sort();
+            entries.push(WebhookEntry {
+                event: event.config_key().to_string(),
+                // `Display` prints a resolved `${VAR}` value as `${NAME}`.
+                url: redact_webhook_url(&webhook.url.to_string()),
+                method: webhook.method.clone(),
+                timeout_ms: webhook.timeout_ms,
+                on_failure: format!("{:?}", webhook.on_failure),
+                async_mode: webhook.async_mode,
+                retry_count: webhook.retry_count,
+                header_keys,
+                preset: webhook.preset.clone(),
+            });
+        }
+    }
+    entries
+}
+
+/// Cut a webhook URL to `scheme://host`.
+///
+/// Drops credentials (`user:pass@`), port, path, query and fragment: a
+/// webhook URL often carries its token in one of them. The host must be an
+/// allow-list of host characters (or a `${NAME}` placeholder), so a URL with
+/// a stray separator cannot carry text through as the host. Anything that
+/// fails prints as `<redacted>`, because it cannot be told apart from a bare
+/// token.
+fn redact_webhook_url(url: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return REDACTED.to_string();
+    };
+    let scheme_ok = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !scheme_ok {
+        return REDACTED.to_string();
+    }
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        let Some((inner, _)) = inner.split_once(']') else {
+            return REDACTED.to_string();
+        };
+        if inner.is_empty()
+            || !inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return REDACTED.to_string();
+        }
+        format!("[{inner}]")
+    } else {
+        let host = host_port.split(':').next().unwrap_or_default();
+        let host_ok = !host.is_empty()
+            && host.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '$' | '{' | '}')
+            });
+        if !host_ok {
+            return REDACTED.to_string();
+        }
+        host.to_string()
+    };
+    format!("{scheme}://{host}")
 }
 
 #[cfg(test)]
@@ -189,5 +332,127 @@ mod tests {
         let json = serde_json::to_string(&entries).unwrap();
         assert!(!json.contains(SECRET), "leaked: {json}");
         assert!(json.contains("--token ${ROCKY_T1919_HOOK}"), "{json}");
+    }
+
+    #[test]
+    fn webhook_urls_are_cut_to_scheme_and_host() {
+        for (url, want) in [
+            (
+                "https://hooks.slack.com/services/T0/B0/TOKEN",
+                "https://hooks.slack.com",
+            ),
+            (
+                "http://user:pw@host.example:8080/p?q=1#f",
+                "http://host.example",
+            ),
+            ("https://host.example?key=secret", "https://host.example"),
+            ("https://[::1]:9000/x", "https://[::1]"),
+            (
+                "https://${WEBHOOK_HOST}/hook/${TOKEN}",
+                "https://${WEBHOOK_HOST}",
+            ),
+            ("${WEBHOOK_URL}", "<redacted>"),
+            ("not a url with a token", "<redacted>"),
+            ("://host/x", "<redacted>"),
+            ("https:///path-only", "<redacted>"),
+        ] {
+            assert_eq!(redact_webhook_url(url), want, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_host_must_be_host_characters() {
+        for url in [
+            r"https://host\services\TOKEN",
+            "https://host name/x",
+            "https://ho st.example/x",
+            "https://host;rm -rf/x",
+            "https://[not-ipv6]/x",
+            "https://[::1/x",
+        ] {
+            let got = redact_webhook_url(url);
+            assert!(
+                !got.contains("TOKEN") && !got.contains("rm -rf") && !got.contains("not-ipv6"),
+                "{url} -> {got}"
+            );
+        }
+        assert_eq!(
+            redact_webhook_url(r"https://host\services\TOKEN"),
+            "https://host"
+        );
+        assert_eq!(redact_webhook_url("https://host name/x"), "<redacted>");
+    }
+
+    #[test]
+    fn the_route_shows_the_program_only() {
+        for (command, want) in [
+            ("notify.sh", "notify.sh"),
+            ("/opt/bin/notify.sh --token abc", "notify.sh …"),
+            (
+                "curl -H \"Authorization: Bearer SECRET1\" https://h/x",
+                "curl …",
+            ),
+            ("TOKEN=SECRET2 deploy.sh", "deploy.sh …"),
+            ("A=1 B=2 ./run", "run …"),
+            ("\"/usr/bin/x\" --password=SECRET3", "x …"),
+            ("C:\\tools\\hook.exe -u u:SECRET4", "hook.exe …"),
+            ("héllo\u{201c}https://h/SECRET5", "…"),
+            ("", "…"),
+            ("TOKEN=SECRET6", "…"),
+            ("AUTH='Bearer S1' curl x", "…"),
+            ("FOO=bar\\ S2 cmd", "…"),
+            ("A=$(echo S3 x) cmd", "…"),
+            ("A=`S4` cmd", "…"),
+        ] {
+            let got = command_program(command);
+            assert_eq!(got, want, "{command}");
+            assert!(!got.contains("SECRET"), "{got}");
+            for secret in ["S1", "S2", "S3", "S4"] {
+                assert!(!got.contains(secret), "{got}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_listed_hooks_are_stable_and_counted_with_their_webhooks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [[hook.on_pipeline_start]]\ncommand = \"a.sh\"\n\
+             [hook.on_pipeline_start.env]\nZED = \"1\"\nALPHA = \"2\"\nMID = \"3\"\n\n\
+             [hook.webhooks.on_pipeline_complete]\nurl = \"https://h.example/x\"\n",
+        )
+        .unwrap();
+        let config = load_rocky_config(&path).unwrap();
+        let output = hooks_list_output(&HookRegistry::from_config(&config.hooks));
+        assert_eq!(output.hooks[0].env_keys, ["ALPHA", "MID", "ZED"]);
+        assert_eq!(output.hooks.len(), 1);
+        assert_eq!(output.webhooks.len(), 1);
+        assert_eq!(output.total, 2, "total counts shell hooks and webhooks");
+    }
+
+    #[test]
+    fn the_cli_list_keeps_the_full_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [[hook.on_pipeline_start]]\n\
+             command = \"curl -u u:p -H 'Authorization: Bearer abc' https://h.example/x?k=v\"\n",
+        )
+        .unwrap();
+        let config = load_rocky_config(&path).unwrap();
+        let registry = HookRegistry::from_config(&config.hooks);
+        assert_eq!(
+            hooks_list_output(&registry).hooks[0].command,
+            "curl -u u:p -H 'Authorization: Bearer abc' https://h.example/x?k=v"
+        );
+        assert_eq!(
+            hooks_list_output_program_only(&registry).hooks[0].command,
+            "curl …"
+        );
     }
 }

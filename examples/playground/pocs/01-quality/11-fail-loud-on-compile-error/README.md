@@ -2,42 +2,9 @@
 
 ## Feature
 
-`rocky run` over a project that contains a model with a real compile error
-fails the run loudly: it exits non-zero, reports status `PartialFailure`, and records
-the broken model as a `compile-error` instead of quietly reporting a green run
-over a half-built warehouse.
+`rocky run` over a project with a model that fails to compile exits non-zero, reports status `PartialFailure` and records the model as a `compile-error`. The broken model is excluded from execution; the clean model in the same run still materializes.
 
-## Why it's distinctive
-
-A pipeline is only trustworthy if a broken model can't masquerade as a healthy
-one. Rocky type-checks every model before issuing SQL, so a model that can't
-compile is excluded from execution and surfaced as a failure rather than
-skipped in silence. The run's exit code and JSON status both reflect that one
-model didn't build, which is what lets an orchestrator (or a human) stop and
-look instead of shipping downstream on stale or missing data.
-
-Just as important: the failure is contained. The clean model in the same run
-still materializes. Rocky fails the broken model loudly without throwing away
-the good data that compiled fine, so a partial outage stays partial.
-
-The broken model here is a `time_interval` model whose declared
-`time_column = "order_date"` is absent from its `SELECT` output. Rocky catches
-that as **E020** at compile time, before any SQL reaches the warehouse.
-
-## Layout
-
-```
-rocky.toml                  Transformation pipeline over models/**
-models/
-  stg_orders.sql/.toml      Clean full_refresh model — always materializes
-  daily_revenue.sql/.toml   Broken time_interval model — E020 (time_column
-                            order_date missing from the SELECT output)
-daily_revenue.fixed.sql     The corrected SELECT (outputs order_date); run.sh
-                            applies it in the final step to show a green re-run
-data/seed.sql               One raw__sales.orders table feeding both models
-run.sh                      Runs the broken pipeline, asserts the loud failure
-                            + that good data landed, then fixes and re-runs
-```
+The broken model, `daily_revenue`, is a `time_interval` model whose `time_column = "order_date"` is missing from its `SELECT` output (**E020**, caught before any SQL reaches the warehouse). `stg_orders` is the clean one. In its final step `run.sh` applies `daily_revenue.fixed.sql` and shows a green re-run.
 
 ## Run
 
@@ -46,12 +13,9 @@ cd examples/playground/pocs/01-quality/11-fail-loud-on-compile-error
 ./run.sh
 ```
 
-No credentials required — DuckDB only. `run.sh` needs `rocky`, the `duckdb`
-CLI and `jq` on `PATH`.
+No credentials required (DuckDB only). `run.sh` needs `rocky`, the `duckdb` CLI and `jq` on `PATH`.
 
 ## Expected output
-
-The broken run exits non-zero and the script asserts every claim:
 
 ```
 ==== 3. assert: the run exited NON-ZERO ====
@@ -77,6 +41,4 @@ OK: with the compile error fixed, the same pipeline runs green and builds daily_
 PASS: rocky run failed loud on the compile error ...
 ```
 
-The script exits 0 only because the run **correctly failed**: a green exit here
-proves Rocky reported the failure, kept the broken table out of the warehouse,
-and still landed the data that compiled.
+The script exits 0 only because the run **correctly failed**.

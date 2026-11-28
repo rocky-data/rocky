@@ -2,45 +2,13 @@
 
 ## Feature
 
-`@var(name)` markers in a model's SQL are resolved at run time from
-`rocky run --var name=value` (also accepted by `rocky compile` and
-`rocky emit-sql`). A marker may carry an inline default — `@var(name, default)`
-— and a required marker with no value and no default is a compile error.
+`@var(name)` markers in model SQL are resolved per run from `rocky run --var name=value` (also accepted by `rocky compile` and `rocky emit-sql`). A marker may carry an inline default, `@var(name, default)`. A required marker with no value and no default fails the compile with **E028**, naming the variable and suggesting the fix.
 
-## Why it's distinctive
+This differs from `${ENV}`, which is resolved while `rocky.toml` is parsed and feeds connection and config values. `@var()` is resolved at compile/render time, inside model SQL.
 
-`@var()` is the run-time half of Rocky's two-layer parameterisation, and it is
-deliberately distinct from the config-time `${ENV}` interpolation:
+Inside a string literal you own the quoting (`region = '@var(region)'`). In numeric or expression position the marker renders without quotes (`amount >= @var(min_amount, 0)`). Substitution runs before SQL parsing, so a bare marker never trips the parser.
 
-- `${ENV}` is resolved while `rocky.toml` is parsed. It feeds connection and
-  config values into the engine before any model is seen.
-- `@var()` is resolved at compile/render time, per run, inside model SQL. It is
-  how one run differs from the next: which region to load, which cutoff date to
-  use.
-
-The marker stays visible in the source, so the SQL reads honestly and the
-operator owns any quoting (`where region = '@var(region)'`). A required
-variable that nobody supplied does not silently render to nothing. It fails the
-compile with **E028**, naming the variable and suggesting the fix.
-
-A marker works in either position. Inside a string literal the operator owns
-the quoting (`region = '@var(region)'`); bare in numeric or expression position
-it renders without quotes (`amount >= @var(min_amount, 0)`). Substitution runs
-before the SQL is parsed for lineage and type checking, so a bare marker never
-trips the parser.
-
-## Layout
-
-```
-rocky.toml                      Transformation pipeline over models/**
-models/
-  regional_sales.sql/.toml      Filters on @var(region) (required, quoted),
-                                @var(channel, web) (optional, quoted) and
-                                @var(min_amount, 0) (optional, BARE numeric)
-data/seed.sql                   raw__sales.sales across three regions x two channels
-run.sh                          Runs with --var, emits resolved SQL, and shows
-                                the missing-variable compile error
-```
+The model `regional_sales` filters on `region` (required), `channel` (default `web`) and `min_amount` (default `0`).
 
 ## Run
 
@@ -49,8 +17,7 @@ cd examples/playground/pocs/00-foundations/15-run-variables
 ./run.sh
 ```
 
-No credentials required — DuckDB only. `run.sh` needs `rocky`, the `duckdb`
-CLI and `jq` on `PATH`. `rocky emit-sql` writes the rendered SQL to `build/`.
+No credentials required (DuckDB only). `run.sh` needs `rocky`, the `duckdb` CLI and `jq` on `PATH`. `rocky emit-sql` writes rendered SQL to `build/`.
 
 ## Expected output
 

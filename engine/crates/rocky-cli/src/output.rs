@@ -6078,6 +6078,31 @@ pub struct ImportDbtFailure {
 pub struct HooksListOutput {
     pub hooks: Vec<HookEntry>,
     pub total: usize,
+    /// Configured `[hook.webhooks]` endpoints. Each URL is cut to its scheme
+    /// and host, because a webhook URL often carries a token in its path or
+    /// query. Empty for a project with no webhooks.
+    pub webhooks: Vec<WebhookEntry>,
+}
+
+/// One configured webhook in [`HooksListOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WebhookEntry {
+    pub event: String,
+    /// The endpoint's scheme and host only (`https://hooks.example.com`).
+    /// Never the path, query, port or credentials. A URL that does not parse
+    /// prints as `<redacted>`.
+    pub url: String,
+    pub method: String,
+    pub timeout_ms: u64,
+    pub on_failure: String,
+    /// Whether the webhook is fire-and-forget.
+    pub async_mode: bool,
+    pub retry_count: u32,
+    /// Names of the headers the webhook sets. Never their values.
+    pub header_keys: Vec<String>,
+    /// The preset the webhook was built from, when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -14672,7 +14697,8 @@ impl PreviewCostOutput {
 /// `state_needs_migration` (`409`: the state store lacks tables this server
 /// reads and a read never creates them; one read-write command — a
 /// `rocky run` — migrates it; not retryable), `model_not_found`,
-/// `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
+/// `run_not_found` (a run id, or `latest` on an empty store, names no
+/// recorded run), `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
 /// the mutation permit — carries [`running_job_id`](Self::running_job_id)),
 /// `job_not_running` (`409`: a cancel named a job that has finished),
 /// `job_not_cancellable` (`409`: a cancel named a job this server process
@@ -15114,6 +15140,19 @@ pub enum JobKind {
     /// Applying the plan (`apply`, with the returned `plan_id`) is what runs the
     /// statements.
     Compact,
+    /// `rocky ci-diff` — the structural model diff between a git ref and the
+    /// `HEAD` commit, with the column lineage it moves. Uncommitted edits are
+    /// not compared. Read-only: the job writes nothing itself, except its job
+    /// record, which the server keeps in its state store (by default
+    /// `models/.rocky-state.redb`, inside the project). It reads `data/seed.sql`
+    /// from `HEAD`; a seed committed there runs as it does for `rocky ci-diff`,
+    /// so a seed with `COPY ... TO` or `ATTACH` still writes where it says. Its
+    /// git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`, so in
+    /// a partial clone a missing object fails the job and nothing is fetched.
+    /// It takes no mutation permit, so it
+    /// never blocks a run. At most one runs at a time; a second submission is
+    /// refused `409 mutation_in_progress`.
+    Diff,
 }
 
 impl JobKind {
@@ -15134,6 +15173,7 @@ impl JobKind {
             JobKind::Promote => "promote",
             JobKind::ProductApprove => "product_approve",
             JobKind::Compact => "compact",
+            JobKind::Diff => "diff",
         }
     }
 
@@ -15157,6 +15197,7 @@ impl JobKind {
             JobKind::Promote => "plan",
             JobKind::ProductApprove => "product",
             JobKind::Compact => "compact",
+            JobKind::Diff => "ci-diff",
         }
     }
 
@@ -15175,9 +15216,12 @@ impl JobKind {
             | JobKind::Unfreeze
             | JobKind::Preview
             | JobKind::ProductApprove => true,
-            JobKind::Plan | JobKind::Test | JobKind::Ci | JobKind::Promote | JobKind::Compact => {
-                false
-            }
+            JobKind::Plan
+            | JobKind::Test
+            | JobKind::Ci
+            | JobKind::Promote
+            | JobKind::Compact
+            | JobKind::Diff => false,
         }
     }
 
@@ -15196,6 +15240,7 @@ impl JobKind {
             "promote" => Some(JobKind::Promote),
             "product_approve" => Some(JobKind::ProductApprove),
             "compact" => Some(JobKind::Compact),
+            "diff" => Some(JobKind::Diff),
             _ => None,
         }
     }

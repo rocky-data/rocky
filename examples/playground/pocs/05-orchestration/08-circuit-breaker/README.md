@@ -7,11 +7,9 @@
 
 ## What it shows
 
-Adapter operations run behind an exponential-backoff retry policy and a
-three-state circuit breaker. A circuit breaker stops calling a failing
-warehouse after N failures in a row, then tries again after a timeout.
-
-**TOML surface:**
+Adapter operations run behind exponential-backoff retry and a three-state circuit
+breaker: after N consecutive failures it stops calling the warehouse, then tries
+again after a timeout.
 
 ```toml
 [adapter.retry]
@@ -27,31 +25,12 @@ circuit_breaker_recovery_timeout_secs = 60  # auto-advance Open → HalfOpen
 **States:** `Closed` → (N failures) → `Open` → (timeout) → `HalfOpen`
 → (success → Closed) / (failure → Open).
 
-**Events:** state transitions fire `PipelineEvent`s on the run's
-event bus: `circuit_breaker_tripped` (Closed/HalfOpen → Open) and
-`circuit_breaker_recovered` (HalfOpen → Closed).
-
-## Why it's distinctive
-
-- **Trust-grade resilience is a warehouse-adapter concern, not a user
-  concern.** The breaker lives in the Rust crates; you configure it
-  declaratively in `rocky.toml`.
-- **The retry policy and breaker are observable.** Each state change
-  emits an event on the run's event bus. You get back pressure, not silent
-  failure.
-
-## Layout
-
-```
-.
-├── README.md    this file
-├── rocky.toml   [adapter.retry] block with all knobs explicit
-└── run.sh       validate the config; print the state diagram
-```
+**Events** on the run's event bus: `circuit_breaker_tripped` (Closed/HalfOpen →
+Open) and `circuit_breaker_recovered` (HalfOpen → Closed).
 
 ## Credentials
 
-- **None** for this POC (validates the config).
+- **None** for this POC, which only validates the config.
 - **To watch the breaker fire:** set `[adapter] type = "databricks"`
   with a bad token, run a few retries against the real adapter, and
   inspect the events in the run JSON. The
@@ -64,22 +43,12 @@ event bus: `circuit_breaker_tripped` (Closed/HalfOpen → Open) and
 ./run.sh
 ```
 
-## What happened
-
-1. `rocky validate` confirms the `[adapter.retry]` block parses and all
-   keys are recognized.
-2. The state diagram + event names are printed.
+It runs `rocky validate`, then prints the state diagram and event names.
 
 ## Related
 
-- Engine source: `engine/crates/rocky-core/src/circuit_breaker.rs`,
-  `engine/crates/rocky-core/src/config.rs` (`RetryConfig`)
-- Adapters wired: `rocky-databricks/src/connector.rs`,
-  `rocky-snowflake/src/connector.rs`
-- **State backend wired:** `[state.retry]` shares the exact
-  shape and semantics of `[adapter.NAME.retry]`: same `RetryConfig`,
-  same breaker, same events. See [`03-remote-state-s3/`](../03-remote-state-s3/)
-  for a live MinIO demo that includes the retry block and a
-  `rocky doctor --check state_rw` cold-start probe.
-- Sibling POC: [`04-checkpoint-resume/`](../04-checkpoint-resume/)
-  covers state-store-backed resume after a partial failure.
+- `[state.retry]` has the same shape and semantics as `[adapter.NAME.retry]`
+  (same `RetryConfig`, breaker, events). See
+  [`03-remote-state-s3/`](../03-remote-state-s3/) for a live SeaweedFS demo.
+- [`04-checkpoint-resume/`](../04-checkpoint-resume/): resume after a partial
+  failure.

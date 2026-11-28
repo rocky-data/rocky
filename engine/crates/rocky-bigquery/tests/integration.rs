@@ -42,7 +42,7 @@ fn adapter_from_env() -> Option<BigQueryAdapter> {
 /// `DROP SCHEMA ... CASCADE`) at the end regardless of test outcome.
 ///
 /// Project is read from `BIGQUERY_TEST_PROJECT`. Datasets use the
-/// `hc_phase5_` prefix to match Hugo's Databricks-side convention so
+/// `hc_phase5_` prefix to match the Databricks-side convention so
 /// sandbox housekeeping uses one regex across warehouses.
 #[tokio::test]
 #[ignore]

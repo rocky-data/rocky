@@ -296,6 +296,16 @@ pub const E068: &str = "E068";
 /// argument its body does not use), or any place not on the bound list of
 /// [`crate::set_operation`]. It never fails a compile on its own.
 pub const W068: &str = "W068";
+/// A call on DuckDB that [`E057`] or [`E068`] would refuse, in a project
+/// whose `data/seed.sql` is there but could not be read (not valid UTF-8, a
+/// directory, no permission). The seed may create the name as a function or
+/// macro (#2691), so Rocky cannot tell whether the call is the project's own.
+/// The check fails closed: it refuses the call and names the seed file and
+/// the read failure (#2753). Emitted from [`crate::function_check`] by
+/// `rocky compile`, `rocky emit-sql`, `rocky serve` and `rocky lsp`. The
+/// commands that run the seed (`rocky compile --with-seed`, `rocky ci`,
+/// `rocky test`) refuse the whole run instead, naming the seed file.
+pub const E073: &str = "E073";
 /// The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different
 /// numbers of columns (#2661). SQL requires the same number in every branch,
 /// so it is checked whatever the warehouse. Emitted by

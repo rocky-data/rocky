@@ -3468,7 +3468,7 @@ mod tests {
 
     /// Not a CI test. Writes two replace scenarios to the directory in
     /// `ROCKY_DELTA_EXPORT_DIR` so an outside Delta reader (delta-rs) can
-    /// check them. See the RV1-P1a experiment record in rocky-plans.
+    /// check them.
     #[tokio::test]
     #[ignore]
     async fn export_replace_tables_for_an_external_reader() {

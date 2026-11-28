@@ -11,6 +11,7 @@ import {
   useJob,
   type JobClient,
 } from "../operator";
+import { jobKey } from "../jobs/store";
 import { ResourceState } from "../review/ResourceState";
 import { useResource } from "./useResource";
 
@@ -92,8 +93,8 @@ export function PromoteControls({
     return (
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         {approvalRequired === false
-          ? "Promote is not offered here. It writes production tables, so this page offers it only when rocky.toml sets "
-          : "Promote is not offered here: the project config could not be read. It is offered only when rocky.toml sets "}
+          ? "Promote branch is not offered here. It writes production tables, so this page offers it only when rocky.toml sets "
+          : "Promote branch is not offered here: the project config could not be read. It is offered only when rocky.toml sets "}
         <code>{PROMOTE_CONFIG_KEY}</code>
         {approvalRequired === false
           ? ", which makes the engine ask for a signed branch approval first. Set it, or promote in a terminal with rocky branch promote."
@@ -114,14 +115,21 @@ function PromotePanel({
   onDone?: () => void;
 }) {
   const branches = useResource(useCallback(() => loadBranches(), [loadBranches]), [loadBranches]);
-  const plan = useJob("promote", jobs);
-  const apply = useJob("apply", jobs, onDone);
-  const [chosen, setChosen] = useState("");
+  const plan = useJob("promote", jobs, undefined, {
+    label: "Plan promote branch",
+    heldBy: jobKey("apply", "promote-branch"),
+  });
+  const apply = useJob("apply", jobs, onDone, { subject: "promote-branch", label: "Promote branch" });
+  // A page that comes back to a job it started shows that job again.
+  const sentBranch = typeof plan.body?.name === "string" ? plan.body.name : null;
+  const [chosen, setChosen] = useState(sentBranch ?? "");
   // The branch the plan job was started for. A plan shown beside a different
   // selection would be applied under the wrong name.
-  const [plannedFor, setPlannedFor] = useState<string | null>(null);
+  const [plannedFor, setPlannedFor] = useState<string | null>(sentBranch);
   // The plan the apply job was started for, for the same reason.
-  const [applyingPlan, setApplyingPlan] = useState<string | null>(null);
+  const [applyingPlan, setApplyingPlan] = useState<string | null>(
+    typeof apply.body?.plan_id === "string" ? apply.body.plan_id : null,
+  );
 
   if (branches.kind !== "ready") {
     return <ResourceState resource={branches} loadingLine="reading the branches…" />;
@@ -130,7 +138,7 @@ function PromotePanel({
   if (names.length === 0) {
     return (
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        There are no branches to promote. Create one with Preview above, or <code>rocky branch create</code>.
+        There are no branches to promote. Create one with Create branch above, or <code>rocky branch create</code>.
       </p>
     );
   }
@@ -150,9 +158,9 @@ function PromotePanel({
   return (
     <div className="space-y-3">
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        Promotes a branch&apos;s tables to their production targets in two steps. First a plan is written: it
+        Promotes a branch&apos;s tables to their production targets in two steps. First a change is planned: it
         checks the branch&apos;s signed approval and its breaking changes and lists every production table it
-        would replace. Nothing in production changes yet. Then you apply that exact plan. The approval itself is
+        would replace. Nothing in production changes yet. Then you apply that exact change. The approval itself is
         signed in a terminal with <code>rocky branch approve</code>; this page does not sign it.
       </p>
       <div className="flex flex-wrap items-end gap-3">
@@ -172,27 +180,28 @@ function PromotePanel({
           </select>
         </label>
         <WriteButton
-          label="Plan promote"
+          label="Plan promote branch"
           busy={planBusy}
           onClick={() => {
             setPlannedFor(branch);
+            setApplyingPlan(null);
             plan.start({ name: branch });
           }}
         />
       </div>
-      {shown && <JobLine label="Plan promote" view={plan.view} cancel={plan.cancel} />}
+      {shown && <JobLine label="Plan promote branch" view={plan.view} cancel={plan.cancel} />}
       {planFinishedWithoutPlan && (
         <p role="alert" className="text-xs text-red-700 dark:text-red-300">
-          Plan promote: the job succeeded but returned no plan id, so there is nothing to apply.
+          Plan promote branch: the job succeeded but returned no change id, so there is nothing to apply.
         </p>
       )}
       {summary !== null && (
         <div className="space-y-2">
           <p className="text-xs text-emerald-700 dark:text-emerald-300">
-            Plan ready for branch {branch}: it replaces {summary.tables.length} production table
+            Change ready for branch {branch}: it replaces {summary.tables.length} production table
             {summary.tables.length === 1 ? "" : "s"}.
           </p>
-          <ul aria-label="Production tables this plan replaces" className="list-disc space-y-0.5 pl-5">
+          <ul aria-label="Production tables this change replaces" className="list-disc space-y-0.5 pl-5">
             {summary.tables.map((table) => (
               <li key={table} className="break-all font-mono text-xs text-zinc-700 dark:text-zinc-200">
                 {table}
@@ -201,11 +210,11 @@ function PromotePanel({
           </ul>
           {summary.tables.length === 0 ? (
             <p className="text-xs text-amber-800 dark:text-amber-300">
-              The plan lists no tables, so there is nothing to apply.
+              The change lists no tables, so there is nothing to apply.
             </p>
           ) : applied ? null : (
             <ConfirmedWrite
-              label="Promote"
+              label="Promote branch"
               question={`Replace ${summary.tables.length} production table${
                 summary.tables.length === 1 ? "" : "s"
               } with the contents of branch ${branch}: ${summary.tables.join(", ")}? This writes the warehouse with this server's credentials. Rocky cannot undo it.`}
@@ -218,11 +227,11 @@ function PromotePanel({
             />
           )}
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            Applies plan <code className="font-mono">{summary.planId}</code> as written; it is not planned again.
+            Applies change <code className="font-mono">{summary.planId}</code> as written; it is not planned again.
           </p>
-          {applyShown && <JobLine label="Promote" view={apply.view} cancel={apply.cancel} />}
+          {applyShown && <JobLine label="Promote branch" view={apply.view} cancel={apply.cancel} />}
           {applyShown && apply.view.kind === "done" && appliedTargets(apply.view.job).length > 0 && (
-            <ul aria-label="Promote result" className="list-disc space-y-0.5 pl-5">
+            <ul aria-label="Promote branch result" className="list-disc space-y-0.5 pl-5">
               {appliedTargets(apply.view.job).map(({ target, succeeded }) => (
                 <li
                   key={target}

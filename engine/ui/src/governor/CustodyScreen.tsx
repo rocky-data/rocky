@@ -1,7 +1,7 @@
 import { useCallback, useState, type FormEvent } from "react";
 import type { AuditForOutput } from "@rocky-types/audit_for";
 import { apiGet } from "../api";
-import { EmptyState, StatusCard } from "../components";
+import { EmptyState, StatusCard, runStatusLabel } from "../components";
 import { useResource } from "../estate/useResource";
 import { formatInstant, orNotRecorded, verdictLabel } from "../format";
 import { custodyPath, navigateTo } from "../router";
@@ -52,7 +52,7 @@ export function CustodyScreen({
           id="custody-subject"
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
-          placeholder="a model name, a run id, a plan id, or freeze:global"
+          placeholder="a model name, a run id, a change id, or freeze:global"
           className="w-96 max-w-full rounded border border-zinc-300 bg-white px-2 py-1 font-mono text-xs dark:border-zinc-700 dark:bg-zinc-900"
         />
         <button
@@ -72,7 +72,7 @@ export function CustodyScreen({
       {subject === null ? (
         <EmptyState
           title="No subject yet"
-          detail="Type one above, or follow a plan or run id from the brief or the audit ledger."
+          detail="Type one above, or follow a change or run id from the Inbox or the audit log."
         />
       ) : (
         <CustodyChain subject={subject} load={load} now={now} />
@@ -110,7 +110,7 @@ function ChainBody({ chain, now }: { chain: AuditForOutput; now?: number }) {
       <p className="text-xs text-zinc-500 dark:text-zinc-400">
         <span className="font-mono text-zinc-900 dark:text-zinc-100">{chain.subject}</span> resolved as a{" "}
         <code>{chain.subject_kind}</code>
-        {chain.resolved ? "." : ": nothing in the ledger, the run history, the plan files or the graph references it."}
+        {chain.resolved ? "." : ": nothing in the audit log, the run history, the change files or the lineage references it."}
       </p>
 
       <SectionCard
@@ -122,7 +122,7 @@ function ChainBody({ chain, now }: { chain: AuditForOutput; now?: number }) {
       >
         <Rows
           ariaLabel="Decisions about the subject"
-          columns={["when", "principal", "capability", "model", "kind", "effect", "rule", "plan", "reason"]}
+          columns={["when", "actor", "action", "model", "kind", "outcome", "rule", "change", "reason"]}
           rows={decisions.entries.map((entry) => [
             formatInstant(entry.timestamp, now),
             entry.principal,
@@ -138,21 +138,21 @@ function ChainBody({ chain, now }: { chain: AuditForOutput; now?: number }) {
       </SectionCard>
 
       <SectionCard
-        title="Plan"
+        title="Change"
         availability={plan.availability}
         note={plan.note}
-        emptyLine="no plan governs this subject"
-        summary={`${plan.changes.length} change(s)`}
+        emptyLine="no change governs this subject"
+        summary={`${plan.changes.length} model(s)`}
       >
         <div className="space-y-2 text-xs text-zinc-900 dark:text-zinc-100">
           <p>
-            Plan {plan.plan_id ? <CustodyLink subject={plan.plan_id} /> : orNotRecorded(null)}, kind{" "}
-            {orNotRecorded(plan.kind)}, principal {orNotRecorded(plan.principal)}, diff{" "}
+            Change {plan.plan_id ? <CustodyLink subject={plan.plan_id} /> : orNotRecorded(null)}, kind{" "}
+            {orNotRecorded(plan.kind)}, actor {orNotRecorded(plan.principal)}, diff{" "}
             {plan.diff_available ? "available" : "not available"}.
           </p>
           <Rows
-            ariaLabel="Plan changes"
-            columns={["model", "capability"]}
+            ariaLabel="Models in the change"
+            columns={["model", "action"]}
             rows={plan.changes.map((change) => [change.model, change.capability])}
           />
         </div>
@@ -170,7 +170,7 @@ function ChainBody({ chain, now }: { chain: AuditForOutput; now?: number }) {
           columns={["run", "status", "started", "finished", "triggered by"]}
           rows={runs.runs.map((run) => [
             <CustodyLink key={run.run_id} subject={run.run_id} />,
-            run.status,
+            runStatusLabel(run.status),
             formatInstant(run.started_at, now),
             formatInstant(run.finished_at, now),
             orNotRecorded(run.triggering_identity),
@@ -179,15 +179,15 @@ function ChainBody({ chain, now }: { chain: AuditForOutput; now?: number }) {
       </SectionCard>
 
       <SectionCard
-        title="Verification after apply"
+        title="Post-apply checks"
         availability={verify.availability}
         note={verify.note}
-        emptyLine="no verification row is recorded for this subject"
+        emptyLine="no post-apply check is recorded for this subject"
         summary={`${verify.total} row(s)`}
       >
         <Rows
-          ariaLabel="Verification rows"
-          columns={["when", "plan", "passed", "checks", "reason"]}
+          ariaLabel="Post-apply checks"
+          columns={["when", "change", "passed", "checks", "reason"]}
           rows={verify.entries.map((entry) => [
             formatInstant(entry.timestamp, now),
             <CustodyLink key={entry.plan_id} subject={entry.plan_id} />,
@@ -199,7 +199,7 @@ function ChainBody({ chain, now }: { chain: AuditForOutput; now?: number }) {
       </SectionCard>
 
       <SectionCard
-        title="Blast radius"
+        title="Impact"
         availability={blast.availability}
         note={blast.note}
         emptyLine="nothing sits downstream"

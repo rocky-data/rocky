@@ -58,7 +58,7 @@ function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
           </div>
         )}
         <div>
-          <dt className="text-xs text-zinc-500 dark:text-zinc-400">blast radius</dt>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">impact</dt>
           <dd>{entry.blast_radius ?? "not computed"}</dd>
         </div>
         <div>
@@ -88,8 +88,8 @@ export function QueuePanel({ load = defaultQueueLoader, now }: { load?: QueueLoa
 
   if (queue.kind !== "ready") {
     return (
-      <section aria-label="The review queue" className="space-y-3">
-        <h2 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-white">The review queue</h2>
+      <section aria-label="Changes waiting for approval" className="space-y-3">
+        <h2 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-white">Changes waiting for approval</h2>
         <ResourceState resource={queue} loadingLine="reading the queue…" />
       </section>
     );
@@ -98,26 +98,26 @@ export function QueuePanel({ load = defaultQueueLoader, now }: { load?: QueueLoa
   const { pending, total, excluded_non_plan_rows: excluded, ranking } = queue.value;
 
   return (
-    <section aria-label="The review queue" className="space-y-3">
+    <section aria-label="Changes waiting for approval" className="space-y-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-white">
-          {total === 0 ? "Nothing is waiting for review" : `${total} waiting for review`}
+          {total === 0 ? "Nothing is waiting for approval" : `${total} waiting for approval`}
         </h2>
         <span className="text-xs text-zinc-500 dark:text-zinc-400">ranked by {ranking}</span>
       </div>
       {excluded > 0 && (
         <p className="text-xs text-zinc-600 dark:text-zinc-300">
-          {excluded} further {excluded === 1 ? "row" : "rows"} in the ledger resolve to no plan
-          file, so nothing could approve them. They stay in the audit ledger.
+          {excluded} further {excluded === 1 ? "row" : "rows"} in the audit log resolve to no change
+          file, so nothing could approve them. They stay in the audit log.
         </p>
       )}
       {pending.length === 0 ? (
         <p className="text-sm text-zinc-600 dark:text-zinc-300">
-          No escalation is outstanding. A plan appears here when something asks for a change that
-          policy will not let through unreviewed. <code>rocky backfill --model &lt;name&gt;</code>{" "}
-          makes one, because a backfill is always review-gated; the model has to be one this
+          No approval request is outstanding. A change appears here when something asks for an action that
+          policy will not let through without approval. <code>rocky backfill --model &lt;name&gt;</code>{" "}
+          makes one, because a backfill always needs approval; the model has to be one this
           project compiles, and <code>rocky compile</code> lists those names. Nothing needs to have
-          run first. This queue is not only for AI work — a plan is listed the same way whoever
+          run first. This queue is not only for AI work — a change is listed the same way whoever
           asked for it.
         </p>
       ) : (

@@ -104,9 +104,11 @@ export function ProductApprove({
   jobs?: JobClient;
   onDone?: () => void;
 }) {
-  const approve = useJob("product_approve", jobs, onDone);
+  const approve = useJob("product_approve", jobs, onDone, { subject: name, label: `Approve data product ${name}` });
   // The digest the person confirmed, for the comparison with the result.
-  const [confirmed, setConfirmed] = useState<string | null>(null);
+  const [confirmed, setConfirmed] = useState<string | null>(
+    typeof approve.body?.expect_spec_digest === "string" ? approve.body.expect_spec_digest : null,
+  );
   const digest = approvableSpec(status);
   const summary = succeededSummary(approve.view);
   if (digest === null && approve.view.kind === "idle") return null;
@@ -120,13 +122,13 @@ export function ProductApprove({
         <>
           <p className="text-xs text-zinc-600 dark:text-zinc-300">
             {replaces === null
-              ? "The working spec has no approval yet."
-              : "The working spec differs from the approved one."}{" "}
+              ? "The current spec has no approval yet."
+              : "The current spec differs from the approved one."}{" "}
             The fulfillment loop acts only on an approved spec.
           </p>
           <ConfirmedWrite
             label="Approve spec"
-            question={`Approve the working spec of product ${name} (digest ${digest}${
+            question={`Approve the current spec of data product ${name} (digest ${digest}${
               output === null ? "" : `, output model ${output}`
             })?${
               replaces === null ? "" : ` This replaces the approval of ${replaces}.`
