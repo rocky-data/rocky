@@ -356,9 +356,20 @@ impl SnowflakeConnector {
         // answer carries partition 0 only; the rest are read one at a time
         // (#2775).
         for partition in 1..partitions {
+            // A read deadline here is not a statement still running: the
+            // statement has ended, so `Timeout` (whose `may_still_run` is
+            // true) would be a false signal. Report the short result.
             let more = self
                 .fetch_partition(&response.statement_handle, partition)
-                .await?;
+                .await
+                .map_err(|err| match err {
+                    ConnectorError::Timeout { .. } => ConnectorError::IncompleteResult {
+                        handle: response.statement_handle.clone(),
+                        expected: total_row_count.unwrap_or(rows.len() as u64),
+                        received: rows.len() as u64,
+                    },
+                    other => other,
+                })?;
             rows.extend(more);
         }
 
@@ -424,7 +435,17 @@ impl SnowflakeConnector {
                 });
             match outcome {
                 Ok(rows) => return Ok(rows),
-                Err(err) if failed < retry.max_retries && is_transient(&err) => {
+                // The statement has ended, so this GET is safe to send
+                // again: a broken body or a bad decode is retried too, not
+                // only what `is_transient` names.
+                Err(err)
+                    if failed < retry.max_retries
+                        && (is_transient(&err)
+                            || matches!(
+                                err,
+                                ConnectorError::Http(_) | ConnectorError::Timeout { .. }
+                            )) =>
+                {
                     if matches!(&err, ConnectorError::ApiError { status: 401, .. }) {
                         self.auth.invalidate_cache().await;
                     }
