@@ -435,6 +435,10 @@ pub async fn compute_preview_rows(
         final_sql,
     } = prepared?;
 
+    // The last check before the warehouse sees it. The wrapper is text around
+    // user SQL, so the string that is actually sent is what gets checked.
+    refuse_a_second_statement(&adapter_type, &final_sql)?;
+
     adapter.ping().await.map_err(|e| {
         fail(
             "connection_error",
@@ -873,6 +877,29 @@ pub(crate) fn admit_model<'a>(
     })
 }
 
+/// Refuse a preview that could run more than the one `SELECT` it shows.
+///
+/// A warehouse runs every statement of a string. A `;` must be provably inside
+/// a string or comment, and a carriage return must be part of a `\r\n`: a lone
+/// one ends a line comment on the warehouse but not in the parser.
+fn refuse_a_second_statement(adapter_type: &str, sql: &str) -> Result<(), PreviewFailure> {
+    let lone_return = sql.replace("\r\n", "\n").contains('\r');
+    let unproven = sql.contains(';') && rocky_sql::parser::require_single_statement(sql).is_err();
+    // T-SQL needs no `;` between statements, and nests block comments where
+    // the parser does not. So SQL Server text is scanned whether or not it
+    // holds a `;`.
+    let unscanned_tsql = adapter_type.eq_ignore_ascii_case("sqlserver")
+        && rocky_sql::validation::reject_statement_terminator("the preview", sql).is_err();
+    if lone_return || unproven || unscanned_tsql {
+        return Err(fail(
+            "unsupported_model_kind",
+            "the preview SQL could not be shown to be one statement",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 fn fail(kind: &str, message: &str, extra: Option<serde_json::Value>) -> PreviewFailure {
     PreviewFailure {
         kind: kind.to_string(),
@@ -909,6 +936,85 @@ mod tests {
         assert!(is_local_adapter("DuckDB"));
         assert!(!is_local_adapter("databricks"));
         assert!(!is_local_adapter("snowflake"));
+    }
+
+    /// The limit wrapper is text around user SQL. A selection that closes the
+    /// wrapper early must not reach the warehouse: DuckDB runs every statement
+    /// of a string. A lone carriage return ends a DuckDB line comment but not
+    /// the parser's, so the parser alone reads one SELECT here.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn preview_never_runs_a_second_statement_hidden_by_a_carriage_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("p.duckdb");
+        {
+            let conn = rocky_duckdb::DuckDbConnector::open(&db).unwrap();
+            conn.execute_statement("CREATE TABLE victim (id INT)")
+                .unwrap();
+        }
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS a\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n[target]\ncatalog = \"p\"\nschema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let selection = dir.path().join("selection.sql");
+        std::fs::write(
+            &selection,
+            "SELECT 1 AS a -- x\r) AS q; DROP TABLE victim; SELECT (1",
+        )
+        .unwrap();
+
+        let result = compute_preview_rows(
+            &config,
+            "m",
+            None,
+            10,
+            true,
+            None,
+            &models,
+            Some(&selection),
+            None,
+        )
+        .await;
+
+        let conn = rocky_duckdb::DuckDbConnector::open(&db).unwrap();
+        assert!(
+            conn.execute_sql("SELECT * FROM victim").is_ok(),
+            "the preview dropped a table: {result:?}"
+        );
+        assert!(result.is_err(), "the selection is refused: {result:?}");
+    }
+
+    /// A nested block comment hides a quote from T-SQL but opens a string for
+    /// the parser, so a second statement needs no `;` at all.
+    #[test]
+    fn sql_server_text_is_scanned_without_a_semicolon() {
+        let hidden = "SELECT 1 AS a /* /* */ , ' */ ) AS q DROP TABLE victim \
+                      SELECT * FROM (SELECT 1 AS b --'\n, 2 AS c";
+        let sql = wrap_with_limit("sqlserver", hidden, 10);
+        assert!(
+            refuse_a_second_statement("sqlserver", &sql).is_err(),
+            "{sql}"
+        );
+        let plain = wrap_with_limit("sqlserver", "SELECT a FROM t WHERE b = 'x' -- note\n", 10);
+        assert!(
+            refuse_a_second_statement("sqlserver", &plain).is_ok(),
+            "{plain}"
+        );
     }
 
     #[test]

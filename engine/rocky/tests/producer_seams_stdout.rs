@@ -630,12 +630,14 @@ async fn estimate_prints_what_compute_estimate_returns_with_no_models() {
 
 /// Three models, three fates: `bad` fails EXPLAIN (its table does not exist),
 /// `skip` never reaches EXPLAIN (a dynamic table has no DuckDB SQL), `good`
-/// is estimated. The JSON holds only `good`; the text prints the EXPLAIN
-/// failure before the table, and the skip only under `--verbose`.
+/// is estimated. The JSON estimates only `good` and lists the other two with
+/// their reasons; the text prints both before the table.
 #[tokio::test]
 async fn estimate_prints_what_compute_estimate_returns_with_mixed_outcomes() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = duckdb_project(dir.path());
+    // `estimate` opens an existing database read-only and never creates one.
+    drop(duckdb::Connection::open(dir.path().join("x.duckdb")).unwrap());
     let models_dir = dir.path().join("models");
     std::fs::create_dir_all(&models_dir).unwrap();
     let sidecar = |name: &str, strategy: &str| {
@@ -671,11 +673,15 @@ async fn estimate_prints_what_compute_estimate_returns_with_mixed_outcomes() {
             .collect::<Vec<_>>(),
         vec!["good"]
     );
-    assert_eq!(report.explain_failed.len(), 1);
-    assert_eq!(report.explain_failed[0].0, "bad");
-    assert_eq!(report.skipped.len(), 1);
-    assert_eq!(report.skipped[0].0, "skip");
-    assert!(report.skipped[0].1.starts_with("SQL generation:"));
+    assert_eq!(report.output.explain_failed.len(), 1);
+    assert_eq!(report.output.explain_failed[0].model_name, "bad");
+    assert_eq!(report.output.skipped.len(), 1);
+    assert_eq!(report.output.skipped[0].model_name, "skip");
+    assert!(
+        report.output.skipped[0]
+            .reason
+            .starts_with("SQL generation:")
+    );
 
     let printed = rocky_stdout(
         dir.path(),
@@ -687,10 +693,14 @@ async fn estimate_prints_what_compute_estimate_returns_with_mixed_outcomes() {
         dir.path(),
         &["estimate", "--models", models, "--output", "table"],
     );
-    let failure_line = format!("  ! bad — explain failed: {}\n", report.explain_failed[0].1);
+    let skip_line = format!("  ! skip — {}\n", report.output.skipped[0].reason);
+    let failure_line = format!(
+        "  ! bad — explain failed: {}\n",
+        report.output.explain_failed[0].reason
+    );
     assert!(
-        text.starts_with(&failure_line),
-        "the EXPLAIN failure is the first line, before the table:\n{text}"
+        text.starts_with(&format!("{skip_line}{failure_line}")),
+        "the skipped model, then the EXPLAIN failure, come before the table:\n{text}"
     );
     let table_at = text
         .find("Estimated 1 model(s):\n")

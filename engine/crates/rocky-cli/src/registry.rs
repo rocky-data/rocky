@@ -386,6 +386,74 @@ pub(crate) fn postgres_dialect_for_config(
     }
 }
 
+/// How [`AdapterRegistry`] opens a DuckDB database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuckDbOpen {
+    CreateIfMissing,
+    ReadOnly,
+}
+
+/// A warehouse a read-only call cannot open without writing something.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct WarehouseUnavailable(pub(crate) String);
+
+#[cfg(feature = "duckdb")]
+fn open_duckdb_read_only(
+    name: &str,
+    adapter_cfg: &rocky_core::config::AdapterConfig,
+    extensions: &rocky_duckdb::ExtensionOptions,
+) -> Result<DuckDbWarehouseAdapter> {
+    let unavailable =
+        |why: String| anyhow::Error::new(WarehouseUnavailable(format!("adapters.{name}: {why}")));
+    // Attaching a DuckLake catalog can create its files.
+    if !adapter_cfg.attach.is_empty() {
+        return Err(unavailable(
+            "a DuckDB adapter that attaches catalogs cannot be opened without writing".to_string(),
+        ));
+    }
+    let path = adapter_cfg
+        .path
+        .as_ref()
+        .map(rocky_core::env_string::EnvString::expose)
+        .filter(|p| !p.is_empty() && *p != ":memory:");
+    let adapter = match path {
+        None => DuckDbWarehouseAdapter::in_memory_with(extensions),
+        Some(path) => {
+            let path = std::path::Path::new(path);
+            // The path is a `${VAR}`-capable value, so no message names it.
+            if let Err(e) = std::fs::metadata(path) {
+                let absent = e.kind() == std::io::ErrorKind::NotFound
+                    && matches!(
+                        rocky_core::path_presence::classify_not_found(path),
+                        rocky_core::path_presence::PathPresence::Absent
+                    );
+                return Err(unavailable(
+                    if absent {
+                        "its database file does not exist; run the pipeline first"
+                    } else {
+                        "its database file cannot be read"
+                    }
+                    .to_string(),
+                ));
+            }
+            DuckDbWarehouseAdapter::open_read_only_with(path, extensions)
+        }
+    };
+    // DuckDB's own message names the database path, so none of it is passed on.
+    adapter.map_err(|e| {
+        tracing::debug!(
+            adapter = name,
+            "read-only DuckDB open failed: {}",
+            rocky_core::secret_registry::render_placeholders(&e.to_string())
+        );
+        unavailable(
+            "the DuckDB database could not be opened read-only; another process may be writing it"
+                .to_string(),
+        )
+    })
+}
+
 /// Holds constructed adapter instances, keyed by name from the config.
 pub struct AdapterRegistry {
     warehouse: HashMap<String, Arc<dyn WarehouseAdapter>>,
@@ -435,6 +503,26 @@ impl AdapterRegistry {
 
     /// Build the registry from a `RockyConfig`.
     pub fn from_config(config: &RockyConfig) -> Result<Self> {
+        Self::build(config, DuckDbOpen::CreateIfMissing)
+    }
+
+    /// Build only the adapters in `names`, for a call that must not write.
+    ///
+    /// A DuckDB database is opened read-only and is never created. The error
+    /// is [`WarehouseUnavailable`] when a DuckDB adapter cannot be opened
+    /// that way: its file does not exist, or it attaches catalogs.
+    pub(crate) fn from_config_read_only(
+        config: &RockyConfig,
+        names: &std::collections::BTreeSet<String>,
+    ) -> Result<Self> {
+        let mut config = config.clone();
+        config.adapters.retain(|name, _| names.contains(name));
+        Self::build(&config, DuckDbOpen::ReadOnly)
+    }
+
+    fn build(config: &RockyConfig, duckdb_open: DuckDbOpen) -> Result<Self> {
+        #[cfg(not(feature = "duckdb"))]
+        let _ = duckdb_open;
         let mut warehouse = HashMap::new();
         let mut discovery = HashMap::new();
         let mut connectors = HashMap::new();
@@ -542,7 +630,9 @@ impl AdapterRegistry {
                     // The message prints the path as `${NAME}`; only the
                     // open call sees the plaintext (#1919).
                     let extensions = rocky_duckdb::ExtensionOptions::from_adapter(adapter_cfg);
-                    let warehouse_adapter = if let Some(p) = adapter_cfg.path.as_ref() {
+                    let warehouse_adapter = if duckdb_open == DuckDbOpen::ReadOnly {
+                        open_duckdb_read_only(name, adapter_cfg, &extensions)?
+                    } else if let Some(p) = adapter_cfg.path.as_ref() {
                         // DuckDB's own IO error names the plaintext path, so
                         // it is rendered here instead of chained as the source.
                         DuckDbWarehouseAdapter::open_with(
