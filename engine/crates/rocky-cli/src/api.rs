@@ -710,6 +710,21 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message, None)
     }
 
+    /// `413` — a job request body over [`crate::ui::MAX_REQUEST_BODY_BYTES`].
+    /// The same code, message and hint as the router's own `413` envelope
+    /// ([`crate::ui::envelope_payload_too_large`]).
+    fn job_request_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            format!(
+                "the request body exceeds the {}-byte limit",
+                crate::ui::MAX_REQUEST_BODY_BYTES
+            ),
+            Some("send a smaller body; a job request is a few hundred bytes"),
+        )
+    }
+
     /// `409` — `products/<name>.toml` exists but the spec loader rejects it,
     /// so the product's output model cannot be resolved. An integrity fault of
     /// a custody file, like a malformed review marker, not a server fault.
@@ -3532,6 +3547,37 @@ pub(crate) struct JobRequest {
     semantic: Option<bool>,
 }
 
+/// Parse a job submission body into a [`JobRequest`].
+///
+/// An empty body is the default request. The body is untrusted, so the parse
+/// is bounded here and does not rely on the router's layers alone:
+///
+/// - A body over [`crate::ui::MAX_REQUEST_BODY_BYTES`] is refused `413
+///   payload_too_large` before any parse. The router's `DefaultBodyLimit`
+///   refuses it first in every mode; this check keeps the bound when the
+///   handler is reached some other way.
+/// - [`JobRequest`] is a flat struct of optional strings and one optional
+///   boolean, with `deny_unknown_fields`: no nested, polymorphic or
+///   collection field to grow.
+/// - Trailing bytes after the JSON value are refused (`end()`), and serde_json's
+///   recursion limit applies.
+///
+/// Any parse error is `400 bad_request`, `invalid job request body: <error>`.
+fn parse_job_request(body: &[u8]) -> Result<JobRequest, ApiError> {
+    if body.is_empty() {
+        return Ok(JobRequest::default());
+    }
+    if body.len() > crate::ui::MAX_REQUEST_BODY_BYTES {
+        return Err(ApiError::job_request_too_large());
+    }
+    let invalid =
+        |e: serde_json::Error| ApiError::bad_request(format!("invalid job request body: {e}"));
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let request = JobRequest::deserialize(&mut deserializer).map_err(invalid)?;
+    deserializer.end().map_err(invalid)?;
+    Ok(request)
+}
+
 /// Mint an opaque, collision-resistant job id for this sidecar.
 fn new_job_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4121,12 +4167,7 @@ async fn submit_job(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<Response, ApiError> {
-    let request: JobRequest = if body.is_empty() {
-        JobRequest::default()
-    } else {
-        serde_json::from_slice(body)
-            .map_err(|e| ApiError::bad_request(format!("invalid job request body: {e}")))?
-    };
+    let request = parse_job_request(body)?;
     validate_job_plan_id(kind, &request)?;
     validate_freeze_fields(kind, &request)?;
     validate_preview_fields(kind, &request)?;
@@ -5820,6 +5861,56 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use tower::ServiceExt;
+
+    /// The job body parse keeps every refusal `serde_json::from_slice` gave:
+    /// an unknown field, a wrong type and trailing bytes are `400`. A body
+    /// over the request limit is `413` before any parse.
+    #[test]
+    fn parse_job_request_bounds_and_refusals() {
+        let request = parse_job_request(b"").unwrap();
+        assert_eq!(request.plan_id, None);
+
+        let request = parse_job_request(br#"{"pipeline": "p", "semantic": true}"#).unwrap();
+        assert_eq!(request.pipeline.as_deref(), Some("p"));
+        assert_eq!(request.semantic, Some(true));
+
+        for (body, needle) in [
+            (&br#"{"pipelin": "p"}"#[..], "unknown field"),
+            (&br#"{"semantic": "yes"}"#[..], "invalid type"),
+            (&br#"{"pipeline": "p"} {}"#[..], "trailing characters"),
+            (&br#"{"pipeline": "p"}x"#[..], "trailing characters"),
+            (&b"not json"[..], "expected"),
+        ] {
+            let err = parse_job_request(body).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{needle}");
+            assert_eq!(err.envelope.code, "bad_request", "{needle}");
+            assert!(
+                err.envelope
+                    .message
+                    .starts_with("invalid job request body: ")
+                    && err.envelope.message.contains(needle),
+                "{needle}: {}",
+                err.envelope.message
+            );
+        }
+
+        // Trailing whitespace is not trailing characters, as before.
+        assert!(parse_job_request(b"{}\n  ").is_ok());
+
+        let mut big = br#"{"reason": ""#.to_vec();
+        big.resize(crate::ui::MAX_REQUEST_BODY_BYTES, b'a');
+        big.extend_from_slice(br#""}"#);
+        let err = parse_job_request(&big).unwrap_err();
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(err.envelope.code, "payload_too_large");
+        assert!(err.envelope.remediation_hint.is_some());
+
+        let mut at_limit = br#"{"reason": ""#.to_vec();
+        at_limit.resize(crate::ui::MAX_REQUEST_BODY_BYTES - 2, b'a');
+        at_limit.extend_from_slice(br#""}"#);
+        assert_eq!(at_limit.len(), crate::ui::MAX_REQUEST_BODY_BYTES);
+        assert!(parse_job_request(&at_limit).is_ok());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

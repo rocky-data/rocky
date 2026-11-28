@@ -105,6 +105,15 @@ pub enum AuthError {
 
     #[error("auth API error {status}: {body}")]
     ApiError { status: u16, body: String },
+
+    /// The configured account cannot be the host label of
+    /// `https://<account>.snowflakecomputing.com`. Refused before any request,
+    /// so no credential is sent to a host the account string would name.
+    #[error(
+        "invalid Snowflake account identifier: {reason}; use the identifier from \
+         your account URL, such as `myorg-myaccount` or `xy12345.us-east-1`"
+    )]
+    InvalidAccount { reason: &'static str },
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -223,7 +232,18 @@ impl Auth {
     /// 3. If `private_key_path` is set -> Key-pair (RS256 JWT)
     /// 4. If `username` + `password` are set -> Password
     /// 5. Otherwise -> error
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::InvalidAccount`] when `config.account` cannot be a host
+    /// label (checked first, in every mode), and
+    /// [`AuthError::NoAuthConfigured`] when no credential is set.
     pub fn from_config(config: AuthConfig) -> Result<Self, AuthError> {
+        // Every mode's requests go to `https://<account>.snowflakecomputing.com`:
+        // refuse an account that would name another host before any credential
+        // is stored or sent.
+        crate::connector::account_host(&config.account)?;
+
         // PAT takes highest priority — distinct token-type header from OAuth.
         if let Some(token) = config.pat.filter(|t| !t.is_empty()) {
             return Ok(Auth {
@@ -394,8 +414,8 @@ impl Auth {
                     return Ok(ct.token.expose().to_string());
                 }
 
-                let url =
-                    format!("https://{account}.snowflakecomputing.com/session/v1/login-request");
+                let host = crate::connector::account_host(account)?;
+                let url = format!("https://{host}.snowflakecomputing.com/session/v1/login-request");
 
                 let body = serde_json::json!({
                     "data": {
@@ -554,6 +574,29 @@ mod tests {
         let debug = format!("{err:?}");
         assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
         assert!(debug.contains("${RV_SF_AUTH_DBG}"), "{debug}");
+    }
+
+    /// An account that would name another host is refused in every mode,
+    /// before any credential is stored: password login would otherwise post
+    /// the password to `https://evil.example/x?.snowflakecomputing.com/...`.
+    #[test]
+    fn from_config_refuses_an_account_that_names_another_host() {
+        let config = |oauth: Option<&str>, password: Option<&str>| AuthConfig {
+            account: "evil.example/x?".into(),
+            username: Some("user".into()),
+            password: password.map(Into::into),
+            oauth_token: oauth.map(Into::into),
+            private_key_path: None,
+            pat: None,
+        };
+        for config in [config(Some("t"), None), config(None, Some("pass"))] {
+            let err = Auth::from_config(config).err().expect("refused");
+            assert!(matches!(err, AuthError::InvalidAccount { .. }), "{err}");
+            assert!(
+                err.to_string()
+                    .contains("invalid Snowflake account identifier")
+            );
+        }
     }
 
     #[test]
