@@ -444,7 +444,7 @@ export type {
 export type { DagEdgeOutput, DagNodeOutput, DagOutput, DagSummaryOutput, PartitionShapeOutput } from "./dag";
 export type { DagRunNodeOutput, DagRunOutput } from "./dag_run";
 export type { CollisionCandidateOutput, FailedSourceOutput, ResolvedCheckNameOutput } from "./discover";
-export type { EstimateOutput } from "./estimate";
+export type { EstimateGap, EstimateOutput } from "./estimate";
 export type { FulfillOutput } from "./fulfill";
 export type { GcCandidateOutput, GcCheckOutput, GcRebuildCostOutput, GcReportOutput } from "./gc";
 export type { GcApplyOutput, GcEvictedOutput, GcRefusedOutput } from "./gc_apply";

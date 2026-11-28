@@ -15,20 +15,16 @@ use rocky_core::cost::WarehouseCostModel;
 use rocky_core::models;
 use rocky_core::traits::WarehouseAdapter;
 
-use crate::output::{EstimateOutput, ModelEstimate, print_json};
-use crate::registry::{self, AdapterRegistry};
+use crate::output::{EstimateGap, EstimateOutput, ModelEstimate, print_json};
+use crate::registry::{self, AdapterRegistry, WarehouseUnavailable};
 
 /// What `rocky estimate` computed, before rendering: the typed document a
-/// JSON consumer gets, plus what the text report shows and the JSON
-/// deliberately omits (skips, EXPLAIN failures, the pricing table).
+/// JSON consumer gets, plus what only the text report shows (the pricing
+/// table).
 #[derive(Debug)]
 pub struct EstimateReport {
     /// The `--output json` document.
     pub output: EstimateOutput,
-    /// Models whose SQL could not be generated, with the reason.
-    pub skipped: Vec<(String, String)>,
-    /// Models whose EXPLAIN failed, with the reason.
-    pub explain_failed: Vec<(String, String)>,
     /// Which pricing table applied, named by adapter type.
     pub pricing_source: &'static str,
     /// The pricing table itself.
@@ -43,6 +39,13 @@ pub struct EstimateReport {
 /// report with `matched == 0` and the JSON document's `message` set; so is
 /// a project where every model was skipped or failed EXPLAIN, with the
 /// other message.
+///
+/// An estimate changes nothing. `EXPLAIN` receives one statement per model or
+/// none: an adapter runs the statements after the first, so a model whose SQL
+/// is more than one statement, or cannot be parsed to prove it is one, is
+/// listed in the output's `skipped`. A DuckDB database is opened read-only and
+/// never created; when it cannot be opened that way, every model is skipped
+/// with the reason. Only the pipeline's target adapter is built.
 pub async fn compute_estimate(
     config_path: &Path,
     models_dir: &Path,
@@ -54,8 +57,6 @@ pub async fn compute_estimate(
         config_path.display()
     ))?;
     let (_, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
-    let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let (pricing_source, pricing) = resolve_pricing(&rocky_cfg, pipeline.target_adapter());
 
@@ -83,17 +84,38 @@ pub async fn compute_estimate(
         info!("no models found to estimate");
         return Ok(EstimateReport {
             output: EstimateOutput::empty("no models found to estimate"),
-            skipped: Vec::new(),
-            explain_failed: Vec::new(),
             pricing_source,
             pricing,
             matched,
         });
     }
 
+    let touched = std::collections::BTreeSet::from([pipeline.target_adapter().to_string()]);
+    let adapter_registry = match AdapterRegistry::from_config_read_only(&rocky_cfg, &touched) {
+        Ok(registry) => registry,
+        Err(error) => {
+            let unavailable = error.downcast::<WarehouseUnavailable>()?;
+            let mut output = EstimateOutput::empty("no model produced an estimate");
+            output.skipped = models_to_estimate
+                .iter()
+                .map(|model| EstimateGap {
+                    model_name: model.config.name.clone(),
+                    reason: format!("not estimated: {unavailable}"),
+                })
+                .collect();
+            return Ok(EstimateReport {
+                output,
+                pricing_source,
+                pricing,
+                matched,
+            });
+        }
+    };
+    let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
+
     let mut estimates = Vec::new();
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    let mut explain_failed: Vec<(String, String)> = Vec::new();
+    let mut skipped: Vec<EstimateGap> = Vec::new();
+    let mut explain_failed: Vec<EstimateGap> = Vec::new();
     let is_duckdb = rocky_cfg
         .adapters
         .get(pipeline.target_adapter())
@@ -102,27 +124,33 @@ pub async fn compute_estimate(
         let model_ir = model.to_model_ir();
         let dialect = warehouse_adapter.dialect();
 
-        let sql_result = rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect);
-
-        let sql = match sql_result {
-            // DuckDB EXPLAIN applies to one statement. Explain the model
-            // input without creating the scratch table or executing any DML.
-            Ok(_)
-                if is_duckdb
-                    && matches!(
-                        model_ir.materialization,
-                        rocky_ir::MaterializationStrategy::DeleteInsert { .. }
-                    ) =>
-            {
-                format!(
-                    "SELECT * FROM (\n{}\n) AS _rocky_estimate_input",
-                    model_ir.sql
-                )
-            }
-            Ok(stmts) => stmts.join(";\n"),
-            Err(e) => {
-                debug!(model = %model.config.name, "skipping estimate — SQL gen error: {e}");
-                skipped.push((model.config.name.clone(), format!("SQL generation: {e}")));
+        // A DuckDB database is open read-only, and DuckDB refuses to plan a
+        // write there, so the model's input query is what gets explained.
+        // DuckDB's partition replacement is several statements by design;
+        // every other generated string is checked first.
+        let checked = rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect)
+            .map_err(|e| format!("SQL generation: {e}"))
+            .and_then(|statements| {
+                let replaces_partitions = matches!(
+                    model_ir.materialization,
+                    rocky_ir::MaterializationStrategy::DeleteInsert { .. }
+                );
+                if !(is_duckdb && replaces_partitions) {
+                    let sql = single_explainable_statement(&statements, &model_ir.sql)?;
+                    if !is_duckdb {
+                        return Ok(sql);
+                    }
+                }
+                single_explainable_statement(&[input_query(&model_ir.sql)], &model_ir.sql)
+            });
+        let sql = match checked {
+            Ok(sql) => sql,
+            Err(reason) => {
+                debug!(model = %model.config.name, "skipping estimate: {reason}");
+                skipped.push(EstimateGap {
+                    model_name: model.config.name.clone(),
+                    reason,
+                });
                 continue;
             }
         };
@@ -130,21 +158,24 @@ pub async fn compute_estimate(
         match run_explain(&warehouse_adapter, &model.config.name, &sql, &pricing).await {
             Ok(estimate) => estimates.push(estimate),
             Err(e) => {
-                debug!(model = %model.config.name, "explain failed: {e}");
-                explain_failed.push((model.config.name.clone(), e.to_string()));
+                debug!(model = %model.config.name, "explain failed: {e:#}");
+                explain_failed.push(EstimateGap {
+                    model_name: model.config.name.clone(),
+                    reason: format!("{e:#}"),
+                });
             }
         }
     }
 
-    let output = if estimates.is_empty() {
+    let mut output = if estimates.is_empty() {
         EstimateOutput::empty("no model produced an estimate")
     } else {
         EstimateOutput::new(estimates)
     };
+    output.skipped = skipped;
+    output.explain_failed = explain_failed;
     Ok(EstimateReport {
         output,
-        skipped,
-        explain_failed,
         pricing_source,
         pricing,
         matched,
@@ -170,14 +201,20 @@ pub async fn run_estimate(
     } else if report.matched == 0 {
         println!("No models found.");
     } else {
-        for (name, e) in &report.explain_failed {
-            println!("  ! {name} — explain failed: {e}");
+        // `--verbose` lists the skips in its own section.
+        if !verbose {
+            for gap in &report.output.skipped {
+                println!("  ! {} — {}", gap.model_name, gap.reason);
+            }
+        }
+        for gap in &report.output.explain_failed {
+            println!("  ! {} — explain failed: {}", gap.model_name, gap.reason);
         }
         print!(
             "{}",
             render_estimates_text(
                 &report.output.estimates,
-                &report.skipped,
+                &report.output.skipped,
                 report.pricing_source,
                 &report.pricing,
                 verbose
@@ -194,7 +231,7 @@ pub async fn run_estimate(
 /// changes none of the existing ones.
 fn render_estimates_text(
     estimates: &[ModelEstimate],
-    skipped: &[(String, String)],
+    skipped: &[EstimateGap],
     pricing_source: &str,
     pricing: &WarehouseCostModel,
     verbose: bool,
@@ -268,13 +305,51 @@ fn render_estimates_text(
         if !skipped.is_empty() {
             let _ = writeln!(out);
             let _ = writeln!(out, "  Skipped before EXPLAIN ({}):", skipped.len());
-            for (name, reason) in skipped {
-                let _ = writeln!(out, "    {name} — {reason}");
+            for gap in skipped {
+                let _ = writeln!(out, "    {} — {}", gap.model_name, gap.reason);
             }
         }
     }
 
     out
+}
+
+/// A query that reads what a model reads and writes nothing.
+fn input_query(model_sql: &str) -> String {
+    let body = model_sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    format!("SELECT * FROM (\n{body}\n) AS _rocky_estimate_input")
+}
+
+/// The one statement `EXPLAIN` may receive for a model, or why there is none.
+///
+/// The length of `statements` is not enough: a dialect can put several
+/// statements in one element, and a model body can hold its own `;`. So the
+/// string is parsed. When the parser cannot read the warehouse's own write
+/// syntax (DuckDB `INSERT BY NAME`, Spark `USING DELTA`), the model's input
+/// query stands in for it, under the same check.
+fn single_explainable_statement(
+    statements: &[String],
+    model_sql: &str,
+) -> std::result::Result<String, String> {
+    use rocky_sql::parser::{SingleStatementError, require_single_statement};
+    let [sql] = statements else {
+        return Err(format!(
+            "not explained: the strategy generates {} statements, and EXPLAIN covers only one",
+            statements.len()
+        ));
+    };
+    let refused = |e: SingleStatementError| format!("not explained: {e}");
+    match require_single_statement(sql) {
+        Ok(sql) => Ok(sql.to_string()),
+        Err(e @ SingleStatementError::Unparseable(_)) => {
+            require_single_statement(&input_query(model_sql))
+                .map(str::to_string)
+                .map_err(|_| refused(e))
+        }
+        Err(
+            e @ (SingleStatementError::Several(_) | SingleStatementError::AmbiguousSemicolon(_)),
+        ) => Err(refused(e)),
+    }
 }
 
 /// Run EXPLAIN for a single model's SQL and return the estimate.
@@ -351,6 +426,8 @@ fn resolve_pricing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "duckdb")]
+    use crate::registry::AdapterRegistry;
 
     fn est(name: &str, plan_lines: usize, cost: Option<f64>) -> ModelEstimate {
         ModelEstimate {
@@ -461,7 +538,10 @@ mod tests {
     /// `--verbose` names them with the reason.
     #[test]
     fn verbose_names_models_dropped_before_explain_ran() {
-        let skipped = vec![("broken".to_string(), "SQL generation: bad ref".to_string())];
+        let skipped = vec![EstimateGap {
+            model_name: "broken".to_string(),
+            reason: "SQL generation: bad ref".to_string(),
+        }];
         let pricing = WarehouseCostModel::duckdb();
         let plain = render_estimates_text(&[], &skipped, "duckdb", &pricing, false);
         let verbose = render_estimates_text(&[], &skipped, "duckdb", &pricing, true);
@@ -538,7 +618,7 @@ type = "some-future-warehouse"
             Some("no models found to estimate")
         );
         assert_eq!(report.pricing_source, "duckdb");
-        assert!(report.skipped.is_empty() && report.explain_failed.is_empty());
+        assert!(report.output.skipped.is_empty() && report.output.explain_failed.is_empty());
 
         let err = compute_estimate(&config, &models, None, Some("ghost"))
             .await
@@ -590,7 +670,7 @@ type = "some-future-warehouse"
         let report = compute_estimate(&config, &models_dir, Some("p"), Some("orders"))
             .await
             .unwrap();
-        assert!(report.explain_failed.is_empty(), "{report:?}");
+        assert!(report.output.explain_failed.is_empty(), "{report:?}");
         assert_eq!(report.output.total_models, 1);
         assert!(report.output.estimates[0].raw_explain.contains("incoming"));
 
@@ -602,5 +682,288 @@ type = "some-future-warehouse"
             .unwrap()
             .rows;
         assert_eq!(rows, vec![vec![serde_json::json!("10")]]);
+    }
+
+    /// A DuckDB project with one model `t`, a `victim` table and an
+    /// `incoming` table, all in `warehouse.duckdb`.
+    #[cfg(feature = "duckdb")]
+    struct OneModel {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(feature = "duckdb")]
+    impl OneModel {
+        async fn new(sql: &str, strategy: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let project = Self { dir };
+            std::fs::write(
+                project.config(),
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+                     [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                     [pipeline.p.target]\n",
+                    project.dir.path().join("warehouse.duckdb").display()
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir(project.models()).unwrap();
+            std::fs::write(project.models().join("t.sql"), sql).unwrap();
+            std::fs::write(
+                project.models().join("t.toml"),
+                format!(
+                    "[strategy]\n{strategy}\n\n\
+                     [target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"t\"\n"
+                ),
+            )
+            .unwrap();
+            project
+                .adapter()
+                .execute_statement(
+                    "CREATE TABLE victim AS SELECT 'victim-row-value' AS v;
+                     CREATE TABLE incoming AS SELECT 1 AS a, now() AS ts;
+                     CREATE TABLE t AS SELECT 1 AS a, now() AS ts;",
+                )
+                .await
+                .unwrap();
+            project
+        }
+
+        fn config(&self) -> std::path::PathBuf {
+            self.dir.path().join("rocky.toml")
+        }
+
+        fn models(&self) -> std::path::PathBuf {
+            self.dir.path().join("models")
+        }
+
+        fn adapter(&self) -> Arc<dyn WarehouseAdapter> {
+            let cfg = rocky_core::config::load_rocky_config(&self.config()).unwrap();
+            let registry = crate::registry::AdapterRegistry::from_config(&cfg).unwrap();
+            registry.warehouse_adapter("default").unwrap()
+        }
+
+        async fn victim_rows(&self) -> Vec<Vec<serde_json::Value>> {
+            self.adapter()
+                .execute_query("SELECT v FROM victim")
+                .await
+                .expect("the victim table is still there")
+                .rows
+        }
+
+        async fn estimate(&self) -> EstimateReport {
+            compute_estimate(&self.config(), &self.models(), None, Some("t"))
+                .await
+                .unwrap()
+        }
+
+        fn database(&self) -> std::path::PathBuf {
+            self.dir.path().join("warehouse.duckdb")
+        }
+
+        /// Every file beside the config, with its bytes.
+        fn files(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(self.dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// The hazard these tests guard against, shown on the adapter itself:
+    /// `EXPLAIN` of a two-statement string runs the second statement.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_explain_runs_every_statement_after_the_first() {
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement("CREATE TABLE victim AS SELECT 1 AS v")
+            .await
+            .unwrap();
+        adapter
+            .explain("SELECT 1; DROP TABLE victim")
+            .await
+            .unwrap();
+        assert!(adapter.execute_query("SELECT v FROM victim").await.is_err());
+    }
+
+    /// A model body holding a second statement is skipped with a reason, and
+    /// the statement does not run, on every strategy that carried it into the
+    /// `EXPLAIN` string, the DuckDB `delete_insert` wrapper included.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn estimate_never_runs_a_second_statement() {
+        let full = "type = \"full_refresh\"";
+        for (sql, strategy) in [
+            ("SELECT 1 AS a; DROP TABLE victim", full),
+            ("SELECT 1 AS a; DELETE FROM victim; SELECT 2", full),
+            ("SELECT 1 AS a; SELECT 1, v FROM victim", full),
+            ("SELECT 1 AS a; DROP TABLE victim", "type = \"view\""),
+            (
+                "SELECT 1 AS a) AS x; DROP TABLE victim; SELECT (1",
+                "type = \"delete_insert\"\npartition_by = [\"a\"]",
+            ),
+            ("SELECT 1 AS a /* /* */ ; DROP TABLE victim; /* */ */", full),
+            ("SELECT 1 AS a -- x\r; DROP TABLE victim", full),
+        ] {
+            let project = OneModel::new(sql, strategy).await;
+            let report = project.estimate().await;
+            assert_eq!(
+                project.victim_rows().await,
+                vec![vec![serde_json::json!("victim-row-value")]],
+                "{sql}"
+            );
+            assert!(report.output.estimates.is_empty(), "{sql}: {report:?}");
+            assert!(report.output.explain_failed.is_empty(), "{sql}: {report:?}");
+            assert_eq!(report.output.skipped.len(), 1, "{sql}: {report:?}");
+            assert!(
+                report.output.skipped[0]
+                    .reason
+                    .starts_with("not explained:"),
+                "{sql}: {}",
+                report.output.skipped[0].reason
+            );
+        }
+    }
+
+    /// The guard does not turn ordinary models into skips.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn ordinary_duckdb_models_still_estimate() {
+        let select = "SELECT a, ts FROM warehouse.main.incoming";
+        for (sql, strategy) in [
+            (select.to_string(), "type = \"full_refresh\""),
+            (format!("{select};\n"), "type = \"full_refresh\""),
+            (
+                format!("-- one; two\n{select} WHERE 'a;b' <> ''"),
+                "type = \"full_refresh\"",
+            ),
+            (select.to_string(), "type = \"view\""),
+            (
+                select.to_string(),
+                "type = \"incremental\"\ntimestamp_column = \"ts\"",
+            ),
+            (
+                select.to_string(),
+                "type = \"merge\"\nunique_key = [\"a\"]\nupdate_columns = [\"ts\"]",
+            ),
+            (
+                select.to_string(),
+                "type = \"delete_insert\"\npartition_by = [\"a\"]",
+            ),
+        ] {
+            let project = OneModel::new(&sql, strategy).await;
+            let before = project.files();
+            let report = project.estimate().await;
+            assert_eq!(report.output.estimates.len(), 1, "{strategy}: {report:?}");
+            assert!(!report.output.estimates[0].raw_explain.is_empty());
+            assert!(report.output.skipped.is_empty(), "{report:?}");
+            assert!(
+                project.files() == before,
+                "{strategy}: the estimate changed a file"
+            );
+        }
+    }
+
+    /// The in-place overwrite of an attached Iceberg catalog is
+    /// `BEGIN; ...; DELETE; INSERT; COMMIT`. Joined and explained, only
+    /// `BEGIN` is explained, so the `DELETE` and `INSERT` rewrote the target.
+    /// Attaching a real Iceberg catalog needs a server, so this uses the
+    /// statement list the dialect generates.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn the_in_place_overwrite_statements_are_never_explained() {
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement("CREATE TABLE t AS SELECT 1 AS a UNION ALL SELECT 2")
+            .await
+            .unwrap();
+        let statements = rocky_core::sql_gen::in_place_overwrite_statements(
+            adapter.dialect(),
+            "memory.main.t",
+            "SELECT 9 AS a",
+        );
+        assert!(single_explainable_statement(&statements, "SELECT 9 AS a").is_err());
+        assert!(single_explainable_statement(&[statements.join(";\n")], "SELECT 9 AS a").is_err());
+
+        // What the joined form did.
+        let _ = adapter.explain(&statements.join(";\n")).await;
+        let rows = adapter.execute_query("SELECT a FROM t").await.unwrap().rows;
+        assert_eq!(rows, vec![vec![serde_json::json!("9")]]);
+    }
+
+    /// PostgreSQL and Redshift return their `delete_insert` as ONE vector
+    /// element holding two statements, and their connector runs both.
+    #[test]
+    fn a_joined_postgres_delete_insert_is_refused() {
+        for adapter_type in ["postgres", "redshift"] {
+            let Some(dialect) = crate::registry::warehouse_dialect_for_type(adapter_type) else {
+                panic!("no dialect for {adapter_type}");
+            };
+            let statements = dialect.delete_insert_sql("db.s.t", &["a".into()], "SELECT 1 AS a");
+            assert_eq!(statements.len(), 1, "{adapter_type}: {statements:?}");
+            let error = single_explainable_statement(&statements, "SELECT 1 AS a").unwrap_err();
+            assert!(error.contains("2 statements"), "{adapter_type}: {error}");
+        }
+    }
+
+    /// An absent DuckDB database is not created. Each model is reported as
+    /// not estimated, with the reason.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn estimate_does_not_create_an_absent_database() {
+        let project = OneModel::new("SELECT 1 AS a", "type = \"full_refresh\"").await;
+        std::fs::remove_file(project.database()).unwrap();
+        let before = project.files();
+
+        let report = project.estimate().await;
+        assert!(project.files() == before, "the estimate created a file");
+        assert!(report.output.estimates.is_empty());
+        assert_eq!(report.output.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.output.skipped[0].model_name, "t");
+        assert!(
+            report.output.skipped[0].reason.contains("does not exist"),
+            "{}",
+            report.output.skipped[0].reason
+        );
+        assert_eq!(
+            report.output.message.as_deref(),
+            Some("no model produced an estimate")
+        );
+    }
+
+    /// A file DuckDB cannot open read-only is a reason, not a path.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn estimate_reports_an_unopenable_database_without_its_path() {
+        let project = OneModel::new("SELECT 1 AS a", "type = \"full_refresh\"").await;
+        std::fs::write(project.database(), "not a database").unwrap();
+        let report = project.estimate().await;
+        assert_eq!(report.output.skipped.len(), 1, "{report:?}");
+        let reason = &report.output.skipped[0].reason;
+        assert!(reason.contains("could not be opened read-only"), "{reason}");
+        assert!(!reason.contains("warehouse.duckdb"), "{reason}");
+        assert_eq!(
+            std::fs::read_to_string(project.database()).unwrap(),
+            "not a database"
+        );
+    }
+
+    /// `rocky plan --cost-estimate adapter` estimates in a process that may
+    /// already hold the database open read-write.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn estimate_works_beside_a_read_write_connection_in_the_process() {
+        let project = OneModel::new("SELECT 1 AS a", "type = \"full_refresh\"").await;
+        let held = project.adapter();
+        let report = project.estimate().await;
+        assert_eq!(report.output.estimates.len(), 1, "{report:?}");
+        drop(held);
     }
 }

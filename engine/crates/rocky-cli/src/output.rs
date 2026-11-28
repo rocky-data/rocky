@@ -3639,6 +3639,15 @@ pub struct EstimateOutput {
     /// and the machine was not (#1428).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Models `EXPLAIN` was never asked about, with the reason: SQL
+    /// generation failed, the model's SQL could not be shown to be one
+    /// statement, or the DuckDB database could not be opened read-only.
+    /// Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<EstimateGap>,
+    /// Models whose `EXPLAIN` failed, with the reason. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explain_failed: Vec<EstimateGap>,
 }
 
 /// Cost estimate for a single model.
@@ -3658,6 +3667,13 @@ pub struct ModelEstimate {
     pub raw_explain: String,
 }
 
+/// A model that has no entry in [`EstimateOutput::estimates`], and why.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct EstimateGap {
+    pub model_name: String,
+    pub reason: String,
+}
+
 impl EstimateOutput {
     pub fn new(estimates: Vec<ModelEstimate>) -> Self {
         let count = estimates.len();
@@ -3674,6 +3690,8 @@ impl EstimateOutput {
             total_models: count,
             total_estimated_cost_usd: total_cost,
             message: None,
+            skipped: Vec::new(),
+            explain_failed: Vec::new(),
         }
     }
 

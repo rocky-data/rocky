@@ -257,6 +257,27 @@ impl DuckDbWarehouseAdapter {
         })
     }
 
+    /// Create an adapter over an existing database opened read-only. See
+    /// [`DuckDbConnector::open_read_only_with`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DuckDbConnector::open_read_only_with`].
+    pub fn open_read_only_with(
+        path: &std::path::Path,
+        opts: &crate::ExtensionOptions,
+    ) -> Result<Self, crate::DuckDbError> {
+        let connector = DuckDbConnector::open_read_only_with(path, opts)?;
+        Ok(Self {
+            connector: Arc::new(Mutex::new(connector)),
+            dialect: DuckDbSqlDialect::plain(),
+            concurrent_for_test: false,
+            default_catalog: Some(crate::dialect::catalog_name_for_path(
+                &path.to_string_lossy(),
+            )),
+        })
+    }
+
     /// Create an adapter from an existing connector.
     pub fn new(connector: DuckDbConnector) -> Self {
         Self {
