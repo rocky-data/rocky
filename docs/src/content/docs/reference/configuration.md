@@ -706,7 +706,7 @@ Put a ceiling on what one run may cost, how long it may take, and how much it ma
 |-------|------|---------|-------------|
 | `max_usd` | float | | Maximum run cost in USD, from per-materialization `cost_usd` on `RunOutput.cost_summary`. `None` when no adapter produced cost data. |
 | `max_duration_ms` | integer | | Maximum run wall time in milliseconds. |
-| `max_bytes_scanned` | integer | | Maximum total bytes scanned across every materialization in the run, from per-model `bytes_scanned`. Catches scan-volume regressions even when cost stays inside `max_usd`. Only BigQuery reports it today (`totalBytesBilled`); Databricks, Snowflake and DuckDB give `None` and skip the dimension. |
+| `max_bytes_scanned` | integer | | Maximum total bytes scanned across every materialization in the run, from per-model `bytes_scanned`. Catches scan-volume regressions even when cost stays inside `max_usd`. Only BigQuery reports it today (`totalBytesBilled`); Databricks, Snowflake and DuckDB give `None` and skip the dimension; `rocky run` then logs a warning that the limit was not checked. `max_usd` warns the same way when the adapter reports no cost. |
 | `on_breach` | string | `"warn"` | `"warn"` fires the event and keeps the run successful. `"error"` also fails the run. |
 
 The limits are independent: any one breach trips the event, checked once per run against observed totals. Subscribe to `on_budget_breach` under `[hook.*]` to route it. Each [`BudgetBreachOutput`](/reference/json-output/) carries a `limit_type` tag: `"max_usd"`, `"max_duration_ms"` or `"max_bytes_scanned"`.

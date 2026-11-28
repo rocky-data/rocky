@@ -350,7 +350,8 @@ pub async fn run_fulfill(
 }
 
 /// Run one model's local tests and note what the verify bundle must say
-/// about them. `true` when no model test failed.
+/// about them. `true` when the model executed and no unit test
+/// (`[[test]]`) failed or was refused.
 #[cfg(feature = "duckdb")]
 fn scoped_tests(
     models_dir: &Path,
@@ -375,7 +376,25 @@ fn scoped_tests(
                     .collect();
                 detail.push(format!("test failures: {}", rendered.join("; ")));
             }
-            output.failed == 0
+            // `output.failed` counts model execution only. The fixture
+            // `[[test]]` run is in its own summary, so a failing or refused
+            // unit test has to be read from there, or it reads as green.
+            let unit_failures: Vec<String> = output
+                .unit_tests
+                .iter()
+                .flat_map(|summary| summary.results.iter())
+                .filter(|result| !result.passed)
+                .map(|result| {
+                    let reason = result.error.clone().unwrap_or_else(|| {
+                        format!("{} row(s) did not match `expect`", result.mismatches.len())
+                    });
+                    format!("{}::{}: {reason}", result.model, result.test)
+                })
+                .collect();
+            if !unit_failures.is_empty() {
+                detail.push(format!("unit test failures: {}", unit_failures.join("; ")));
+            }
+            output.failed == 0 && unit_failures.is_empty()
         }
         Err(err) => {
             detail.push(format!("tests failed to run: {err:#}"));
@@ -452,6 +471,35 @@ mod unit_test_dialect_notice {
         let (green, detail) = detail_of(&tmp);
         assert!(green, "{detail:?}");
         assert!(detail.is_empty(), "{detail:?}");
+    }
+
+    /// #2778: the model executes, so `output.failed` is 0, but its
+    /// `[[test]]` expects a row the model never returns. The bundle must
+    /// be red and name the failing test.
+    #[test]
+    fn a_failing_unit_test_turns_the_bundle_red() {
+        let tmp = project(
+            "[adapter]\ntype = \"duckdb\"\n\
+             [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.trans.target]\n",
+        );
+        let sidecar = tmp.path().join("models").join("flagged.toml");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        let wrong = text.replace(
+            "rows = [ { id = 1, amount = 150 } ]",
+            "rows = [ { id = 2, amount = 50 } ]",
+        );
+        assert_ne!(text, wrong, "the fixture's expect line moved");
+        std::fs::write(&sidecar, wrong).unwrap();
+
+        let (green, detail) = detail_of(&tmp);
+        assert!(!green, "{detail:?}");
+        assert!(
+            detail
+                .iter()
+                .any(|d| d.starts_with("unit test failures: flagged::keeps_high")),
+            "{detail:?}"
+        );
     }
 }
 
@@ -1636,12 +1684,15 @@ impl Runner {
                             Some(false)
                         }
                         Some(max) => {
-                            let lag = Utc::now() - max;
-                            let ok = lag.num_seconds() <= budget_seconds as i64;
+                            // Rounded up, so a lag half a second past
+                            // the budget is over it (#2621).
+                            let lag = rocky_core::source_freshness::whole_seconds_rounded_up(
+                                Utc::now() - max,
+                            );
+                            let ok = lag <= i64::try_from(budget_seconds).unwrap_or(i64::MAX);
                             detail.push(format!(
-                                "MAX({}) = {max}, lag {}s, budget {budget_seconds}s",
+                                "MAX({}) = {max}, lag {lag}s, budget {budget_seconds}s",
                                 freshness.time_column,
-                                lag.num_seconds()
                             ));
                             Some(ok)
                         }

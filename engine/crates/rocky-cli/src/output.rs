@@ -3174,6 +3174,32 @@ impl TestOutput {
     }
 }
 
+/// A warning for each `[budget]` limit the run could not check, because the
+/// adapter reported no figure for it (#2776). Call it only for a run that
+/// built at least one model: with none, every figure is absent.
+///
+/// Snowflake, for example, reports no bytes scanned, so `max_bytes_scanned`
+/// can never trip there. Saying so keeps a limit that is silently skipped
+/// from reading as a limit that held.
+fn unchecked_budget_limits(
+    budget_cfg: &rocky_core::config::BudgetConfig,
+    observed_cost: Option<f64>,
+    observed_bytes: Option<u64>,
+) -> Vec<String> {
+    let mut unchecked = Vec::new();
+    if let (Some(limit), None) = (budget_cfg.max_bytes_scanned, observed_bytes) {
+        unchecked.push(format!(
+            "[budget] max_bytes_scanned = {limit} was not checked: the adapter reported no bytes-scanned figure for this run"
+        ));
+    }
+    if let (Some(limit), None) = (budget_cfg.max_usd, observed_cost) {
+        unchecked.push(format!(
+            "[budget] max_usd = {limit} was not checked: the adapter reported no cost figure for this run"
+        ));
+    }
+    unchecked
+}
+
 /// JSON output for `rocky ci`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CiOutput {
@@ -7089,6 +7115,13 @@ impl RunOutput {
             .cost_summary
             .as_ref()
             .and_then(|s| s.total_bytes_scanned);
+        // A run that built nothing has no figures to report on any adapter,
+        // and nothing for a limit to catch, so it gets no warning.
+        if !self.materializations.is_empty() {
+            for unchecked in unchecked_budget_limits(budget_cfg, observed_cost, observed_bytes) {
+                tracing::warn!("{unchecked}");
+            }
+        }
         let breaches = budget_cfg.check_breaches(observed_cost, self.duration_ms, observed_bytes);
         if breaches.is_empty() {
             return Ok(());
@@ -9683,6 +9716,23 @@ mod cost_finalize_tests {
         assert_eq!(out.budget_breaches[0].limit_type, "max_bytes_scanned");
         assert!((out.budget_breaches[0].limit - 1_000_000.0).abs() < f64::EPSILON);
         assert!((out.budget_breaches[0].actual - 2_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_budget_limit_with_no_reported_figure_is_named_as_unchecked() {
+        let budget = rocky_core::config::BudgetConfig {
+            max_usd: Some(5.0),
+            max_duration_ms: None,
+            max_bytes_scanned: Some(1_000_000),
+            ..Default::default()
+        };
+        let unchecked = super::unchecked_budget_limits(&budget, None, None);
+        assert_eq!(unchecked.len(), 2, "{unchecked:?}");
+        assert!(unchecked[0].contains("max_bytes_scanned = 1000000 was not checked"));
+        assert!(unchecked[1].contains("max_usd = 5 was not checked"));
+        assert!(super::unchecked_budget_limits(&budget, Some(1.0), Some(10)).is_empty());
+        let unset = rocky_core::config::BudgetConfig::default();
+        assert!(super::unchecked_budget_limits(&unset, None, None).is_empty());
     }
 
     #[test]
