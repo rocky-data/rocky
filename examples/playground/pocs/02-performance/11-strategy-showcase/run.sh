@@ -75,7 +75,7 @@ cat <<'EOF'
   | Strategy     | First run | Second run with delta              | Best for                                  |
   |--------------|-----------|------------------------------------|-------------------------------------------|
   | full_refresh | 100 rows  | rebuild -> 120 rows; updates seen  | small tables, source-of-truth dimensions  |
-  | incremental  | 100 rows  | append-only -> 120 rows; no update | large append-mostly facts (logs, events)  |
+  | incremental  | 99 rows   | append-only -> 119 rows; no update | large append-mostly facts (logs, events)  |
   | merge        | 100 rows  | upsert -> 120 rows; updates seen   | facts with late updates (orders, status)  |
 
 EOF
