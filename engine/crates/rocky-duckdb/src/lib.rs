@@ -451,6 +451,22 @@ impl DuckDbConnector {
         })
     }
 
+    /// Opens an existing database read-only. Nothing is created, and DuckDB
+    /// refuses every statement that would change the database.
+    ///
+    /// # Errors
+    ///
+    /// The file does not exist, is locked by a writer, or is not a database.
+    pub fn open_read_only_with(path: &Path, opts: &ExtensionOptions) -> Result<Self, DuckDbError> {
+        let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+        let conn = Connection::open_with_flags(path, config)?;
+        prepare_extensions(&conn, opts)?;
+        Ok(DuckDbConnector {
+            conn,
+            profile_file: std::cell::RefCell::new(None),
+        })
+    }
+
     /// Executes a SQL statement and returns results.
     pub fn execute_sql(&self, sql: &str) -> Result<QueryResult, DuckDbError> {
         self.ensure_profiling_off();

@@ -3896,6 +3896,12 @@ mod tests {
         run_git(dir, &["config", "user.email", "tester@example.com"]);
         run_git(dir, &["config", "user.name", "Tester"]);
         run_git(dir, &["config", "commit.gpgsign", "false"]);
+        // `git commit` starts a detached `git maintenance run --auto`, which
+        // takes `.git/objects/maintenance.lock` for a moment. A test that
+        // snapshots `.git` can catch that file, or its removal, and fail
+        // at random. Turn automatic maintenance off in every test repo.
+        run_git(dir, &["config", "maintenance.auto", "false"]);
+        run_git(dir, &["config", "gc.auto", "0"]);
         for (path, contents) in files {
             let full = models_dir.join(path);
             if let Some(parent) = full.parent() {
